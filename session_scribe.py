@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.09.2"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.12.4"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -61,18 +61,23 @@ for _k, _v in (("HF_HUB_DISABLE_TELEMETRY", "1"), ("DO_NOT_TRACK", "1"),
 os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ.get("PATH", "")   # app-local ffmpeg
 
 import base64
+import collections
 import gc
 import hashlib
+import hmac
 import importlib
 import importlib.util
 import ipaddress
 import json
+import math
 import queue
 import re
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
+import copy
 import threading
 import time
 import urllib.error
@@ -164,7 +169,8 @@ CONFIG_PATH = os.path.join(LOCAL_DIR, "config.json")
 LEGACY_CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 SHARED_SETTINGS = "settings.json"            # in the data folder; contains no patient data
 SHARED_KEYS = {"language", "min_speakers", "max_speakers", "max_chars", "previous_notes",
-               "smooth_flicker", "delete_audio", "autolock_minutes", "role_labels", "date_format"}
+               "smooth_flicker", "delete_audio", "autolock_minutes", "role_labels", "date_format",
+               "phone_page_url", "phone_client_id"}
 TEMPLATE_DIR = os.path.join(APP_DIR, "templates")     # updated by set_data_paths()
 DEFAULT_CONFIG = {
     "lmstudio_url": "http://127.0.0.1:1234/v1",
@@ -196,6 +202,9 @@ DEFAULT_CONFIG = {
     "remote_notify": True,      # desktop notification when a recording sent elsewhere is done
     "computer_id": "",          # this computer's id for handoffs (made once, kept locally)
     "remote_target": "",        # the queue's last "Run on" choice
+    "phone_relay": False,       # this computer answers the phone (questions, queue) and keeps its patient list current
+    "phone_page_url": "",       # where the phone page is put (e.g. https://name.github.io/scribe/)
+    "phone_client_id": "",      # the Google sign-in client ID baked into the phone page (public by design)
 }
 WHISPER_MODELS = ["large-v3-turbo", "large-v3", "medium.en", "small.en"]
 ROLES = ["Clinician", "Patient", "Parent/Guardian", "Other"]
@@ -798,6 +807,76 @@ clinician). Match the style, length and wording of these examples closely, but w
 session only — never copy an example's content.
 {examples}{vocabulary}{intake_points}"""
 
+DEFAULT_PARENT_NOTE_TEMPLATE = """Write a CONTACT NOTE documenting this communication between the Counselor \
+and {contact_party}, outside of a therapy session, in the agency's note style:
+- ONE narrative paragraph of about 3-6 sentences (roughly 60-130 words). No headings or bullet points \
+inside it. Past tense, third person, using "patient" and "Counselor". {contact_ref} Never write a name \
+the source doesn't give, and keep any placeholder exactly as written (for example [PERSON_1]).
+- Open with the contact itself, matching the contact method: "Counselor met with ...", "Counselor spoke \
+with ... by phone", or "Counselor received a text message / an email from ...".
+- Then, in flowing sentences: the reason for the contact; what was reported, asked or raised; what the \
+Counselor shared, explained or recommended; and any agreements. {contact_rules}
+- If ANY safety concern came up (suicidal ideation, self-harm, abuse, neglect, threats), add one factual \
+sentence documenting it and how it was addressed. If none came up, do not add a safety statement.
+- If consent, release of information or limits of confidentiality were discussed, say so briefly.
+- If it relates to a treatment goal, connect it in a short clause.
+
+Then, after one blank line, exactly this section (plain text, one item per line, each starting with "- "):
+
+Follow-up:
+- [item]
+
+Rules: 1-4 items — what the Counselor or {contact_party} agreed to do next ({contact_followups}). Only what \
+the source supports; if nothing was agreed, write "- None discussed".
+
+Contact details
+Patient code: {client_code}
+Date: {session_date}
+Contact with: {contact_party}
+Contact method: {contact_method}
+Treatment goals: {goals}
+Clinician's notes not captured in the source: {observations}
+
+Below is {source_kind}.
+
+{transcript}"""
+
+DEFAULT_PARENT_SUMMARY_TEMPLATE = """Write a summary of this communication between the Counselor and \
+{contact_party} (outside of a therapy session) for the clinician's own use. Use these plain-text headings, \
+in this order:
+
+CONCERNS AND REPORTS
+Each concern, observation, request or question raised, one line each (with a timestamp or message time \
+when the source has one).
+
+WHAT THE COUNSELOR SHARED OR RECOMMENDED
+What was explained, advised or recommended.
+
+AGREEMENTS AND FOLLOW-UP
+Who agreed to do what, and by when if stated; or "None discussed".
+
+RELEVANCE TO TREATMENT
+How this contact relates to the treatment goals and recent sessions (when provided), and anything worth \
+exploring with the patient next session. Label interpretations as hypotheses.
+
+CONFIDENTIALITY, CONSENT AND RISK
+Anything touching confidentiality limits, consent / release of information, or safety; or state that \
+none came up.
+
+Contact details
+Patient code: {client_code}
+Date: {session_date}
+Contact with: {contact_party}
+Contact method: {contact_method}
+Clinician's theoretical orientation: {orientation}
+Treatment goals: {goals}
+Clinician's notes not captured in the source: {observations}
+
+Below is {source_kind}.
+
+{transcript}"""
+
+
 TEMPLATE_FILES = {
     "session_note.txt": DEFAULT_NOTE_TEMPLATE,
     "overview.txt": DEFAULT_OVERVIEW_TEMPLATE,
@@ -805,6 +884,8 @@ TEMPLATE_FILES = {
     "intake_questionnaire.txt": DEFAULT_INTAKE_QUESTIONNAIRE_TEMPLATE,
     "case_overview.txt": DEFAULT_CASE_TEMPLATE,
     "treatment_plan.txt": DEFAULT_TREATMENT_PLAN_TEMPLATE,
+    "parent_note.txt": DEFAULT_PARENT_NOTE_TEMPLATE,
+    "parent_summary.txt": DEFAULT_PARENT_SUMMARY_TEMPLATE,
 }
 # Hashes of earlier built-in templates: unedited copies are upgraded automatically.
 OLD_TEMPLATE_HASHES = {
@@ -814,6 +895,8 @@ OLD_TEMPLATE_HASHES = {
     "1b5b48d2628a4cc14491b1191c04bffb1b65eb7c6eb2621ef4bfa45cfb9bcc3b",   # v2 overview
     "298ba9a3e976f5131273e0a49f63233342b76fca6c5d1f92a5e07a8362f07aa5",   # v2 case overview
     "f08f9585b19702cdfad094aabc9701b37ea0826cab44183b26c135105f92b825",   # v3 note (before the interventions sections)
+    "7e3dd7332eff7b3dd71c4cfaaccddca9abf0691d1498afc76d3916bfd5adb382",   # parent-only contact note
+    "3a40a09b7be08e52b27c4f8790bbc160e185bdd4045220b81b4787a429074940",   # parent-only contact summary
 }
 TEMPLATE_HELP = """These files are the instructions given to the local AI. Edit them to fine-tune \
 the format. Keep the {placeholders}; they're filled in automatically.
@@ -826,6 +909,9 @@ case_overview.txt: {client_code} {orientation} {background} {goals} {session_cou
 {date_range} {source_kind} {sessions}
 treatment_plan.txt: {client_code} {orientation} {background} {goals} {review_days} \
 {instructions} {source_kind} {material}
+parent_note.txt, parent_summary.txt (contacts outside sessions — with the patient, a parent or someone else): \
+{client_code} {session_date} {contact_party} {contact_ref} {contact_rules} {contact_followups} \
+{contact_method} {orientation} {goals} {observations} {source_kind} {transcript}
 
 Added automatically before these instructions: the patient's previous notes and intake, and (if \
 loaded in Settings) the example notes and vocabulary from your agency's manual.
@@ -896,8 +982,1044 @@ def fill(template, values):
 
 
 # --------------------------------------------------------------------------- #
+# Phone (iPhone): a web page that reads the encrypted vault straight from Google Drive
+# --------------------------------------------------------------------------- #
+# The phone talks only to Google Drive (the BAA-covered storage) and decrypts in its own memory.
+# For things that need a computer — patient-AI questions (LM Studio) and the recording queue — it
+# drops an encrypted request into <data folder>/phone/requests; a computer with Phone access turned
+# on answers into phone/replies. Each computer also publishes, encrypted with the vault key:
+#   phone/index-<computer>.enc   the session list (so the phone doesn't decrypt every file to list them)
+#   phone/status-<computer>.enc  queue and progress, refreshed every few seconds while it changes
+# phone/devices/<id>.json holds each phone's Face ID + PIN unlock: the vault key wrapped with a secret
+# only that phone's passkey can produce, combined with the PIN — useless on its own.
+PHONE_DIR = "phone"
+PHONE_SUBDIRS = ("requests", "replies", "devices")
+PHONE_REQ_TTL = 15 * 60              # a request older than this is ignored (and tidied)
+PHONE_REPLY_KEEP = 24 * 3600         # replies the phone never collected are removed after this
+PHONE_LOG = os.path.join(LOCAL_DIR, "logs", "phone.log")
+
+
+def phone_root(cfg):
+    return os.path.join(data_root(cfg), PHONE_DIR)
+
+
+def phone_prepare(cfg):
+    """Make the phone folders (only computers create them, so Drive never ends up with duplicates)."""
+    for sub in PHONE_SUBDIRS:
+        os.makedirs(os.path.join(phone_root(cfg), sub), exist_ok=True)
+
+
+def phone_write(vault, path, obj):
+    vault._atomic_write(path, vault.fernet.encrypt(json.dumps(obj).encode("utf-8")))
+
+
+def phone_devices(cfg):
+    """Phones set up for Face ID + PIN unlock: [{"id", "name", "created", "path"}]."""
+    d = os.path.join(phone_root(cfg), "devices")
+    out = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(d, fn), encoding="utf-8") as f:
+                j = json.load(f)
+            out.append({"id": j.get("id", fn[:-5]), "name": j.get("name") or "Phone",
+                        "created": j.get("created", ""), "path": os.path.join(d, fn)})
+        except (OSError, ValueError):
+            continue
+    return sorted(out, key=lambda x: x["created"])
+
+
+def phone_log(text):
+    """What the phone asked this computer to do (no patient information: the kind of request only)."""
+    try:
+        os.makedirs(os.path.dirname(PHONE_LOG), exist_ok=True)
+        with open(PHONE_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().isoformat(timespec='seconds')}  {text}\n")
+        if os.path.getsize(PHONE_LOG) > 256 * 1024:
+            with open(PHONE_LOG, encoding="utf-8") as f:
+                keep = f.readlines()[-400:]
+            with open(PHONE_LOG, "w", encoding="utf-8") as f:
+                f.writelines(keep)
+    except OSError:
+        pass
+
+
+def phone_log_tail(n=12):
+    try:
+        with open(PHONE_LOG, encoding="utf-8") as f:
+            return [ln.rstrip("\n") for ln in f.readlines()[-n:]]
+    except OSError:
+        return []
+
+
+def _png_icon(size=180, rgb=(47, 111, 94)):
+    """A plain square home-screen icon (PNG), made here so the page needs nothing from elsewhere."""
+    import zlib
+    row = b"\x00" + bytes(rgb) * size
+    raw = row * size
+
+    def chunk(kind, data):
+        c = kind + data
+        return struct.pack(">I", len(data)) + c + struct.pack(">I", zlib.crc32(c) & 0xFFFFFFFF)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def make_phone_page(client_id, page_url):
+    """The phone page, ready to upload as index.html. Contains no patient information and no secrets
+    (a Google sign-in client ID is public by design). Everything it runs is inside this one file,
+    pinned by its Content-Security-Policy, which allows it to talk to Google Drive only."""
+    script = (PHONE_JS.replace("%%CLIENT_ID%%", json.dumps(client_id.strip())[1:-1])
+              .replace("%%PAGE_URL%%", json.dumps(page_url.strip())[1:-1])
+              .replace("%%BUILD%%", APP_BUILD))
+    digest = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode()
+    return (PHONE_HTML.replace("%%SCRIPT_HASH%%", "sha256-" + digest)
+            .replace("%%ICON%%", base64.b64encode(_png_icon()).decode())
+            .replace("%%SCRIPT%%", script))
+
+
+def phone_page_url_ok(url):
+    return bool(re.match(r"^https://[A-Za-z0-9.-]+\.[A-Za-z]{2,}(/[^\s?#]*)?$", (url or "").strip()))
+
+
+PHONE_HTML = r'''<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Session Scribe">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src '%%SCRIPT_HASH%%'; style-src 'unsafe-inline'; connect-src https://www.googleapis.com; img-src data:; manifest-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Session Scribe</title>
+<link rel="apple-touch-icon" href="data:image/png;base64,%%ICON%%">
+<style>
+:root { --bg:#f5f4f0; --card:#ffffff; --ink:#1d1d1b; --muted:#6b6a65; --line:#e3e1da; --accent:#2f6f5e;
+        --accent-ink:#ffffff; --warn:#9a5b00; --warn-bg:#fff4e0; --bad:#b3261e; --good:#2f6f5e; --chip:#eeece6; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#151514; --card:#1f1f1d; --ink:#ecebe6; --muted:#a3a29b; --line:#33332f; --accent:#5fb39b;
+          --accent-ink:#0d1f1a; --warn:#f0b35c; --warn-bg:#3a2c12; --bad:#ff8a80; --good:#7fd1b9; --chip:#2a2a27; }
+}
+* { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+html, body { margin:0; background:var(--bg); color:var(--ink);
+  font:16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+body { padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom); min-height:100vh; }
+body.cover > * { visibility:hidden; }
+header { position:sticky; top:0; z-index:5; background:var(--bg); border-bottom:1px solid var(--line);
+  display:flex; align-items:center; gap:8px; padding:10px 16px; }
+header h1 { font-size:17px; margin:0; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+main { padding:12px 16px 96px; max-width:720px; margin:0 auto; }
+nav.tabs { position:fixed; left:0; right:0; bottom:0; z-index:5; display:flex; background:var(--card);
+  border-top:1px solid var(--line); padding-bottom:env(safe-area-inset-bottom); }
+nav.tabs button { flex:1; border:0; background:none; color:var(--muted); padding:10px 4px 12px; font-size:13px; }
+nav.tabs button.on { color:var(--accent); font-weight:600; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin:10px 0; }
+.row { display:flex; align-items:center; gap:10px; }
+.grow { flex:1; min-width:0; }
+.list { background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; margin:10px 0; }
+.item { display:flex; align-items:center; gap:10px; padding:12px 14px; border-bottom:1px solid var(--line);
+  width:100%; text-align:left; background:none; border-left:0; border-right:0; border-top:0; color:inherit; font:inherit; }
+.item:last-child { border-bottom:0; }
+.item .t { font-weight:600; }
+.muted { color:var(--muted); font-size:14px; }
+.small { font-size:13px; }
+.warn { color:var(--warn); }
+.bad { color:var(--bad); }
+.good { color:var(--good); }
+.banner { background:var(--warn-bg); color:var(--warn); border-radius:12px; padding:10px 12px; margin:10px 0; font-size:14px; }
+.chip { display:inline-block; background:var(--chip); border-radius:999px; padding:2px 9px; font-size:12px; color:var(--muted); }
+.chip.warn { background:var(--warn-bg); color:var(--warn); }
+button.btn, a.btn { display:inline-flex; align-items:center; justify-content:center; gap:6px; border:1px solid var(--line);
+  background:var(--card); color:var(--ink); border-radius:11px; padding:10px 14px; font:inherit; font-weight:600; }
+button.btn.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+button.btn.wide { width:100%; margin-top:10px; }
+button.btn:disabled { opacity:.5; }
+button.icon { border:0; background:none; color:var(--accent); font:inherit; font-weight:600; padding:6px 4px; }
+input, textarea { width:100%; font:inherit; color:var(--ink); background:var(--card); border:1px solid var(--line);
+  border-radius:11px; padding:11px 12px; }
+textarea { min-height:55vh; resize:vertical; line-height:1.5; }
+label.f { display:block; font-size:14px; color:var(--muted); margin:12px 0 4px; }
+.doc { white-space:pre-wrap; word-wrap:break-word; font-size:15.5px; line-height:1.55; }
+.seg { display:flex; gap:6px; overflow-x:auto; padding:2px 0 8px; }
+.seg button { flex:none; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:999px;
+  padding:6px 12px; font:inherit; font-size:14px; }
+.seg button.on { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+.bar { height:8px; background:var(--chip); border-radius:99px; overflow:hidden; margin:8px 0 4px; }
+.bar > div { height:100%; background:var(--accent); width:0; transition:width .4s; }
+.msg { border-radius:14px; padding:10px 12px; margin:8px 0; white-space:pre-wrap; word-wrap:break-word; }
+.msg.user { background:var(--accent); color:var(--accent-ink); margin-left:12%; }
+.msg.ai { background:var(--card); border:1px solid var(--line); margin-right:4%; }
+.center { text-align:center; }
+.hero { padding:28px 4px 8px; }
+.hero h2 { margin:6px 0; font-size:24px; }
+.spin { display:inline-block; width:16px; height:16px; border:2px solid var(--line); border-top-color:var(--accent);
+  border-radius:50%; animation:sp 0.8s linear infinite; vertical-align:-3px; }
+@keyframes sp { to { transform:rotate(360deg); } }
+.toast { position:fixed; left:16px; right:16px; bottom:calc(76px + env(safe-area-inset-bottom)); z-index:9;
+  background:var(--ink); color:var(--bg); border-radius:12px; padding:11px 14px; font-size:14px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>%%SCRIPT%%</script>
+</body>
+</html>
+'''
+
+PHONE_JS = r'''"use strict";
+/* Session Scribe on the phone. Reads and edits the encrypted vault straight from Google Drive and
+   decrypts it here, in memory only: nothing is saved on the phone (no storage, no offline cache).
+   Patient-AI questions and the recording queue are relayed to a computer through the same Drive
+   folder, encrypted with the vault key. */
+const CFG = { clientId: "%%CLIENT_ID%%", redirect: "%%PAGE_URL%%", build: "%%BUILD%%" };
+const IDLE_LOCK_MS = 5 * 60 * 1000;
+const ONLINE_SECS = 180;                 // a computer whose status is newer than this is "on"
+const MAX_PIN_FAILS = 5;
+const API = "https://www.googleapis.com/drive/v3/";
+const UPLOAD = "https://www.googleapis.com/upload/drive/v3/";
+const FOLDER = "application/vnd.google-apps.folder";
+const KIND_LABELS = { progress: ["Progress note", "Overview"], intake: ["Intake assessment", "Intake questionnaire"],
+                      parent: ["Parent contact note", "Conversation summary"] };
+const CONTACT_NAMES = { patient: ["Patient contact note", "Communication summary", "Patient contact"],
+                        parent: ["Parent contact note", "Conversation summary", "Parent contact"],
+                        other: ["Collateral contact note", "Conversation summary", "Collateral contact"] };
+const contactWith = m => (CONTACT_NAMES[(m || {}).contact_with] ? m.contact_with : "parent");
+const te = new TextEncoder(), td = new TextDecoder();
+const PRF_SALT = te.encode("session-scribe/phone-unlock/v1");
+
+// ------------------------------------------------------------------ bytes
+function b64ToBytes(s) {
+  s = String(s).replace(/-/g, "+").replace(/_/g, "/").replace(/\s+/g, "");
+  while (s.length % 4) s += "=";
+  const bin = atob(s), out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesToB64(b, url) {
+  b = b instanceof Uint8Array ? b : new Uint8Array(b);
+  let s = "";
+  for (let i = 0; i < b.length; i += 0x8000) s += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  s = btoa(s);
+  return url ? s.replace(/\+/g, "-").replace(/\//g, "_") : s;
+}
+function concat(...parts) {
+  let n = 0; for (const p of parts) n += p.length;
+  const out = new Uint8Array(n); let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+function rand(n) { return crypto.getRandomValues(new Uint8Array(n)); }
+function hex(b) { return Array.from(b, x => x.toString(16).padStart(2, "0")).join(""); }
+function sameBytes(a, b) { if (a.length !== b.length) return false; let d = 0; for (let i = 0; i < a.length; i++) d |= a[i] ^ b[i]; return d === 0; }
+
+// ------------------------------------------------------------------ scrypt (as the desktop app: N from vault.json, r=8, p=1)
+async function pbkdf2(pw, salt, len, iterations) {
+  const k = await crypto.subtle.importKey("raw", pw, "PBKDF2", false, ["deriveBits"]);
+  return new Uint8Array(await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: iterations || 1 }, k, len * 8));
+}
+function salsa8(B, x) {
+  for (let i = 0; i < 16; i++) x[i] = B[i];
+  const R = (a, b) => (a << b) | (a >>> (32 - b));
+  for (let i = 0; i < 8; i += 2) {
+    x[4] ^= R(x[0] + x[12], 7);  x[8] ^= R(x[4] + x[0], 9);   x[12] ^= R(x[8] + x[4], 13);  x[0] ^= R(x[12] + x[8], 18);
+    x[9] ^= R(x[5] + x[1], 7);   x[13] ^= R(x[9] + x[5], 9);  x[1] ^= R(x[13] + x[9], 13);  x[5] ^= R(x[1] + x[13], 18);
+    x[14] ^= R(x[10] + x[6], 7); x[2] ^= R(x[14] + x[10], 9); x[6] ^= R(x[2] + x[14], 13);  x[10] ^= R(x[6] + x[2], 18);
+    x[3] ^= R(x[15] + x[11], 7); x[7] ^= R(x[3] + x[15], 9);  x[11] ^= R(x[7] + x[3], 13);  x[15] ^= R(x[11] + x[7], 18);
+    x[1] ^= R(x[0] + x[3], 7);   x[2] ^= R(x[1] + x[0], 9);   x[3] ^= R(x[2] + x[1], 13);   x[0] ^= R(x[3] + x[2], 18);
+    x[6] ^= R(x[5] + x[4], 7);   x[7] ^= R(x[6] + x[5], 9);   x[4] ^= R(x[7] + x[6], 13);   x[5] ^= R(x[4] + x[7], 18);
+    x[11] ^= R(x[10] + x[9], 7); x[8] ^= R(x[11] + x[10], 9); x[9] ^= R(x[8] + x[11], 13);  x[10] ^= R(x[9] + x[8], 18);
+    x[12] ^= R(x[15] + x[14], 7); x[13] ^= R(x[12] + x[15], 9); x[14] ^= R(x[13] + x[12], 13); x[15] ^= R(x[14] + x[13], 18);
+  }
+  for (let i = 0; i < 16; i++) B[i] = (B[i] + x[i]) | 0;
+}
+function blockMix(B, Y, r, X, tmp) {
+  X.set(B.subarray((2 * r - 1) * 16, 2 * r * 16));
+  for (let i = 0; i < 2 * r; i++) {
+    for (let k = 0; k < 16; k++) X[k] ^= B[i * 16 + k];
+    salsa8(X, tmp);
+    Y.set(X, ((i & 1) ? r + (i >> 1) : (i >> 1)) * 16);
+  }
+  B.set(Y);
+}
+async function scrypt(pw, salt, N, r, p, dkLen, onProgress) {
+  const B = await pbkdf2(pw, salt, p * 128 * r);
+  const W = 32 * r, words = new Uint32Array(p * W), dv = new DataView(B.buffer);
+  for (let i = 0; i < words.length; i++) words[i] = dv.getUint32(i * 4, true);
+  const V = new Uint32Array(W * N), Y = new Uint32Array(W), X16 = new Uint32Array(16), tmp = new Uint32Array(16);
+  for (let q = 0; q < p; q++) {
+    const Xb = words.subarray(q * W, (q + 1) * W);
+    for (let i = 0; i < N; i++) {
+      V.set(Xb, i * W); blockMix(Xb, Y, r, X16, tmp);
+      if ((i & 2047) === 0) { onProgress && onProgress((q * 2 * N + i) / (2 * N * p)); await new Promise(res => setTimeout(res, 0)); }
+    }
+    for (let i = 0; i < N; i++) {
+      const j = Xb[(2 * r - 1) * 16] & (N - 1);
+      for (let k = 0; k < W; k++) Xb[k] ^= V[j * W + k];
+      blockMix(Xb, Y, r, X16, tmp);
+      if ((i & 2047) === 0) { onProgress && onProgress((q * 2 * N + N + i) / (2 * N * p)); await new Promise(res => setTimeout(res, 0)); }
+    }
+  }
+  for (let i = 0; i < words.length; i++) dv.setUint32(i * 4, words[i], true);
+  V.fill(0);
+  return pbkdf2(pw, B, dkLen);
+}
+
+// ------------------------------------------------------------------ Fernet (same format as the desktop app)
+async function fernetKeys(raw32) {
+  return {
+    mac: await crypto.subtle.importKey("raw", raw32.slice(0, 16), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]),
+    aes: await crypto.subtle.importKey("raw", raw32.slice(16, 32), { name: "AES-CBC" }, false, ["encrypt", "decrypt"]),
+  };
+}
+async function fernetDecrypt(keys, token) {
+  const d = b64ToBytes(String(token).trim());
+  if (d.length < 57 || d[0] !== 0x80) throw new Error("not an encrypted Session Scribe file");
+  const body = d.subarray(0, d.length - 32), mac = d.subarray(d.length - 32);
+  if (!(await crypto.subtle.verify("HMAC", keys.mac, mac, body))) throw new Error("wrong key or damaged file");
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-CBC", iv: d.subarray(9, 25) }, keys.aes, d.subarray(25, d.length - 32)));
+}
+async function fernetEncrypt(keys, bytes) {
+  const iv = rand(16), ts = new Uint8Array(8), now = Math.floor(Date.now() / 1000);
+  new DataView(ts.buffer).setUint32(0, Math.floor(now / 2 ** 32)); new DataView(ts.buffer).setUint32(4, now >>> 0);
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-CBC", iv }, keys.aes, bytes));
+  const body = concat(new Uint8Array([0x80]), ts, iv, ct);
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", keys.mac, body));
+  return bytesToB64(concat(body, mac), true);
+}
+const decJSON = async (keys, token) => JSON.parse(td.decode(await fernetDecrypt(keys, token)));
+const encJSON = (keys, obj) => fernetEncrypt(keys, te.encode(JSON.stringify(obj)));
+
+// ------------------------------------------------------------------ Google sign-in (redirect; the token lives in memory only)
+class AuthError extends Error {}
+const Auth = {
+  token: null, expires: 0,
+  signIn() {
+    const state = bytesToB64(rand(18), true);
+    try { sessionStorage.setItem("ss_oauth_state", state); } catch (e) {}
+    const p = new URLSearchParams({ client_id: CFG.clientId, redirect_uri: CFG.redirect, response_type: "token",
+      scope: "https://www.googleapis.com/auth/drive", include_granted_scopes: "true", state });
+    location.assign("https://accounts.google.com/o/oauth2/v2/auth?" + p.toString());
+  },
+  takeFromUrl() {
+    if (!location.hash || location.hash.length < 2) return null;
+    const h = new URLSearchParams(location.hash.slice(1));
+    history.replaceState(null, "", location.pathname + location.search);
+    let want = null;
+    try { want = sessionStorage.getItem("ss_oauth_state"); sessionStorage.removeItem("ss_oauth_state"); } catch (e) {}
+    if (h.get("error")) return "Google sign-in didn't finish (" + h.get("error") + ").";
+    if (!h.get("access_token")) return null;
+    // (a home-screen app on iOS can lose this tab's storage while Google's page is open; then the
+    // sign-in is still only usable for this page — and nothing opens without your vault password or PIN)
+    if (want && h.get("state") !== want) return "Sign-in check failed — please sign in again.";
+    this.token = h.get("access_token");
+    this.expires = Date.now() + (parseInt(h.get("expires_in") || "3600", 10) - 60) * 1000;
+    return true;
+  },
+  valid() { return !!this.token && Date.now() < this.expires; },
+};
+
+// ------------------------------------------------------------------ Google Drive
+const Drive = {
+  async call(url, opt) {
+    opt = opt || {};
+    if (!Auth.valid()) throw new AuthError("Your Google sign-in has expired.");
+    const r = await fetch(url, Object.assign({ cache: "no-store", referrerPolicy: "no-referrer", credentials: "omit" }, opt,
+      { headers: Object.assign({ Authorization: "Bearer " + Auth.token }, opt.headers || {}) }));
+    if (r.status === 401) { Auth.token = null; throw new AuthError("Your Google sign-in has expired."); }
+    if (!r.ok) {
+      let msg = "error " + r.status;
+      try { const j = await r.json(); msg = (j.error && j.error.message) || msg; } catch (e) {}
+      const err = new Error("Google Drive: " + msg); err.status = r.status; throw err;
+    }
+    return r;
+  },
+  qs(o) { return new URLSearchParams(o).toString(); },
+  esc(s) { return String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'"); },
+  async list(q, fields, extra) {
+    let out = [], page = "";
+    do {
+      const p = Object.assign({ q, fields: "nextPageToken,files(" + (fields || "id,name,modifiedTime,size,md5Checksum,mimeType") + ")",
+        pageSize: 1000, supportsAllDrives: true, includeItemsFromAllDrives: true }, extra || {});
+      if (page) p.pageToken = page;
+      const j = await (await this.call(API + "files?" + this.qs(p))).json();
+      out = out.concat(j.files || []); page = j.nextPageToken || "";
+    } while (page);
+    return out;
+  },
+  children(parent, more) { return this.list("'" + parent + "' in parents and trashed=false" + (more ? " and " + more : "")); },
+  async text(id) { return (await this.call(API + "files/" + id + "?alt=media&supportsAllDrives=true")).text(); },
+  async meta(id) { return (await this.call(API + "files/" + id + "?fields=id,name,modifiedTime,size,md5Checksum&supportsAllDrives=true")).json(); },
+  async create(parent, name, body, mime) {
+    const b = "ssb" + hex(rand(12)), m = mime || "application/octet-stream";
+    const payload = "--" + b + "\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n" + JSON.stringify({ name, parents: [parent] }) +
+      "\r\n--" + b + "\r\nContent-Type: " + m + "\r\n\r\n" + body + "\r\n--" + b + "--";
+    return (await this.call(UPLOAD + "files?uploadType=multipart&supportsAllDrives=true&fields=id,name,modifiedTime,size,md5Checksum",
+      { method: "POST", headers: { "Content-Type": "multipart/related; boundary=" + b }, body: payload })).json();
+  },
+  async update(id, body, mime) {
+    return (await this.call(UPLOAD + "files/" + id + "?uploadType=media&supportsAllDrives=true&fields=id,name,modifiedTime,size,md5Checksum",
+      { method: "PATCH", headers: { "Content-Type": mime || "application/octet-stream" }, body })).json();
+  },
+  async remove(id) { await this.call(API + "files/" + id + "?supportsAllDrives=true", { method: "DELETE" }); },
+};
+
+// ------------------------------------------------------------------ state (memory only)
+const S = {
+  root: null, f: {},              // Drive folder ids: vault, sessions, clients, phone, requests, replies, devices
+  keys: null, raw: null,          // the vault key (only while unlocked)
+  index: null, clients: [], files: {},   // sid -> Drive file; index.sessions: sid -> {m, z}
+  docs: new Map(),                // sid -> {doc, file}
+  clientDocs: new Map(),          // cid -> {doc, file}
+  status: {},                     // computer -> status
+  view: { name: "patients" }, lastTouch: Date.now(), timers: [],
+  deviceName: "", pending: {},    // request id -> {kind, to, sentAt, onReply}
+};
+function wipe() {
+  if (S.raw) S.raw.fill(0);
+  S.keys = null; S.raw = null; S.index = null; S.clients = []; S.files = {};
+  S.docs.clear(); S.clientDocs.clear(); S.status = {}; S.pending = {};
+  S.view = { name: "patients" };
+  S.timers.forEach(clearTimeout); S.timers = [];
+  document.querySelectorAll(".toast").forEach(t => t.remove());
+}
+
+// ------------------------------------------------------------------ DOM helpers (text only: never HTML from data)
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") el.className = v;
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (k === "text") el.textContent = v;
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const c of kids.flat()) if (c != null && c !== false) el.append(c.nodeType ? c : document.createTextNode(String(c)));
+  return el;
+}
+const $app = () => document.getElementById("app");
+function screen(title, opts, ...body) {
+  opts = opts || {};
+  const head = h("header", {}, opts.back ? h("button", { class: "icon", onclick: opts.back }, "‹ Back") : null,
+    h("h1", { text: title }), opts.right || null,
+    S.keys ? h("button", { class: "icon", onclick: () => lockNow("Locked.") }, "Lock") : null);
+  const tabs = S.keys ? h("nav", { class: "tabs" },
+    [["patients", "Patients"], ["queue", "Queue"], ["more", "Phone"]].map(([k, l]) =>
+      h("button", { class: tabRoot(S.view.name) === k ? "on" : "", onclick: () => go({ name: k }) }, l))) : null;
+  $app().replaceChildren(head, h("main", {}, ...body), tabs || "");
+  window.scrollTo(0, opts.keepScroll || 0);
+}
+function tabRoot(n) { return n === "queue" ? "queue" : n === "more" ? "more" : "patients"; }
+function toast(msg, ms) {
+  const t = h("div", { class: "toast", text: msg }); document.body.append(t);
+  setTimeout(() => t.remove(), ms || 3500);
+}
+function spinner(text) { return h("p", { class: "muted" }, h("span", { class: "spin" }), " ", text); }
+function fmtDate(s) {
+  if (!s || !/^\d{4}-\d\d-\d\d/.test(s)) return s || "Undated";
+  const d = new Date(s.slice(0, 10) + "T12:00:00");
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+}
+function isoLocal() {
+  const d = new Date(), p = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + "T" + p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+function fmtLeft(secs) {
+  if (secs == null) return "";
+  secs = Math.max(0, Math.round(secs));
+  if (secs < 60) return "under a minute left";
+  const m = Math.round(secs / 60);
+  return m < 60 ? m + " min left" : Math.floor(m / 60) + " h " + (m % 60) + " min left";
+}
+function ago(t) {
+  const s = Math.max(0, Date.now() / 1000 - t);
+  return s < 90 ? "just now" : s < 3600 ? Math.round(s / 60) + " min ago" : Math.round(s / 3600) + " h ago";
+}
+function errText(e) { return (e && e.message) || String(e); }
+
+// ------------------------------------------------------------------ locking: on leaving the app, and when idle
+function lockNow(why) {
+  wipe();
+  showUnlock(why || "");
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) { document.body.classList.add("cover"); if (S.keys) lockNow("Locked when you left the app."); }
+  else document.body.classList.remove("cover");
+});
+window.addEventListener("pagehide", () => { if (S.keys) lockNow(""); });
+["touchstart", "keydown", "scroll", "mousedown"].forEach(ev => window.addEventListener(ev, () => { S.lastTouch = Date.now(); }, { passive: true }));
+setInterval(() => { if (S.keys && Date.now() - S.lastTouch > IDLE_LOCK_MS) lockNow("Locked after 5 minutes without use."); }, 10000);
+
+// ------------------------------------------------------------------ finding the data folder
+async function findFolders() {
+  const cands = await Drive.list("name='Session Scribe' and mimeType='" + FOLDER + "' and trashed=false",
+    "id,name,modifiedTime", { corpora: "allDrives" });
+  const good = [];
+  for (const c of cands) {
+    const kids = await Drive.children(c.id, "mimeType='" + FOLDER + "'");
+    const by = Object.fromEntries(kids.map(k => [k.name, k.id]));
+    if (by.vault) good.push({ c, by });
+  }
+  if (!good.length) throw new Error("Couldn't find the Session Scribe folder in this Google account's Drive. Sign in with the account that holds it.");
+  good.sort((a, b) => ((b.by.phone ? 1 : 0) - (a.by.phone ? 1 : 0)) || String(b.c.modifiedTime).localeCompare(a.c.modifiedTime));
+  const g = good[0];
+  S.root = g.c.id; S.f = { vault: g.by.vault, phone: g.by.phone || null };
+  const vk = await Drive.children(S.f.vault);
+  for (const k of vk) {
+    if (k.name === "sessions" && k.mimeType === FOLDER) S.f.sessions = k.id;
+    if (k.name === "clients" && k.mimeType === FOLDER) S.f.clients = k.id;
+    if (k.name === "vault.json") S.f.meta = k.id;
+  }
+  if (!S.f.meta || !S.f.sessions || !S.f.clients) throw new Error("The Session Scribe folder is missing its vault files.");
+  if (S.f.phone) {
+    for (const k of await Drive.children(S.f.phone, "mimeType='" + FOLDER + "'")) S.f[k.name] = k.id;
+  }
+}
+
+// ------------------------------------------------------------------ unlocking
+async function unlockWithPassword(pw, onProgress) {
+  const meta = JSON.parse(await Drive.text(S.f.meta));
+  const keyB64 = await scrypt(te.encode(pw), b64ToBytes(meta.salt), meta.n, 8, 1, 32, onProgress);
+  return useKey(keyB64, meta);
+}
+async function useKey(raw, meta) {
+  meta = meta || JSON.parse(await Drive.text(S.f.meta));
+  const keys = await fernetKeys(raw);
+  let ok = false;
+  try { ok = td.decode(await fernetDecrypt(keys, meta.check)) === "session-scribe-vault-ok"; } catch (e) { ok = false; }
+  if (!ok) return false;
+  S.keys = keys; S.raw = new Uint8Array(raw);
+  return true;
+}
+async function listDevices() {
+  if (!S.f.devices) return [];
+  const out = [];
+  for (const f of await Drive.children(S.f.devices)) {
+    if (!f.name.endsWith(".json")) continue;
+    try { out.push(Object.assign(JSON.parse(await Drive.text(f.id)), { _file: f })); } catch (e) {}
+  }
+  return out;
+}
+function passkeysSupported() { return !!(window.PublicKeyCredential && navigator.credentials && window.isSecureContext); }
+async function kekFor(prfOut, pin, salt) {
+  const pinBits = await pbkdf2(te.encode(pin), salt, 32, 210000);
+  const ikm = new Uint8Array(await crypto.subtle.digest("SHA-256", concat(new Uint8Array(prfOut), pinBits)));
+  return crypto.subtle.importKey("raw", ikm, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+async function passkeyAssert(allow) {
+  const a = await navigator.credentials.get({ publicKey: {
+    challenge: rand(32), rpId: location.hostname, userVerification: "required", timeout: 120000,
+    allowCredentials: (allow || []).map(id => ({ type: "public-key", id: b64ToBytes(id), transports: ["internal", "hybrid"] })),
+    extensions: { prf: { eval: { first: PRF_SALT } } } } });
+  const r = a.getClientExtensionResults();
+  if (!r.prf || !r.prf.results || !r.prf.results.first) throw new Error("This phone's Face ID passkey can't unlock Session Scribe (it needs iOS 18 or later).");
+  return { prf: new Uint8Array(r.prf.results.first), id: bytesToB64(new Uint8Array(a.rawId), true) };
+}
+async function unlockWithFaceId(pin) {
+  const devs = await listDevices();
+  if (!devs.length) throw new Error("No phone is set up for Face ID yet — unlock with your vault password first.");
+  const a = await passkeyAssert(devs.map(d => d.cred));
+  const dev = devs.find(d => d.cred === a.id);
+  if (!dev) throw new Error("That passkey was removed in Settings on your computer. Unlock with your vault password and set it up again.");
+  let raw = null;
+  try {
+    const kek = await kekFor(a.prf, pin, b64ToBytes(dev.salt));
+    raw = new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBytes(dev.iv) }, kek, b64ToBytes(dev.wrapped)));
+  } catch (e) { raw = null; }
+  if (!raw || !(await useKey(raw))) {
+    dev.fails = (dev.fails || 0) + 1;
+    const file = dev._file; delete dev._file;
+    if (dev.fails >= MAX_PIN_FAILS) {
+      await Drive.remove(file.id);
+      throw new Error("Wrong PIN " + MAX_PIN_FAILS + " times, so Face ID unlock was turned off for this phone. Unlock with your vault password.");
+    }
+    await Drive.update(file.id, JSON.stringify(dev), "application/json");
+    throw new Error("Wrong PIN. " + (MAX_PIN_FAILS - dev.fails) + " tries left before Face ID unlock is turned off.");
+  }
+  S.deviceName = dev.name || "phone";
+  if (dev.fails) { dev.fails = 0; const file = dev._file; delete dev._file; await Drive.update(file.id, JSON.stringify(dev), "application/json"); }
+  return true;
+}
+async function enrollPhone(pin, name) {
+  if (!S.f.devices) throw new Error("Turn on Phone access in Settings on your computer first.");
+  const devid = rand(16);
+  const cred = await navigator.credentials.create({ publicKey: {
+    rp: { name: "Session Scribe", id: location.hostname },
+    user: { id: devid, name: "Session Scribe (" + name + ")", displayName: "Session Scribe — " + name },
+    challenge: rand(32), pubKeyCredParams: [{ type: "public-key", alg: -7 }, { type: "public-key", alg: -257 }],
+    authenticatorSelection: { authenticatorAttachment: "platform", residentKey: "required", requireResidentKey: true, userVerification: "required" },
+    timeout: 120000, attestation: "none", extensions: { prf: { eval: { first: PRF_SALT } } } } });
+  const ext = cred.getClientExtensionResults();
+  if (!ext.prf || ext.prf.enabled === false) throw new Error("This phone's passkeys can't unlock Session Scribe (it needs iOS 18 or later). Keep using your vault password.");
+  const credId = bytesToB64(new Uint8Array(cred.rawId), true);
+  let out = ext.prf.results && ext.prf.results.first ? new Uint8Array(ext.prf.results.first) : null;
+  if (!out) out = (await passkeyAssert([credId])).prf;
+  const salt = rand(16), iv = rand(12);
+  const kek = await kekFor(out, pin, salt);
+  const wrapped = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, kek, S.raw));
+  const dev = { v: 1, id: bytesToB64(devid, true), name, created: isoLocal(), cred: credId,
+                salt: bytesToB64(salt), iv: bytesToB64(iv), wrapped: bytesToB64(wrapped), fails: 0 };
+  await Drive.create(S.f.devices, dev.id + ".json", JSON.stringify(dev), "application/json");
+  S.deviceName = name;
+}
+
+// ------------------------------------------------------------------ the vault: patients and sessions
+async function loadIndex() {
+  const phoneFiles = S.f.phone ? await Drive.children(S.f.phone) : [];
+  const idxFiles = phoneFiles.filter(f => /^index-.*\.enc$/.test(f.name)).sort((a, b) => String(b.modifiedTime).localeCompare(a.modifiedTime));
+  let index = { sessions: {}, clients: [], time: 0 };
+  for (const f of idxFiles) {
+    try { index = await decJSON(S.keys, await Drive.text(f.id)); break; } catch (e) {}
+  }
+  const [sess, cls] = await Promise.all([Drive.children(S.f.sessions), Drive.children(S.f.clients)]);
+  S.files = {};
+  for (const f of sess) if (f.name.endsWith(".enc")) S.files[f.name.slice(0, -4)] = f;
+  // anything new or changed since the computer last published the index is read here (usually a few files)
+  const stale = Object.keys(S.files).filter(sid => !index.sessions[sid] || String(index.sessions[sid].z) !== String(S.files[sid].size));
+  for (const sid of Object.keys(index.sessions)) if (!S.files[sid]) delete index.sessions[sid];
+  await pool(stale.slice(0, 80), 6, async sid => {
+    try { const d = await openSession(sid); index.sessions[sid] = { m: d.doc.meta || {}, z: S.files[sid].size }; } catch (e) {}
+  });
+  const known = new Set((index.clients || []).map(c => c.id));
+  const live = new Set(cls.filter(f => f.name.endsWith(".enc")).map(f => f.name.slice(0, -4)));
+  index.clients = (index.clients || []).filter(c => live.has(c.id));
+  await pool([...live].filter(id => !known.has(id)), 6, async cid => {
+    try { const c = await openClient(cid); index.clients.push({ id: cid, code: c.doc.code || "?" }); } catch (e) {}
+  });
+  index.clients.sort((a, b) => String(a.code).toLowerCase().localeCompare(String(b.code).toLowerCase()));
+  S.index = index;
+  if (!idxFiles.length) toast("Tip: turn on Phone access in Settings on your computer — patient lists load much faster.", 6000);
+}
+async function pool(items, n, fn) {
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) await fn(items[i++]); }));
+}
+async function openSession(sid, fresh) {
+  const f = S.files[sid];
+  if (!f) throw new Error("That session isn't in Drive anymore.");
+  const have = S.docs.get(sid);
+  if (have && !fresh && have.file.md5Checksum === f.md5Checksum) return have;
+  const doc = await decJSON(S.keys, await Drive.text(f.id));
+  const e = { doc, file: f }; S.docs.set(sid, e); return e;
+}
+async function openClient(cid, fresh) {
+  const have = S.clientDocs.get(cid);
+  if (have && !fresh) return have;
+  const files = await Drive.children(S.f.clients, "name='" + Drive.esc(cid + ".enc") + "'");
+  if (!files.length) throw new Error("That patient isn't in Drive anymore.");
+  const e = { doc: await decJSON(S.keys, await Drive.text(files[0].id)), file: files[0] };
+  S.clientDocs.set(cid, e); return e;
+}
+function sessionsOf(cid) {
+  return Object.entries(S.index.sessions).filter(([, v]) => (v.m || {}).client_id === cid);
+}
+function groupByDate(entries) {
+  const g = {};
+  for (const [sid, v] of entries) (g[(v.m || {}).session_date || "undated"] = g[(v.m || {}).session_date || "undated"] || []).push([sid, v]);
+  const recKey = ([, v]) => [(v.m || {}).source === "imported" ? 1 : 0, (v.m || {}).kind !== "intake" ? 1 : 0, (v.m || {}).created || ""].join("|");
+  return Object.entries(g).map(([day, recs]) => [day, recs.sort((a, b) => recKey(a).localeCompare(recKey(b)))])
+    .sort((a, b) => b[0].localeCompare(a[0]));             // newest first on the phone
+}
+function dayTitle(metas) {
+  if (metas.some(m => m.kind === "intake")) return "Intake";
+  if (metas.length && metas.every(m => m.kind === "parent")) {
+    const names = new Set(metas.map(m => CONTACT_NAMES[contactWith(m)][2]));
+    return names.size === 1 ? [...names][0] : "Outside contacts";
+  }
+  const num = (metas.find(m => m.session_number) || {}).session_number;
+  return num ? "Session " + num : "Session";
+}
+function recordDocs(d) {
+  const m = d.meta || {}, intake = m.kind === "intake";
+  if (m.source === "imported") return [[intake ? "Imported intake" : m.kind === "parent" ? "Imported " + CONTACT_NAMES[contactWith(m)][2].toLowerCase() : "Imported note", "note"]];
+  const L = m.kind === "parent" ? CONTACT_NAMES[contactWith(m)] : (KIND_LABELS[m.kind] || KIND_LABELS.progress), docs = [[L[0], "note"]];
+  if ((d.overview || "").trim()) docs.push([L[1], "overview"]);
+  if ((d.transcript || "").trim()) docs.push([m.source === "messages" ? "Messages" : "Transcript", "transcript"]);
+  return docs;
+}
+async function saveSession(sid, change) {
+  const e = S.docs.get(sid);
+  const cur = await Drive.meta(e.file.id);
+  if (cur.md5Checksum && e.file.md5Checksum && cur.md5Checksum !== e.file.md5Checksum)
+    throw new Error("This session was changed on a computer since you opened it. Go back, open it again and redo your change.");
+  const doc = JSON.parse(JSON.stringify(e.doc));
+  change(doc);
+  doc.meta = doc.meta || {}; doc.meta.updated = isoLocal();
+  const nf = await Drive.update(e.file.id, await encJSON(S.keys, doc));
+  const file = Object.assign({}, e.file, nf);
+  S.docs.set(sid, { doc, file }); S.files[sid] = file;
+  S.index.sessions[sid] = { m: doc.meta, z: file.size };
+}
+
+// ------------------------------------------------------------------ relay to a computer (questions, queue)
+async function loadStatus() {
+  if (!S.f.phone) return {};
+  const files = (await Drive.children(S.f.phone)).filter(f => /^status-.*\.enc$/.test(f.name));
+  const out = {};
+  await pool(files, 4, async f => {
+    try { const st = await decJSON(S.keys, await Drive.text(f.id)); if (st.computer) out[st.computer] = st; } catch (e) {}
+  });
+  S.status = out;
+  return out;
+}
+function online(st) { return st && Date.now() / 1000 - (st.time || 0) < ONLINE_SECS; }
+async function sendRequest(to, body, onReply) {
+  if (!S.f.requests || !S.f.replies) throw new Error("Turn on Phone access in Settings on your computer first.");
+  const id = hex(rand(16));
+  const req = Object.assign({ v: 1, id, to, device: S.deviceName || "phone", time: Date.now() / 1000 }, body);
+  await Drive.create(S.f.requests, id + ".enc", await encJSON(S.keys, req));
+  S.pending[id] = { to, sentAt: Date.now(), onReply };
+  pollReply(id);
+  return id;
+}
+async function pollReply(id) {
+  const p = S.pending[id];
+  if (!p || !S.keys) return;
+  let delay = 3000;
+  try {
+    const f = (await Drive.children(S.f.replies, "name='" + id + ".enc'"))[0];
+    if (f && f.md5Checksum !== p.md5) {
+      p.md5 = f.md5Checksum;
+      const rep = await decJSON(S.keys, await Drive.text(f.id));
+      const final = rep.state === "done" || rep.state === "error";
+      if (final) { delete S.pending[id]; Drive.remove(f.id).catch(() => {}); }
+      p.onReply(rep, final);
+      if (final) return;
+    } else if (!f && Date.now() - p.sentAt > 10 * 60 * 1000) {
+      delete S.pending[id];
+      p.onReply({ state: "error", text: "The computer didn't answer within 10 minutes. Is Session Scribe open on it, with Phone access turned on?" }, true);
+      return;
+    } else if (!f) {
+      p.onReply({ state: "sent", waited: (Date.now() - p.sentAt) / 1000 }, false);
+      delay = 4000;
+    }
+  } catch (e) { if (e instanceof AuthError) return onAuthLost(); delay = 6000; }
+  if (S.pending[id]) S.timers.push(setTimeout(() => pollReply(id), delay));
+}
+
+// ------------------------------------------------------------------ screens
+function go(view) { S.view = view; render(); }
+function render() {
+  if (!S.keys) return;
+  const v = S.view;
+  try {
+    if (v.name === "patients") return showPatients();
+    if (v.name === "patient") return showPatient(v.cid);
+    if (v.name === "day") return showDay(v.cid, v.day, v.tab || 0);
+    if (v.name === "edit") return showEdit(v);
+    if (v.name === "ask") return showAsk(v.cid, v.chat);
+    if (v.name === "queue") return showQueue();
+    if (v.name === "more") return showMore();
+  } catch (e) { screen("Session Scribe", {}, h("p", { class: "bad", text: errText(e) })); }
+}
+function onAuthLost() {
+  wipe();
+  screen("Session Scribe", {}, h("div", { class: "hero center" }, h("h2", { text: "Google sign-in expired" }),
+    h("p", { class: "muted", text: "Patient information was cleared from this screen. Sign in again to carry on." }),
+    h("button", { class: "btn primary wide", onclick: () => Auth.signIn() }, "Sign in with Google")));
+}
+async function guarded(fn, where) {
+  try { await fn(); }
+  catch (e) {
+    if (e instanceof AuthError) return onAuthLost();
+    (where || toast)(errText(e));
+  }
+}
+
+function showStart(msg) {
+  screen("Session Scribe", {},
+    h("div", { class: "hero center" }, h("h2", { text: "Session Scribe" }),
+      h("p", { class: "muted", text: "Your notes, straight from your secure Google Drive. Nothing is saved on this phone." }),
+      msg ? h("p", { class: "bad", text: msg }) : null,
+      h("button", { class: "btn primary wide", onclick: () => Auth.signIn() }, "Sign in with Google")),
+    h("p", { class: "muted small center", text: "Build " + CFG.build }));
+}
+async function showUnlock(note) {
+  if (!Auth.valid()) return showStart(note && note.startsWith("Locked") ? "" : note);
+  const err = h("p", { class: "bad" }), body = h("div", {}, spinner("Checking this phone…"));
+  screen("Session Scribe", {}, h("div", { class: "hero" }, h("h2", { text: "🔒 Locked" }),
+    note ? h("p", { class: "muted", text: note }) : null), err, body);
+  let devs = [];
+  try { if (!S.root) await findFolders(); devs = passkeysSupported() ? await listDevices() : []; }
+  catch (e) { if (e instanceof AuthError) return onAuthLost(); body.replaceChildren(); err.textContent = errText(e); return; }
+  const pin = h("input", { type: "password", inputmode: "numeric", autocomplete: "off", placeholder: "PIN", maxlength: "12" });
+  const pw = h("input", { type: "password", autocomplete: "off", autocapitalize: "off", spellcheck: "false", placeholder: "Vault password" });
+  const prog = h("div", { class: "bar" }, h("div"));
+  prog.style.display = "none";
+  const after = async () => { S.lastTouch = Date.now(); body.replaceChildren(spinner("Loading your patients…")); await loadIndex(); go({ name: "patients" }); };
+  const faceBtn = h("button", { class: "btn primary wide", onclick: () => guarded(async () => {
+    err.textContent = "";
+    if (!pin.value) { err.textContent = "Enter your PIN, then tap Unlock."; return; }
+    faceBtn.disabled = true;
+    try { await unlockWithFaceId(pin.value); pin.value = ""; await after(); } finally { faceBtn.disabled = false; }
+  }, m => { err.textContent = m; }) }, "Unlock with Face ID");
+  const pwBtn = h("button", { class: "btn wide" + (devs.length ? "" : " primary"), onclick: () => guarded(async () => {
+    err.textContent = "";
+    if (!pw.value) { err.textContent = "Enter your vault password."; return; }
+    pwBtn.disabled = true; prog.style.display = "";
+    try {
+      const ok = await unlockWithPassword(pw.value, f => { prog.firstChild.style.width = Math.round(f * 100) + "%"; });
+      pw.value = "";
+      if (!ok) { err.textContent = "Incorrect password."; return; }
+      await after();
+    } finally { pwBtn.disabled = false; prog.style.display = "none"; }
+  }, m => { err.textContent = m; }) }, "Unlock with password");
+  pin.addEventListener("keydown", e => { if (e.key === "Enter") faceBtn.click(); });
+  pw.addEventListener("keydown", e => { if (e.key === "Enter") pwBtn.click(); });
+  body.replaceChildren(
+    devs.length ? h("div", { class: "card" }, h("label", { class: "f", text: "PIN" }), pin, faceBtn) : null,
+    h("div", { class: "card" }, h("label", { class: "f", text: devs.length ? "Or your vault password" : "Vault password" }), pw, prog, pwBtn,
+      !devs.length && passkeysSupported() ? h("p", { class: "muted small", text: "After unlocking, you can set up Face ID + PIN under Phone." }) : null));
+  (devs.length ? pin : pw).focus();
+}
+
+function showPatients() {
+  const q = S.view.q || "";
+  const box = h("input", { type: "search", placeholder: "Find a patient", value: q, autocomplete: "off", autocorrect: "off", spellcheck: "false" });
+  const list = h("div", { class: "list" });
+  const fill = () => {
+    const t = box.value.trim().toLowerCase(); S.view.q = box.value;
+    const rows = S.index.clients.filter(c => !t || String(c.code).toLowerCase().includes(t)).map(c => {
+      const ss = sessionsOf(c.id), rev = ss.filter(([, v]) => (v.m || {}).needs_review).length;
+      const last = ss.map(([, v]) => (v.m || {}).session_date || "").sort().pop();
+      return h("button", { class: "item", onclick: () => go({ name: "patient", cid: c.id }) },
+        h("div", { class: "grow" }, h("div", { class: "t", text: c.code }),
+          h("div", { class: "muted small", text: ss.length + " session" + (ss.length === 1 ? "" : "s") + (last ? " · last " + fmtDate(last) : "") })),
+        rev ? h("span", { class: "chip warn", text: rev + " to review" }) : null, h("span", { class: "muted", text: "›" }));
+    });
+    list.replaceChildren(...(rows.length ? rows : [h("div", { class: "item muted", text: "No patients found." })]));
+  };
+  box.addEventListener("input", fill);
+  screen("Patients", { right: h("button", { class: "icon", onclick: () => guarded(async () => { await loadIndex(); render(); }) }, "↻") }, box, list);
+  fill();
+}
+function clientCode(cid) { return (S.index.clients.find(c => c.id === cid) || {}).code || "Patient"; }
+function showPatient(cid) {
+  const days = groupByDate(sessionsOf(cid));
+  const rows = days.map(([day, recs]) => {
+    const metas = recs.map(([, v]) => v.m || {}), rev = metas.some(m => m.needs_review);
+    return h("button", { class: "item", onclick: () => go({ name: "day", cid, day }) },
+      h("div", { class: "grow" }, h("div", { class: "t", text: dayTitle(metas) }), h("div", { class: "muted small", text: fmtDate(day) })),
+      rev ? h("span", { class: "chip warn", text: "review" }) : null, h("span", { class: "muted", text: "›" }));
+  });
+  screen(clientCode(cid), { back: () => go({ name: "patients", q: S.view.q }) },
+    h("button", { class: "btn primary wide", onclick: () => go({ name: "ask", cid }) }, "💬  Ask about this patient"),
+    h("div", { class: "list" }, ...(rows.length ? rows : [h("div", { class: "item muted", text: "No sessions yet." })])));
+}
+async function showDay(cid, day, tab) {
+  screen(clientCode(cid), { back: () => go({ name: "patient", cid }) }, spinner("Decrypting…"));
+  const recs = groupByDate(sessionsOf(cid)).find(([d]) => d === day);
+  if (!recs) return go({ name: "patient", cid });
+  let loaded;
+  try { loaded = await Promise.all(recs[1].map(async ([sid]) => [sid, (await openSession(sid)).doc])); }
+  catch (e) { if (e instanceof AuthError) return onAuthLost(); return screen(clientCode(cid), { back: () => go({ name: "patient", cid }) }, h("p", { class: "bad", text: errText(e) })); }
+  if (S.view.name !== "day" || S.view.day !== day) return;      // moved on meanwhile
+  const docs = [], seen = {};
+  for (const [sid, d] of loaded) for (const [label, key] of recordDocs(d)) {
+    seen[label] = (seen[label] || 0) + 1;
+    docs.push({ label: seen[label] === 1 ? label : label + " (" + seen[label] + ")", key, sid, d });
+  }
+  tab = Math.min(tab, docs.length - 1);
+  const cur = docs[tab];
+  const banners = loaded.filter(([, d]) => (d.meta || {}).needs_review).map(([sid, d]) =>
+    h("div", { class: "banner" }, h("div", { text: "⚠ Drafted unattended from the recording queue — " + (d.meta.review_reason || "please review") + "." }),
+      h("button", { class: "btn wide", onclick: () => guarded(async () => {
+        await saveSession(sid, doc => { doc.meta.needs_review = false; delete doc.meta.review_reason; });
+        toast("Marked as reviewed."); render();
+      }) }, "✓ Mark as reviewed")));
+  const editable = cur && cur.key !== "transcript";
+  screen(clientCode(cid), { back: () => go({ name: "patient", cid }),
+      right: editable ? h("button", { class: "icon", onclick: () => go({ name: "edit", cid, day, tab, sid: cur.sid, key: cur.key, label: cur.label }) }, "Edit") : null },
+    h("div", { class: "muted", text: dayTitle(loaded.map(([, d]) => d.meta || {})) + " — " + fmtDate(day) }),
+    banners,
+    h("div", { class: "seg" }, docs.map((x, i) => h("button", { class: i === tab ? "on" : "", onclick: () => go({ name: "day", cid, day, tab: i }) }, x.label))),
+    cur ? h("div", { class: "card doc", text: cur.d[cur.key] || "(empty)" }) : h("p", { class: "muted", text: "Nothing saved for this date." }),
+    cur && cur.key === "transcript" ? h("p", { class: "muted small", text: "Transcripts are edited on the computer (speaker labels and timing go with them)." }) : null);
+}
+function showEdit(v) {
+  const e = S.docs.get(v.sid);
+  if (!e) return go({ name: "day", cid: v.cid, day: v.day, tab: v.tab });
+  const ta = h("textarea", { autocorrect: "off", autocomplete: "off", spellcheck: "false" });
+  ta.value = e.doc[v.key] || "";
+  const save = h("button", { class: "btn primary wide", onclick: () => guarded(async () => {
+    save.disabled = true; save.textContent = "Saving…";
+    try {
+      await saveSession(v.sid, doc => { doc[v.key] = ta.value.replace(/\s+$/, ""); });
+      toast("Saved to your encrypted vault."); go({ name: "day", cid: v.cid, day: v.day, tab: v.tab });
+    } finally { save.disabled = false; save.textContent = "Save changes"; }
+  }) }, "Save changes");
+  screen("Edit " + v.label.toLowerCase(), { back: () => {
+      if (ta.value !== (e.doc[v.key] || "") && !confirm("Discard your changes?")) return;
+      go({ name: "day", cid: v.cid, day: v.day, tab: v.tab }); } },
+    h("p", { class: "muted small", text: clientCode(v.cid) + " · " + fmtDate(v.day) + ". Leaving the app locks it and discards unsaved changes." }),
+    ta, save);
+}
+
+// --- patient AI questions, answered by a computer with LM Studio
+function pickComputer(need) {
+  const all = Object.values(S.status).filter(online);
+  const ok = all.filter(st => !need || st.lm_ready);
+  ok.sort((a, b) => (a.busy ? 1 : 0) - (b.busy ? 1 : 0) || (b.time - a.time));
+  return { pick: ok[0] || null, any: all };
+}
+async function showAsk(cid, chatId) {
+  screen("Ask · " + clientCode(cid), { back: () => go({ name: "patient", cid }) }, spinner("Loading…"));
+  let c;
+  try { [c] = await Promise.all([openClient(cid, true), loadStatus()]); }
+  catch (e) { if (e instanceof AuthError) return onAuthLost(); return toast(errText(e)); }
+  if (S.view.name !== "ask" || S.view.cid !== cid) return;
+  const chats = (c.doc.chats || []).slice().sort((a, b) => String(b.updated || b.created).localeCompare(a.updated || a.created));
+  const chat = chats.find(x => x.id === chatId) || null;
+  const { pick, any } = pickComputer(true);
+  const where = pick ? h("p", { class: "muted small", text: "Answered by " + (pick.name || pick.computer) + (pick.busy ? " (it pauses what it's doing to answer first)" : "") + "." })
+    : h("div", { class: "banner", text: any.length ? "LM Studio isn't running on " + any.map(s => s.name || s.computer).join(" or ") + ", so questions can't be answered right now."
+      : "No computer is on with Session Scribe open (and Phone access turned on), so questions can't be answered right now. You can still read and edit notes." });
+  const thread = h("div", {});
+  const showMsgs = msgs => thread.replaceChildren(...msgs.map(m => h("div", { class: "msg " + (m.role === "user" ? "user" : "ai"), text: m.text })));
+  showMsgs(chat ? chat.messages || [] : []);
+  const q = h("textarea", { placeholder: "Ask a question about " + clientCode(cid) + "…", autocorrect: "off", spellcheck: "false" });
+  q.style.minHeight = "90px";
+  const live = h("div", {});
+  const send = h("button", { class: "btn primary wide", disabled: !pick, onclick: () => guarded(async () => {
+    const text = q.value.trim(); if (!text) return;
+    send.disabled = true; q.disabled = true;
+    thread.append(h("div", { class: "msg user", text }));
+    const ans = h("div", { class: "msg ai" }, spinner("Sending to " + (pick.name || pick.computer) + "…"));
+    thread.append(ans);
+    await sendRequest(pick.computer, { type: "ask", cid, chat_id: chat ? chat.id : null, question: text }, (rep, final) => {
+      if (!document.body.contains(ans)) return;
+      if (rep.state === "sent") ans.replaceChildren(spinner(rep.waited > 25 ? "Waiting for " + (pick.name || pick.computer) + " to receive it — Google Drive can take up to a minute…" : "Sent…"));
+      else if (rep.state === "waiting") ans.replaceChildren(spinner(rep.text || "Waiting in line on the computer…"));
+      else if (rep.state === "working") ans.replaceChildren(rep.text ? document.createTextNode(rep.text) : spinner("Answering…"));
+      else if (rep.state === "done") { ans.textContent = rep.text; S.clientDocs.delete(cid); if (rep.chat_id) S.view.chat = rep.chat_id; q.value = ""; }
+      else if (rep.state === "error") { ans.replaceChildren(h("span", { class: "bad", text: "⚠ " + (rep.text || "Something went wrong.") })); }
+      if (final) { send.disabled = false; q.disabled = false; }
+    });
+  }) }, "Send");
+  const pickRow = h("div", { class: "seg" },
+    h("button", { class: chat ? "" : "on", onclick: () => go({ name: "ask", cid }) }, "＋ New"),
+    chats.slice(0, 12).map(x => h("button", { class: chat && chat.id === x.id ? "on" : "", onclick: () => go({ name: "ask", cid, chat: x.id }) }, (x.title || "Chat").slice(0, 28))));
+  if (!pick) S.timers.push(setTimeout(() => {           // check again shortly: a computer may just be starting up
+    if (S.keys && S.view.name === "ask" && S.view.cid === cid && !q.value.trim()) showAsk(cid, chatId);
+  }, 10000));
+  screen("Ask · " + clientCode(cid), { back: () => go({ name: "patient", cid }) }, pickRow, thread, live, q, send, where,
+    h("p", { class: "muted small", text: "Answers are saved with the patient (as on the computer). Names are hidden from the AI as usual." }));
+}
+
+// --- the recording queue on each computer
+const STATUS_WORDS = { waiting: "Waiting", transcribing: "Transcribing", writing: "Writing notes", done: "Done", transcribed: "Transcribed",
+                       failed: "Failed", sent: "Sent to the other computer", cancelled: "Cancelled" };
+async function showQueue() {
+  const body = h("div", {}, spinner("Checking your computers…"));
+  screen("Queue", { right: h("button", { class: "icon", onclick: () => render() }, "↻") }, body);
+  try { await loadStatus(); } catch (e) { if (e instanceof AuthError) return onAuthLost(); body.replaceChildren(h("p", { class: "bad", text: errText(e) })); return; }
+  if (S.view.name !== "queue") return;
+  const sts = Object.values(S.status).sort((a, b) => b.time - a.time);
+  if (!sts.length) { body.replaceChildren(h("div", { class: "banner", text: "No computer has shared its queue yet. In Session Scribe on the computer: Settings → Phone → turn on Phone access." })); return; }
+  const cmd = (st, action, seq) => guarded(async () => {
+    if (!online(st)) return toast((st.name || st.computer) + " seems to be off — the command would wait until it's on.");
+    toast("Sent — " + (st.name || st.computer) + " acts on it when it receives it (usually within a minute).", 5000);
+    await sendRequest(st.computer, { type: "queue", action, seq: seq == null ? null : seq }, (rep, final) => {
+      if (final) { toast((rep.state === "error" ? "⚠ " : "✓ ") + (rep.text || "Done."), 5000); if (S.view.name === "queue") render(); }
+    });
+  });
+  body.replaceChildren(...sts.map(st => {
+    const on = online(st), Q = st.queue || { items: [] };
+    const items = Q.items || [], movable = items.filter(it => it.status === "waiting" || it.status === "failed");
+    const head = h("div", { class: "row" }, h("div", { class: "grow" }, h("div", { class: "t", text: st.name || st.computer }),
+      h("div", { class: "muted small", text: (on ? "On" : "Off or asleep") + " · updated " + ago(st.time) + (st.locked ? " · locked" : "") + (st.lm_ready ? "" : " · LM Studio not running") })),
+      h("span", { class: "chip" + (on ? "" : " warn"), text: on ? "online" : "offline" }));
+    const task = st.busy ? h("div", {}, h("div", { class: "small", text: (st.paused ? "⏸ Paused: " : "") + (st.status || st.task || "Working…") }),
+      st.pct != null ? h("div", { class: "bar" }, h("div", { style: "width:" + Math.round(st.pct) + "%" })) : null,
+      h("div", { class: "muted small", text: (st.pct != null ? Math.round(st.pct) + "%" : "") + (st.left != null && !st.paused ? " · " + fmtLeft(st.left) : "") }))
+      : st.paused ? h("div", { class: "small", text: "⏸ " + (st.status || "Paused") }) : h("div", { class: "muted small", text: "Nothing running." });
+    const btns = h("div", { class: "row", style: "flex-wrap:wrap;margin-top:8px" },
+      st.can_pause ? h("button", { class: "btn", onclick: () => cmd(st, "pause") }, "⏸ Pause") : null,
+      st.paused ? h("button", { class: "btn primary", onclick: () => cmd(st, "resume") }, "▶ Resume") : null,
+      Q.running && !Q.stop ? h("button", { class: "btn", onclick: () => cmd(st, "stop") }, "Stop after this one") : null,
+      !Q.running && movable.length ? h("button", { class: "btn primary", onclick: () => cmd(st, "start") }, "▶ Start queue") : null);
+    const list = items.length ? h("div", { class: "list" }, items.map(it => {
+      const i = movable.indexOf(it);
+      return h("div", { class: "item" }, h("div", { class: "grow" },
+        h("div", { class: "t", text: it.code + " · " + fmtDate(it.date) }),
+        h("div", { class: "muted small", text: (STATUS_WORDS[it.status] || it.status) + (it.left != null && (it.status === "waiting" || it.status === "transcribing" || it.status === "writing") ? " · " + fmtLeft(it.left).replace(" left", "") : "") + (it.error ? " — " + it.error : "") })),
+        i >= 0 ? h("span", {},
+          h("button", { class: "icon", disabled: i <= 0, onclick: () => cmd(st, "up", it.seq) }, "▲"),
+          h("button", { class: "icon", disabled: i < 0 || i >= movable.length - 1, onclick: () => cmd(st, "down", it.seq) }, "▼")) : null);
+    })) : h("p", { class: "muted small", text: "The queue is empty." });
+    return h("div", { class: "card" }, head, task, btns, list,
+      Q.left != null && Q.running ? h("p", { class: "muted small", text: "Whole queue: " + fmtLeft(Q.left) }) : null);
+  }));
+  S.timers.push(setTimeout(() => { if (S.view.name === "queue" && S.keys) showQueue(); }, 15000));
+}
+
+// --- this phone
+async function showMore() {
+  const body = h("div", {}, spinner("Loading…"));
+  screen("Phone", {}, body);
+  let devs = [];
+  try { devs = await listDevices(); } catch (e) { if (e instanceof AuthError) return onAuthLost(); }
+  if (S.view.name !== "more") return;
+  const err = h("p", { class: "bad" });
+  const name = h("input", { value: S.deviceName || "iPhone", autocomplete: "off" });
+  const pin1 = h("input", { type: "password", inputmode: "numeric", autocomplete: "off", placeholder: "New PIN (4–12 digits)", maxlength: "12" });
+  const pin2 = h("input", { type: "password", inputmode: "numeric", autocomplete: "off", placeholder: "Same PIN again", maxlength: "12" });
+  const setup = h("button", { class: "btn primary wide", onclick: () => guarded(async () => {
+    err.textContent = "";
+    if (!/^\d{4,12}$/.test(pin1.value)) { err.textContent = "Choose a PIN of 4 to 12 digits."; return; }
+    if (pin1.value !== pin2.value) { err.textContent = "The two PINs don't match."; return; }
+    setup.disabled = true;
+    try { await enrollPhone(pin1.value, name.value.trim() || "iPhone"); pin1.value = pin2.value = ""; toast("Face ID + PIN is set up on this phone."); render(); }
+    finally { setup.disabled = false; }
+  }, m => { err.textContent = m; }) }, "Set up Face ID + PIN");
+  body.replaceChildren(
+    h("div", { class: "card" }, h("div", { class: "t", text: "Face ID + PIN" }),
+      h("p", { class: "muted small", text: "Unlock with Face ID and a short PIN instead of your vault password. Both are needed. The unlock key is kept wrapped in your Drive folder — never on this phone." }),
+      passkeysSupported() ? [h("label", { class: "f", text: "Name for this phone" }), name, h("label", { class: "f", text: "PIN" }), pin1, pin2, err, setup]
+        : h("p", { class: "warn small", text: "This browser can't use Face ID passkeys here." })),
+    devs.length ? h("div", { class: "card" }, h("div", { class: "t", text: "Phones set up" }),
+      h("div", { class: "list" }, devs.map(d => h("div", { class: "item" }, h("div", { class: "grow" }, h("div", { text: d.name || "Phone" }),
+        h("div", { class: "muted small", text: "Set up " + fmtDate((d.created || "").slice(0, 10)) })),
+        h("button", { class: "icon bad", onclick: () => guarded(async () => {
+          if (!confirm("Turn off Face ID unlock for " + (d.name || "this phone") + "?")) return;
+          await Drive.remove(d._file.id); toast("Removed."); render();
+        }) }, "Remove"))))) : null,
+    h("div", { class: "card" }, h("div", { class: "t", text: "Privacy" }),
+      h("p", { class: "muted small", text: "Nothing is stored on this phone: patient information is decrypted in memory and cleared when you lock, leave the app or stop using it for 5 minutes. Everything stays in your Google Drive, encrypted." }),
+      h("p", { class: "muted small", text: "Build " + CFG.build })));
+}
+
+// ------------------------------------------------------------------ start
+(function start() {
+  if (!window.crypto || !crypto.subtle) { document.getElementById("app").textContent = "This page must be opened over https."; return; }
+  const got = Auth.takeFromUrl();
+  if (got === true) return showUnlock("");
+  showStart(typeof got === "string" ? got : "");
+})();
+'''
+
+
+# --------------------------------------------------------------------------- #
 # Encrypted vault
 # --------------------------------------------------------------------------- #
+OPEN_DIR = os.path.join(LOCAL_DIR, "opened-files")      # readable copies made by "Open"; wiped on close
+
+
+def wipe_open_copies():
+    try:
+        for fn in os.listdir(OPEN_DIR):
+            wipe_file(os.path.join(OPEN_DIR, fn))
+    except OSError:
+        pass
+
+
 def wipe_file(path):
     """Overwrite with zeros, then delete. (On SSDs this isn't a guarantee —
     BitLocker is what really protects deleted data.)"""
@@ -922,6 +2044,42 @@ def wipe_file(path):
 # ---- sync check (two computers sharing the data folder through Google Drive) -------------
 SYNC_DIR = "sync"
 _HASH_CACHE = {}
+_HASH_LOCK = threading.Lock()
+_HASH_STATE = {"loaded": False, "dirty": False}
+
+
+def _hash_cache_path():
+    return os.path.join(LOCAL_DIR, "cache", "file-hashes.json")
+
+
+def _hash_cache_load():
+    """Hashes of the encrypted files, remembered between launches (random file names and
+    hashes only — nothing about patients), so the sync check doesn't re-read every file."""
+    if _HASH_STATE["loaded"]:
+        return
+    _HASH_STATE["loaded"] = True
+    try:
+        with open(_hash_cache_path(), encoding="utf-8") as f:
+            for k, h in json.load(f).items():
+                full, size, mt = k.rsplit("|", 2)
+                _HASH_CACHE[(full, int(size), int(mt))] = h
+    except (OSError, ValueError, TypeError):
+        pass
+
+
+def _hash_cache_save(live):
+    if not _HASH_STATE["dirty"]:
+        return
+    try:
+        keep = {f"{k[0]}|{k[1]}|{k[2]}": h for k, h in _HASH_CACHE.items() if k in live}
+        os.makedirs(os.path.dirname(_hash_cache_path()), exist_ok=True)
+        tmp = _hash_cache_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(keep, f)
+        _replace_with_retry(tmp, _hash_cache_path())
+        _HASH_STATE["dirty"] = False
+    except OSError:
+        pass
 
 
 def this_computer():
@@ -932,28 +2090,44 @@ def file_manifest(root):
     """{relative path: [content hash, modified time]} for everything that syncs: the encrypted
     vault, templates and shared settings. Hashes are cached, so repeat checks are quick."""
     out = {}
-    for sub in ("vault", "templates"):
-        base = os.path.join(root, sub)
-        for dp, dns, fns in os.walk(base):
-            dns[:] = [d for d in dns if not d.startswith(".")]
-            for fn in fns:
+    with _HASH_LOCK:
+        _hash_cache_load()
+        live = set()
+
+        def walk(d):
+            try:
+                with os.scandir(d) as it:
+                    ents = list(it)
+            except OSError:
+                return
+            for e in ents:
+                fn = e.name
+                if e.is_dir(follow_symlinks=False):
+                    if not fn.startswith("."):
+                        walk(e.path)
+                    continue
                 if fn.endswith((".tmp", ".part")) or fn.startswith(("~$", ".")) or fn == "deleted.json":
                     continue
-                full = os.path.join(dp, fn)
                 try:
-                    st = os.stat(full)
+                    st = e.stat()           # (comes with the listing on Windows: no extra request)
                 except OSError:
                     continue
-                key = (full, st.st_size, st.st_mtime_ns)
+                key = (e.path, st.st_size, st.st_mtime_ns)
+                live.add(key)
                 h = _HASH_CACHE.get(key)
                 if h is None:
                     try:
-                        with open(full, "rb") as f:
+                        with open(e.path, "rb") as f:
                             h = hashlib.sha256(f.read()).hexdigest()[:20]
                     except OSError:
                         continue
                     _HASH_CACHE[key] = h
-                out[os.path.relpath(full, root).replace(os.sep, "/")] = [h, int(st.st_mtime)]
+                    _HASH_STATE["dirty"] = True
+                out[os.path.relpath(e.path, root).replace(os.sep, "/")] = [h, int(st.st_mtime)]
+
+        for sub in ("vault", "templates"):
+            walk(os.path.join(root, sub))
+        _hash_cache_save(live)
     sp = os.path.join(root, SHARED_SETTINGS)
     if os.path.isfile(sp):
         with open(sp, "rb") as f:
@@ -1787,6 +2961,15 @@ REMOTE_POLL_MS = 15_000              # how often each side checks the handoff fo
 REMOTE_FAST_MS = 6_000               # ...and how often while a handoff is actually in flight
 REMOTE_BEAT_SECS = 60                # how often "I'm open" is refreshed
 REMOTE_FINAL = ("done", "transcribed", "failed", "cancelled")
+REMOTE_CALLOFF_SECS = 2 * 3600       # a called-off job the other computer never confirms is tidied after this
+
+
+def remote_calloff_age(root, jid):
+    """Seconds since this job was called off (0 if it can't be told)."""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(os.path.join(root, "cancel", jid)))
+    except OSError:
+        return 0.0
 
 
 def computer_id(cfg):
@@ -1955,11 +3138,14 @@ class RemoteProgressPublisher:
 
     def update(self, text, pct=None):
         """Cheap and never blocks: safe to call from the progress callback."""
+        text = _TICK_RE.sub("", text or "")          # "… (1:20)" is the local timer, not a new step
+        eta = getattr(_TASK, "eta", None)
         with self._lk:
             now = time.time()
             if text != self._step:
                 self._step, self._since = text, now
             self._latest, self._dirty, self._touched = (text, pct), True, now
+            self._eta = (eta, now) if eta is not None else None
         self._ev.set()
 
     def close(self):
@@ -1988,6 +3174,9 @@ class RemoteProgressPublisher:
                 try:
                     st = dict(id=self.jid, status=self.stage, time=int(now), build=APP_BUILD,
                               host=platform.node(), pct=pct, text=(text or "")[:120], step_since=int(since))
+                    e = getattr(self, "_eta", None)
+                    if e:
+                        st["eta"] = round(max(0.0, e[0] - (now - e[1])), 1)
                     self.vault._atomic_write(_rpath(self.root, "status", self.jid + ".st"),
                                              self.vault.fernet.encrypt(json.dumps(st).encode("utf-8")))
                     self.writes += 1
@@ -2174,6 +3363,7 @@ class Vault:
         self.folder = folder
         self.sessions_dir = os.path.join(folder, "sessions")
         self.clients_dir = os.path.join(folder, "clients")
+        self.files_dir = os.path.join(folder, "files")      # patients' documents (registration forms…)
         self.meta_path = os.path.join(folder, "vault.json")
         self.settings_path = os.path.join(folder, "settings.enc")
         self.fernet = None
@@ -2182,6 +3372,12 @@ class Vault:
         # changed — e.g. synced from the other computer — are read again)
         self._idx = {}
         self._ilock = threading.Lock()
+        # Decrypted files kept in memory, keyed by the file's (mtime, size): a file is read from the shared
+        # drive again only if it changed (e.g. synced from the other computer). Wiped when the app locks.
+        self._plain = collections.OrderedDict()       # "s:<sid>" / "c:<cid>" -> (stamp, plaintext bytes)
+        self._plain_bytes = 0
+        self._clock = threading.Lock()
+        self._index_dirty, self._index_saved = False, 0.0
 
     @property
     def exists(self):
@@ -2196,6 +3392,7 @@ class Vault:
     def _dirs(self):
         os.makedirs(self.sessions_dir, exist_ok=True)
         os.makedirs(self.clients_dir, exist_ok=True)
+        os.makedirs(self.files_dir, exist_ok=True)
 
     def create(self, password):
         from cryptography.fernet import Fernet
@@ -2207,6 +3404,7 @@ class Vault:
                 "check": Fernet(key).encrypt(self.CHECK).decode()}
         self._atomic_write(self.meta_path, json.dumps(meta).encode())
         self.fernet = Fernet(key)
+        set_checkpoint_secret(key)
 
     def _key_for(self, password):
         from cryptography.fernet import Fernet, InvalidToken
@@ -2223,9 +3421,107 @@ class Vault:
         key = self._key_for(password)
         if key:
             self.fernet = Fernet(key)
+            set_checkpoint_secret(key)
             self._dirs()
+            self._load_local_index()
             self.migrate()
+            self.save_local_index()
         return key is not None
+
+    # --- speed: what's already been decrypted isn't read from the shared drive again
+    CACHE_BUDGET = 96 * 1024 * 1024        # decrypted sessions kept in memory (most recently used)
+
+    @staticmethod
+    def _stamp_of(path):
+        try:
+            st = os.stat(path)
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _cached(self, key, stamp):
+        with self._clock:
+            hit = self._plain.get(key)
+            if hit is not None and stamp is not None and hit[0] == stamp:
+                self._plain.move_to_end(key)
+                return hit[1]
+        return None
+
+    def _cache_put(self, key, stamp, plain):
+        if stamp is None:
+            return
+        with self._clock:
+            old = self._plain.pop(key, None)
+            if old is not None:
+                self._plain_bytes -= len(old[1])
+            self._plain[key] = (stamp, plain)
+            self._plain_bytes += len(plain)
+            while self._plain_bytes > self.CACHE_BUDGET:      # drop the least recently used sessions
+                victim = next((k for k in self._plain if k.startswith("s:") and k != key), None)
+                if victim is None:                              # (patient files are small: always kept)
+                    break
+                self._plain_bytes -= len(self._plain.pop(victim)[1])
+
+    def _cache_drop(self, key):
+        with self._clock:
+            old = self._plain.pop(key, None)
+            if old is not None:
+                self._plain_bytes -= len(old[1])
+
+    def forget_plaintext(self):
+        """Drop every decrypted file from memory (the app locked)."""
+        with self._clock:
+            self._plain.clear()
+            self._plain_bytes = 0
+
+    def _read_cached(self, key, path, stamp=None):
+        stamp = stamp if stamp is not None else self._stamp_of(path)
+        plain = self._cached(key, stamp)
+        if plain is None:
+            with open(path, "rb") as f:
+                plain = self.fernet.decrypt(f.read())
+            self._cache_put(key, stamp, plain)
+        return json.loads(plain.decode("utf-8"))
+
+    def _local_index_path(self):
+        vid = hashlib.sha256(os.path.abspath(self.folder).encode("utf-8")).hexdigest()[:16]
+        return os.path.join(LOCAL_DIR, "cache", f"index-{vid}.enc")
+
+    def _load_local_index(self):
+        """What was learned about the sessions last time (encrypted with the vault key, on this computer
+        only), so unlocking doesn't decrypt every session again. Each entry is re-checked against the
+        file's (mtime, size); changed files are read again."""
+        try:
+            with open(self._local_index_path(), "rb") as f:
+                d = json.loads(self.fernet.decrypt(f.read()).decode("utf-8"))
+        except Exception:
+            return
+        with self._ilock:
+            for sid, (mt, size, meta) in (d.get("idx") or {}).items():
+                self._idx.setdefault(sid, ((mt, size), meta))
+        for cid, (mt, size, text) in (d.get("clients") or {}).items():
+            self._cache_put("c:" + cid, (mt, size), text.encode("utf-8"))
+
+    def save_local_index(self, force=True):
+        if self.fernet is None or not (self._index_dirty or force):
+            return
+        if not force and time.time() - self._index_saved < 5:
+            return
+        with self._ilock:
+            idx = {sid: [st[0], st[1], meta] for sid, (st, meta) in self._idx.items()}
+        with self._clock:
+            clients = {k[2:]: [st[0], st[1], v.decode("utf-8")] for k, (st, v) in self._plain.items()
+                       if k.startswith("c:")}
+        path = self._local_index_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(self.fernet.encrypt(json.dumps({"idx": idx, "clients": clients}).encode("utf-8")))
+            _replace_with_retry(tmp, path)
+            self._index_dirty, self._index_saved = False, time.time()
+        except OSError:
+            pass
 
     def verify(self, password):
         return self._key_for(password) is not None
@@ -2265,11 +3561,49 @@ class Vault:
         with open(path, "rb") as f:
             return json.loads(self.fernet.decrypt(f.read()).decode("utf-8"))
 
+    # --- saved documents that aren't about one session (supervision packets, letters…)
+    @property
+    def reports_dir(self):
+        return os.path.join(self.folder, "reports")
+
+    def save_report(self, data, rid=None):
+        rid = rid or uuid.uuid4().hex
+        os.makedirs(self.reports_dir, exist_ok=True)
+        self._write(os.path.join(self.reports_dir, rid + ".enc"), data)
+        return rid
+
+    def load_report(self, rid):
+        return dict(self._read(os.path.join(self.reports_dir, rid + ".enc")), id=rid)
+
+    def list_reports(self, kind=None, client_id=None):
+        """Newest first."""
+        out = []
+        try:
+            names = os.listdir(self.reports_dir)
+        except OSError:
+            return out
+        for fn in names:
+            if not fn.endswith(".enc"):
+                continue
+            try:
+                r = self.load_report(fn[:-4])
+            except Exception:
+                continue
+            if (kind is None or r.get("kind") == kind) and (client_id is None or r.get("client_id") == client_id):
+                out.append(r)
+        return sorted(out, key=lambda r: (r.get("end") or r.get("created") or "", r.get("created") or ""), reverse=True)
+
+    def delete_report(self, rid):
+        wipe_file(os.path.join(self.reports_dir, rid + ".enc"))
+        self._tombstone("reports/" + rid + ".enc")
+
     # --- sessions
     def save_session(self, data, sid=None):
         sid = sid or uuid.uuid4().hex
         path = os.path.join(self.sessions_dir, sid + ".enc")
-        self._write(path, data)
+        plain = json.dumps(data).encode("utf-8")
+        self._atomic_write(path, self.fernet.encrypt(plain))
+        self._cache_put("s:" + sid, self._stamp_of(path), plain)
         self._remember(sid, path, data)
         return sid
 
@@ -2278,11 +3612,35 @@ class Vault:
             st = os.stat(path)
         except OSError:
             return
+        meta = dict(data.get("meta", {}))
+        meta["_x"] = {"note": bool((data.get("note") or "").strip()),          # enough for the dashboard and
+                      "tx": bool((data.get("transcript") or "").strip()),      # the checklists without reading
+                      "rc": data.get("risk_check"), "gc": data.get("goals_check")}   # the whole session again
         with self._ilock:
-            self._idx[sid] = ((st.st_mtime_ns, st.st_size), dict(data.get("meta", {})))
+            self._idx[sid] = ((st.st_mtime_ns, st.st_size), meta)
+            self._index_dirty = True
 
-    def load_session(self, sid):
-        return self._read(os.path.join(self.sessions_dir, sid + ".enc"))
+    def light_sessions(self):
+        """{client_id: [(sid, summary)]} for every session, from the index (one folder scan, nothing decrypted
+        unless a session isn't indexed yet). A summary has meta, note/transcript (non-empty or not), and the
+        risk and goals checks — what the caseload dashboard needs."""
+        out = {}
+        for sid, meta in self.session_index().items():
+            x = meta.get("_x")
+            if x is None:
+                try:
+                    d = self.load_session(sid)
+                    self._remember(sid, os.path.join(self.sessions_dir, sid + ".enc"), d)   # summarised from now on
+                except Exception:
+                    continue
+            else:
+                d = {"meta": {k: v for k, v in meta.items() if k != "_x"}, "note": "·" if x.get("note") else "",
+                     "transcript": "·" if x.get("tx") else "", "risk_check": x.get("rc"), "goals_check": x.get("gc")}
+            out.setdefault(d.get("meta", {}).get("client_id"), []).append((sid, d))
+        return out
+
+    def load_session(self, sid, stamp=None):
+        return self._read_cached("s:" + sid, os.path.join(self.sessions_dir, sid + ".enc"), stamp)
 
     def session_index(self):
         """{sid: meta} for every readable session, kept current cheaply (see _idx)."""
@@ -2306,7 +3664,7 @@ class Vault:
                     stale.append((sid, e.path))
         for sid, path in stale:                      # decrypt outside the lock
             try:
-                self._remember(sid, path, self.load_session(sid))
+                self._remember(sid, path, self.load_session(sid, self._stamp_of(path)))
             except Exception:
                 with self._ilock:
                     self._idx.pop(sid, None)
@@ -2314,7 +3672,11 @@ class Vault:
         with self._ilock:
             for sid in [k for k in self._idx if k not in seen]:
                 del self._idx[sid]
-            return {sid: dict(m) for sid, (_, m) in self._idx.items()}
+                self._index_dirty = True
+            out = {sid: dict(m) for sid, (_, m) in self._idx.items()}
+        if self._index_dirty:
+            self.save_local_index(force=False)
+        return out
 
     def all_sessions(self):
         out = []
@@ -2329,20 +3691,25 @@ class Vault:
         return out
 
     def sessions_for(self, client_id):
-        """Oldest first. Only this patient's files are decrypted."""
+        """Oldest first. Only this patient's files are read — and only if they changed since last time."""
         s = []
-        for sid, meta in self.session_index().items():
+        index = self.session_index()
+        with self._ilock:
+            stamps = {sid: st for sid, (st, _) in self._idx.items()}
+        for sid, meta in index.items():
             if meta.get("client_id") == client_id:
                 try:
-                    s.append((sid, self.load_session(sid)))
+                    s.append((sid, self.load_session(sid, stamps.get(sid))))
                 except Exception:
                     continue
         return sorted(s, key=lambda x: session_sort_key(x[1]))
 
     def delete_session(self, sid):
         wipe_file(os.path.join(self.sessions_dir, sid + ".enc"))
+        self._cache_drop("s:" + sid)
         with self._ilock:
             self._idx.pop(sid, None)
+            self._index_dirty = True
         self._tombstone("sessions/" + sid + ".enc")
 
     def _tombstone(self, rel):
@@ -2366,26 +3733,66 @@ class Vault:
     # --- clients
     def save_client(self, client):
         client.setdefault("id", uuid.uuid4().hex)
-        self._write(os.path.join(self.clients_dir, client["id"] + ".enc"), client)
+        path = os.path.join(self.clients_dir, client["id"] + ".enc")
+        plain = json.dumps(client).encode("utf-8")
+        self._atomic_write(path, self.fernet.encrypt(plain))
+        self._cache_put("c:" + client["id"], self._stamp_of(path), plain)
+        self._index_dirty = True
         return client["id"]
 
-    def load_client(self, cid):
-        return self._read(os.path.join(self.clients_dir, cid + ".enc"))
+    def load_client(self, cid, stamp=None):
+        return self._read_cached("c:" + cid, os.path.join(self.clients_dir, cid + ".enc"), stamp)
 
     def list_clients(self):
         out = []
-        for fn in os.listdir(self.clients_dir):
-            if fn.endswith(".enc"):
+        try:
+            entries = list(os.scandir(self.clients_dir))
+        except OSError:
+            return out
+        for e in entries:
+            if e.name.endswith(".enc"):
                 try:
-                    out.append(self.load_client(fn[:-4]))
+                    st = e.stat()
+                    out.append(self.load_client(e.name[:-4], (st.st_mtime_ns, st.st_size)))
                 except Exception:
                     continue
         return sorted(out, key=lambda c: c.get("code", "").lower())
 
+    # --- patients' files (registration forms, parent emails…): encrypted like everything else
+    FILE_LIMIT = 60 * 1024 * 1024
+
+    def save_file(self, data):
+        if len(data) > self.FILE_LIMIT:
+            raise ValueError(f"That file is {len(data) // (1024 * 1024)} MB — the limit is "
+                             f"{self.FILE_LIMIT // (1024 * 1024)} MB.")
+        os.makedirs(self.files_dir, exist_ok=True)
+        fid = uuid.uuid4().hex
+        self._atomic_write(os.path.join(self.files_dir, fid + ".enc"), self.fernet.encrypt(data))
+        return fid
+
+    def load_file(self, fid):
+        path = os.path.join(self.files_dir, fid + ".enc")
+        if not os.path.exists(path):
+            raise FileNotFoundError("This file hasn't arrived from your other computer yet — "
+                                    "give the shared drive a minute to sync, then try again.")
+        with open(path, "rb") as f:
+            return self.fernet.decrypt(f.read())
+
+    def delete_file(self, fid):
+        wipe_file(os.path.join(self.files_dir, fid + ".enc"))
+        self._tombstone("files/" + fid + ".enc")
+
     def delete_client(self, cid):
+        try:
+            for f in (self.load_client(cid).get("files") or []):
+                self.delete_file(f["id"])
+        except Exception:
+            pass
         for sid, _ in self.sessions_for(cid):
             self.delete_session(sid)
         wipe_file(os.path.join(self.clients_dir, cid + ".enc"))
+        self._cache_drop("c:" + cid)
+        self.save_local_index()
         self._tombstone("clients/" + cid + ".enc")
 
     def migrate(self):
@@ -2944,13 +4351,19 @@ def install_pdf_support(log):
     return "PDF support installed."
 
 
-def extract_text(path):
-    """Plain text from .txt/.md/.docx/.pdf — all read locally."""
+def text_from_bytes(data, ext):
+    """extract_text for a file held in memory (a decrypted vault file): nothing readable touches the disk."""
+    import io
+    return extract_text("memory" + ext, src=io.BytesIO(data))
+
+
+def extract_text(path, src=None):
+    """Plain text from .txt/.md/.docx/.pdf — all read locally. `src`: an open binary file instead of path."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".docx":
         import html
         import zipfile
-        with zipfile.ZipFile(path) as z:
+        with zipfile.ZipFile(src or path) as z:
             xml = z.read("word/document.xml").decode("utf-8", errors="replace")
         paras = []
         for p in re.findall(r"<w:p[ >].*?</w:p>", xml, flags=re.S):
@@ -2967,13 +4380,15 @@ def extract_text(path):
             raise RuntimeError("Reading PDFs needs a small add-on: click Settings → Install next to "
                                "\"PDF support\". (Or use a .docx / .txt copy.)") from None
         pages = []
-        for pg in PdfReader(path).pages:
+        for pg in PdfReader(src or path).pages:
             try:   # layout mode keeps lines intact; plain mode can put one word per line
                 txt = pg.extract_text(extraction_mode="layout") or ""
             except TypeError:
                 txt = pg.extract_text() or ""
             pages.append(txt)
         return _normalize("\f".join(pages))
+    if src is not None:
+        return _normalize(src.read().decode("utf-8", errors="replace"))
     with open(path, encoding="utf-8", errors="replace") as f:
         return _normalize(f.read())
 
@@ -3516,9 +4931,43 @@ class CancelToken:
         self._ev = threading.Event()
         self._lock = threading.Lock()
         self._stoppers = []
+        self._pausers = []                  # (freeze, unfreeze) for work that can be paused in place
+        self.paused = threading.Event()
 
     def is_set(self):
         return self._ev.is_set()
+
+    def on_pause(self, freeze, unfreeze):
+        """Register how to freeze/unfreeze this task's work in place. Returns an unregister function."""
+        pair = (freeze, unfreeze)
+        with self._lock:
+            self._pausers.append(pair)
+        if self.paused.is_set():
+            _quiet(freeze)
+        return lambda: self._unpause_forget(pair)
+
+    def _unpause_forget(self, pair):
+        with self._lock:
+            if pair in self._pausers:
+                self._pausers.remove(pair)
+
+    def can_freeze(self):
+        with self._lock:
+            return bool(self._pausers) and not self._ev.is_set()
+
+    def pause(self):
+        self.paused.set()
+        with self._lock:
+            pairs = list(self._pausers)
+        for freeze, _ in pairs:
+            _quiet(freeze)
+
+    def resume(self):
+        with self._lock:
+            pairs = list(self._pausers)
+        for _, unfreeze in pairs:
+            _quiet(unfreeze)
+        self.paused.clear()
 
     def check(self):
         if self._ev.is_set():
@@ -3641,6 +5090,10 @@ class _ProgressStream:
     def isatty(self):
         return False
 
+    def fileno(self):                   # not a real file: say so the standard way (libraries handle this)
+        import io
+        raise io.UnsupportedOperation("fileno")
+
 
 def _with_progress(on_fraction, duration, fn, *a, **k):
     import contextlib
@@ -3709,13 +5162,514 @@ def _worker_python():
     return py
 
 
+# --------------------------------------------------------------------------- #
+# Learned timing: how fast THIS computer does each step (for an accurate bar and "time left")
+# --------------------------------------------------------------------------- #
+TIMING_PATH = os.path.join(LOCAL_DIR, "timing.json")      # per computer, never synced: speeds differ
+_TIMING_LOCK = threading.Lock()
+# seconds for "load"/"spk_load"; seconds per minute of recording for the rest. First guesses only —
+# replaced by what this computer actually takes after its first transcription.
+TX_DEFAULTS = {"cpu": {"load": 35.0, "read": 0.4, "tx": 18.0, "align": 4.0, "spk_load": 12.0, "spk": 14.0},
+               "cuda": {"load": 15.0, "read": 0.4, "tx": 2.5, "align": 1.0, "spk_load": 6.0, "spk": 3.0}}
+TX_PER_MIN = ("read", "tx", "align", "spk")
+LLM_DEFAULTS = {"prefill": 350.0, "gen": 20.0}             # characters per second: reading the prompt / writing
+CHARS_PER_AUDIO_MIN = 800                                 # transcript size, roughly, for estimates ahead of time
+
+
+_TIMING_MEMO = {"stamp": None, "data": {}}
+
+
+def _timing_load():
+    """The learned timings (read again only when the file changes; it's checked on every
+    progress repaint). Returns a copy, so callers can change it freely."""
+    try:
+        st = os.stat(TIMING_PATH)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    if stamp != _TIMING_MEMO["stamp"]:
+        try:
+            with open(TIMING_PATH, encoding="utf-8") as f:
+                t = json.load(f)
+        except (OSError, ValueError):
+            return {}
+        _TIMING_MEMO.update(stamp=stamp, data=t if isinstance(t, dict) else {})
+    return copy.deepcopy(_TIMING_MEMO["data"])
+
+
+def _timing_save(t):
+    try:
+        os.makedirs(os.path.dirname(TIMING_PATH), exist_ok=True)
+        tmp = TIMING_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(t, f, indent=1)
+        _replace_with_retry(tmp, TIMING_PATH)
+    except OSError:
+        pass
+
+
+def _blend(old, new, n):
+    """Average of the first few runs, then weighted toward recent ones (adapts within a few jobs)."""
+    if old is None:
+        return new
+    w = max(0.25, 1.0 / (n + 1))
+    return old * (1 - w) + new * w
+
+
+def timing_tx(model):
+    """{'cpu': {...}, 'cuda': {...}, 'last_device': ...} for one speech model — learned where known."""
+    t = _timing_load().get("tx", {})
+    out = {"last_device": t.get("last_device"), "typical_secs": t.get("typical_secs")}
+    for dev, base in TX_DEFAULTS.items():
+        d, learned = dict(base), t.get(f"{model}|{dev}") or {}
+        d.update({k: v for k, v in learned.items() if k in base and isinstance(v, (int, float)) and v > 0})
+        d["n"] = learned.get("n", 0)
+        out[dev] = d
+    return out
+
+
+def record_tx(model, device, timings, audio_secs):
+    """Learn from a finished transcription. timings: {step: seconds actually spent (pauses excluded)}."""
+    if not audio_secs or audio_secs < 30 or device not in TX_DEFAULTS:
+        return
+    mins = audio_secs / 60
+    with _TIMING_LOCK:
+        t = _timing_load()
+        cur = t.setdefault("tx", {}).setdefault(f"{model}|{device}", {})
+        n = cur.get("n", 0)
+        for step, secs in (timings or {}).items():
+            if step in TX_DEFAULTS[device] and isinstance(secs, (int, float)) and secs > 0:
+                val = secs / mins if step in TX_PER_MIN else secs
+                cur[step] = round(_blend(cur.get(step), val, n), 3)
+        cur["n"] = n + 1
+        t["tx"]["last_device"] = device
+        t["tx"]["typical_secs"] = round(_blend(t["tx"].get("typical_secs"), audio_secs, n))  # your usual length
+        _timing_save(t)
+
+
+def typical_audio_secs():
+    """Your usual recording length (learned), for estimates when a recording's own length can't be read."""
+    v = _timing_load().get("tx", {}).get("typical_secs")
+    return v if isinstance(v, (int, float)) and v > 0 else 45 * 60
+
+
+def timing_llm(model=None):
+    t = _timing_load().get("llm", {})
+    d = dict(LLM_DEFAULTS)
+    d.update(t.get(model or t.get("last_model") or "", {}))
+    return d
+
+
+def record_llm(model, prompt_chars, prefill_secs, out_chars, gen_secs):
+    with _TIMING_LOCK:
+        t = _timing_load()
+        llm = t.setdefault("llm", {})
+        cur = llm.setdefault(model or "?", {})
+        n = cur.get("n", 0)
+        if gen_secs > 1.0 and out_chars > 200:
+            cur["gen"] = round(_blend(cur.get("gen"), out_chars / gen_secs, n), 2)
+        if prefill_secs > 0.5 and prompt_chars > 2000:
+            cur["prefill"] = round(_blend(cur.get("prefill"), prompt_chars / prefill_secs, n), 1)
+        cur["n"] = n + 1
+        llm["last_model"] = model
+        _timing_save(t)
+
+
+def _out_key(label):
+    return re.sub(r"\d+", "#", label or "")
+
+
+def expected_out(label, default):
+    """How long this kind of document usually turns out (characters), learned per step."""
+    v = _timing_load().get("out", {}).get(_out_key(label))
+    return v if isinstance(v, (int, float)) and v > 50 else default
+
+
+def record_out(label, chars):
+    if chars < 50:
+        return
+    with _TIMING_LOCK:
+        t = _timing_load()
+        out = t.setdefault("out", {})
+        k = _out_key(label)
+        n = out.get(k + "|n", 0)
+        out[k] = round(_blend(out.get(k), chars, n))
+        out[k + "|n"] = n + 1
+        _timing_save(t)
+
+
+def estimate_tx_secs(model, diarize, audio_secs, device=None):
+    prof = timing_tx(model)
+    p = prof[device or prof["last_device"] or "cpu"]
+    mins = (audio_secs or typical_audio_secs()) / 60
+    total = p["load"] + mins * (p["read"] + p["tx"] + p["align"])
+    return total + ((p["spk_load"] + mins * p["spk"]) if diarize else 0)
+
+
+WRITE_STEPS = {"progress": (("Writing the progress note", 1000), ("Writing the session overview", 3500)),
+               "intake": (("Writing the intake assessment", 4000),
+                          ("Filling in the #-section intake questionnaire", 5000)),
+               "parent": (("Writing the contact note", 1200), ("Writing the conversation summary", 2500))}
+
+
+def estimate_write_secs(kind, transcript_chars, context_chars=8000):
+    r = timing_llm()
+    total = 0.0
+    for label, dflt in WRITE_STEPS.get(kind, WRITE_STEPS["progress"]):
+        total += (transcript_chars + context_chars) / r["prefill"] + expected_out(label, dflt) / r["gen"]
+    return total
+
+
+def fmt_left(secs):
+    """'~4 min left', '~1 h 10 min left', '~30 s left'."""
+    secs = max(0, float(secs))
+    if secs >= 3600:
+        h, m = divmod(int(round(secs / 60)), 60)
+        return f"~{h} h {m} min left" if m else f"~{h} h left"
+    if secs >= 90:
+        return f"~{round(secs / 60)} min left"
+    return f"~{max(5, round(secs / 5) * 5):.0f} s left"
+
+
+_DUR_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+
+
+def audio_seconds(path):
+    """A recording's length, read by FFmpeg in a fraction of a second (None if it can't tell)."""
+    exe = shutil.which("ffmpeg")
+    if not exe or not path or not os.path.isfile(path):
+        return None
+    try:
+        r = subprocess.run([exe, "-hide_banner", "-i", path], capture_output=True, timeout=20,
+                           **({"creationflags": 0x08000000} if IS_WIN else {}))
+    except Exception:
+        return None
+    m = _DUR_RE.search(r.stderr.decode("utf-8", "replace"))
+    if not m:
+        return None
+    h, mi, sec = m.groups()
+    return int(h) * 3600 + int(mi) * 60 + float(sec)
+
+
+def set_eta(secs):
+    """Time left for the running task (seconds, or None). The task's progress updates carry it to the bar."""
+    _TASK.eta = None if secs is None else max(0.0, float(secs))
+
+
+# ---- picking up where a transcription left off ------------------------------------------------------
+# A recording is transcribed in pieces of about CHUNK_SECS, cut at a quiet moment. Each finished piece
+# (and each finished step after it) is saved at once to an encrypted checkpoint on this computer, so if
+# the transcription is interrupted — the computer slept, the app was closed, the power went — the next
+# run starts after the last finished piece instead of from the beginning. Checkpoints are encrypted with
+# a key derived from the vault key, named by keyed hashes (no file names or patient details), removed as
+# soon as the session is saved, and after CKPT_KEEP_SECS regardless.
+CHUNK_SECS = 10 * 60
+SESSION_EXTRA_KEYS = ("review", "risk_check", "goals_check", "ai_draft", "revisions")   # kept when a session is re-saved
+QUEUE_FILE = os.path.join(LOCAL_DIR, "queue.enc")   # this computer's recording queue, kept between runs (encrypted)
+CKPT_DIR = os.path.join(LOCAL_DIR, "checkpoints")
+CKPT_KEEP_SECS = 3 * 24 * 3600
+CKPT_VERSION = 1
+_CKPT = {"secret": None}
+
+
+def set_checkpoint_secret(vault_key):
+    """Called when the vault is unlocked (vault_key: its urlsafe-base64 key)."""
+    _CKPT["secret"] = hmac.new(base64.urlsafe_b64decode(vault_key), b"session-scribe/checkpoints/v1",
+                               hashlib.sha256).digest()
+
+
+def _ckpt_tag(text):
+    return hmac.new(_CKPT["secret"], text.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def checkpoint_for(audio_path, cfg, diarize):
+    """{"dir", "key"} for this recording with these settings (None if the vault isn't unlocked)."""
+    if not _CKPT["secret"] or not audio_path:
+        return None
+    try:
+        st = os.stat(audio_path)
+    except OSError:
+        return None
+    full = os.path.abspath(audio_path)
+    who = json.dumps([full, st.st_size, st.st_mtime_ns, cfg.get("whisper_model") or "large-v3-turbo",
+                      cfg.get("language") or "", bool(diarize), cfg.get("min_speakers"), cfg.get("max_speakers"),
+                      CHUNK_SECS, CKPT_VERSION])
+    name = _ckpt_tag("path:" + os.path.normcase(full))[:16] + "-" + _ckpt_tag("run:" + who)[:16]
+    key = base64.urlsafe_b64encode(hmac.new(_CKPT["secret"], ("key:" + who).encode("utf-8"),
+                                            hashlib.sha256).digest()).decode()
+    return {"dir": os.path.join(CKPT_DIR, name), "key": key}
+
+
+def checkpoint_clear(audio_path):
+    """The session from this recording is saved: its checkpoints aren't needed any more."""
+    if not _CKPT["secret"] or not audio_path or not os.path.isdir(CKPT_DIR):
+        return
+    prefix = _ckpt_tag("path:" + os.path.normcase(os.path.abspath(audio_path)))[:16] + "-"
+    for d in os.listdir(CKPT_DIR):
+        if d.startswith(prefix):
+            _ckpt_remove(os.path.join(CKPT_DIR, d))
+
+
+def checkpoint_tidy():
+    """Remove checkpoints nobody came back for."""
+    try:
+        names = os.listdir(CKPT_DIR)
+    except OSError:
+        return
+    for d in names:
+        p = os.path.join(CKPT_DIR, d)
+        try:
+            if time.time() - os.path.getmtime(p) > CKPT_KEEP_SECS:
+                _ckpt_remove(p)
+        except OSError:
+            pass
+
+
+def _ckpt_remove(folder):
+    try:
+        for fn in os.listdir(folder):
+            _quiet(wipe_file, os.path.join(folder, fn))
+        os.rmdir(folder)
+    except OSError:
+        pass
+
+
+class _Checkpoint:
+    """The worker's side: encrypted pieces of one transcription in progress."""
+
+    def __init__(self, info):
+        self.on = bool(info and info.get("dir") and info.get("key"))
+        if self.on:
+            from cryptography.fernet import Fernet
+            self.dir, self.f = info["dir"], Fernet(info["key"].encode())
+            try:
+                os.makedirs(self.dir, exist_ok=True)
+                os.utime(self.dir)                     # in use: not "abandoned" yet
+            except OSError:
+                self.on = False
+
+    def load(self, name):
+        if not self.on:
+            return None
+        try:
+            with open(os.path.join(self.dir, name + ".enc"), "rb") as fh:
+                return json.loads(self.f.decrypt(fh.read()))
+        except Exception:                              # missing, half-written or unreadable: redo that part
+            return None
+
+    def save(self, name, obj):
+        if not self.on:
+            return
+
+        def plain(o):
+            for attr in ("item", "tolist"):
+                if hasattr(o, attr):
+                    return getattr(o, attr)()
+            return str(o)
+        try:
+            path = os.path.join(self.dir, name + ".enc")
+            with open(path + ".tmp", "wb") as fh:
+                fh.write(self.f.encrypt(json.dumps(obj, default=plain).encode("utf-8")))
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+
+    def reset(self):
+        if self.on:
+            for fn in os.listdir(self.dir):
+                _quiet(os.remove, os.path.join(self.dir, fn))
+
+
+def _chunk_bounds(audio, sr=16000):
+    """[(start, end)] sample ranges of about CHUNK_SECS each, cut at the quietest half second near each
+    boundary so no word is split. A recording up to 1.5 × CHUNK_SECS is one piece."""
+    n = len(audio)
+    step = CHUNK_SECS * sr
+    if n <= step * 1.5:
+        return [(0, n)]
+    try:
+        import numpy as np
+        a = np.asarray(audio, dtype="float32")
+    except Exception:                                    # (no NumPy: cut at the plain marks)
+        a = None
+    cuts, pos = [0], step
+    while n - pos > step * 0.5:
+        lo, hi = max(cuts[-1] + 60 * sr, pos - 20 * sr), min(n - 30 * sr, pos + 20 * sr)
+        cut = pos
+        if a is not None and hi - lo > sr:
+            fr = sr // 10
+            seg = a[lo:hi]
+            k = len(seg) // fr
+            e = (seg[:k * fr].reshape(k, fr) ** 2).mean(axis=1)
+            if k >= 5:
+                e = np.convolve(e, np.ones(5) / 5, mode="same")
+            cut = lo + int(np.argmin(e)) * fr + fr // 2
+        cuts.append(int(cut))
+        pos = int(cut) + step
+    cuts.append(n)
+    return [(int(x), int(y)) for x, y in zip(cuts[:-1], cuts[1:])]
+
+
+def _shift_segments(segs, offset):
+    """Move segment and word times by offset seconds (pieces are transcribed from 0)."""
+    out = []
+    for s in segs or []:
+        s = dict(s)
+        for k in ("start", "end"):
+            if s.get(k) is not None:
+                s[k] = round(float(s[k]) + offset, 3)
+        if s.get("words"):
+            s["words"] = [dict(w, **{k: round(float(w[k]) + offset, 3) for k in ("start", "end")
+                                     if w.get(k) is not None}) for w in s["words"]]
+        out.append(s)
+    return out
+
+
+class _SleepWatch:
+    """Notices when the computer was asleep (time jumps ahead while nothing ran), so waiting limits
+    don't count that time and a connection broken by it is retried."""
+    last_gap_at = 0.0
+
+    @classmethod
+    def start(cls):
+        if getattr(cls, "_started", False):
+            return
+        cls._started = True
+
+        def run():
+            prev = time.time()
+            while True:
+                time.sleep(2.0)
+                now = time.time()
+                if now - prev > 20.0:
+                    cls.last_gap_at = now
+                prev = now
+        threading.Thread(target=run, daemon=True).start()
+
+    @classmethod
+    def slept_since(cls, t):
+        return cls.last_gap_at >= t
+
+
+def keep_awake(on):
+    """While a recording is being transcribed or its notes written, don't let the computer go to sleep
+    on its own (Windows; per thread: call from the thread doing the work). Closing the lid or choosing
+    Sleep still works — the work then carries on, or picks up where it left off, afterwards."""
+    if not IS_WIN:
+        return
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | (0x00000001 if on else 0))
+    except Exception:
+        pass
+
+
+WORKER_LOG = os.path.join(LOCAL_DIR, "logs", "transcription.log")
+WORKER_STALL_SECS = 20 * 60        # no word at all from the worker for this long: it's hung, stop it
+_TICK_RE = re.compile(r" \(\d+:\d\d\)$")
+
+
+def worker_log_text(limit=200_000):
+    """The last transcription's technical log (this computer only), or ''."""
+    out = []
+    for path in (WORKER_LOG + ".1", WORKER_LOG):          # the run before, then the latest
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                out.append(f"==== {os.path.basename(path)} ====\n" + f.read()[-limit:])
+        except OSError:
+            pass
+    return "\n".join(out)
+
+
+def _start_worker_log(audio_path):
+    """Open a fresh log for this run (keeping the previous one). Returns (file, redact) or (None, None)."""
+    try:
+        os.makedirs(os.path.dirname(WORKER_LOG), exist_ok=True)
+        if os.path.exists(WORKER_LOG):
+            _replace_with_retry(WORKER_LOG, WORKER_LOG + ".1")
+        f = open(WORKER_LOG, "w", encoding="utf-8", errors="replace")
+    except OSError:
+        return None, None
+    hide = sorted({x for x in (audio_path, os.path.abspath(audio_path), os.path.basename(audio_path),
+                               os.path.splitext(os.path.basename(audio_path))[0]) if x and len(x) > 3},
+                  key=len, reverse=True)
+
+    def redact(line):                   # the recording's name can carry a client code: never log it
+        for h in hide:
+            line = line.replace(h, "<recording>")
+        return line
+    return f, redact
+
+
+WORKER_RETRIES = 2                 # a worker that dies (or hangs) mid-way is started again this many times
+
+
 def transcribe(audio_path, cfg, hf_token, progress):
     """progress(text, percent). Runs WhisperX in its own process on this computer, so it can be
     stopped instantly (the session was discarded, the queue job was cancelled) and its memory is
-    fully released afterwards. The audio never leaves the computer; results come back over a pipe."""
-    if os.environ.get("SESSION_SCRIBE_INPROC_TRANSCRIBE"):
-        return transcribe_here(audio_path, cfg, hf_token, progress)
+    fully released afterwards. The audio never leaves the computer; results come back over a pipe.
+
+    While a step runs with nothing new to say (the model loading can take minutes on a processor),
+    the status shows how long it has been going, so "slow" never looks like "stuck". If the worker
+    says nothing at all for WORKER_STALL_SECS it is stopped and reported, instead of hanging forever.
+
+    Interrupted part-way (the worker died, hung, or the computer slept long enough to break it), it is
+    started again automatically and carries on from the last finished piece (see checkpoint_for)."""
     check_cancelled()
+    ckpt = checkpoint_for(audio_path, cfg, bool(hf_token))
+    if os.environ.get("SESSION_SCRIBE_INPROC_TRANSCRIBE"):
+        return transcribe_here(audio_path, cfg, hf_token, progress, ckpt)
+    _SleepWatch.start()
+    keep_awake(True)
+    try:
+        attempt = 0
+
+        def pieces_saved():
+            try:
+                return len(os.listdir(ckpt["dir"])) if ckpt else 0
+            except OSError:
+                return 0
+        while True:
+            before = pieces_saved()
+            result, error, stalled, code = _transcribe_run(audio_path, cfg, hf_token, progress, ckpt, attempt)
+            check_cancelled()
+            if result is not None or error is not None:
+                break
+            if attempt >= WORKER_RETRIES:
+                break
+            if stalled is not None and pieces_saved() <= before:
+                break                    # hung without finishing anything: trying again would hang the same way
+            attempt += 1
+            print(f"[app] the transcription process {'stopped responding' if stalled else 'ended early'}"
+                  f" (exit code {code}); starting it again (attempt {attempt + 1})", file=sys.stderr)
+            progress("Picking up where it left off…", None)
+    finally:
+        keep_awake(False)
+    mname = cfg.get("whisper_model") or "large-v3-turbo"
+    if stalled is not None and result is None and error is None:
+        raise WorkerError(f"Transcription stopped responding during “{stalled.rstrip('…')}” (nothing for "
+                          f"{WORKER_STALL_SECS // 60} minutes) and was stopped. Settings → “Test the speech engine” "
+                          "checks this computer; the technical details are under Settings → “Transcription log”. "
+                          "What was finished is kept: starting it again carries on from there.")
+    if error is not None:
+        if error.get("missing_module"):
+            raise ModuleNotFoundError(error["msg"], name=error["missing_module"])
+        raise WorkerError(error["msg"])
+    if result is not None and result.get("timing"):
+        tm = result["timing"]                              # learn this computer's speed (pauses excluded)
+        _quiet(record_tx, mname, tm.get("device"), tm.get("times"), tm.get("audio_secs"))
+    if result is None:
+        raise WorkerError("The transcription process stopped unexpectedly (exit code "
+                          f"{code}). If this keeps happening, the computer may be running out of memory "
+                          "— try a smaller speech model in Settings. Details: Settings → “Transcription log”. "
+                          "What was finished is kept: starting it again carries on from there.")
+    return result["segments"], result["duration"], result["diarized"], result["aligned"]
+
+
+def _transcribe_run(audio_path, cfg, hf_token, progress, ckpt, attempt=0):
+    """One run of the worker process: (result, error, stalled step or None, exit code)."""
     env = dict(os.environ)
     extra = [p for p in sys.path if p and os.path.isdir(p)
              and not any(os.path.abspath(p).startswith(os.path.abspath(b))
@@ -3723,24 +5677,93 @@ def transcribe(audio_path, cfg, hf_token, progress):
     if extra:                     # paths added at run time (rare) must reach the child too
         env["PYTHONPATH"] = os.pathsep.join(extra + [env["PYTHONPATH"]] if env.get("PYTHONPATH") else extra)
     env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUNBUFFERED"] = "1"
     kw = {} if IS_WIN else {"start_new_session": True}
+    log, redact = _start_worker_log(audio_path)
     p = subprocess.Popen([_worker_python(), os.path.abspath(__file__), "--transcribe-worker"],
-                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE if log else subprocess.DEVNULL,
                          cwd=APP_DIR, env=env, **kw)
     forget = on_cancel(lambda: _kill_tree(p))
-    result, error, ok = None, None, False
+    tok = current_token()
+    unpause = tok.on_pause(lambda: _freeze_process(p, True), lambda: _freeze_process(p, False)) if tok \
+        else (lambda: None)
+    inbox = queue.Queue()
+
+    def read_out():                     # stdout -> inbox, so this thread can keep time while waiting
+        try:
+            for raw in p.stdout:
+                inbox.put(raw)
+        except (OSError, ValueError):
+            pass
+        inbox.put(None)
+
+    def read_err():                     # stderr -> the local log, file name blanked out
+        try:
+            for raw in p.stderr:
+                log.write(redact(raw.decode("utf-8", errors="replace").replace("\r\n", "\n")))
+                log.flush()
+        except (OSError, ValueError):
+            pass
+        _quiet(log.close)
+    threading.Thread(target=read_out, daemon=True).start()
+    if log:
+        threading.Thread(target=read_err, daemon=True).start()
+    result, error, ok, stalled = None, None, False, None
     try:
-        job = {"audio": audio_path, "hf_token": hf_token or "",
-               "cfg": {k: cfg.get(k) for k in ("whisper_model", "language", "batch_size",
-                                               "min_speakers", "max_speakers") if cfg.get(k) is not None}}
+        mname = cfg.get("whisper_model") or "large-v3-turbo"
+        job = {"audio": audio_path, "hf_token": hf_token or "", "parent_pid": os.getpid(),
+               "cfg": dict({k: cfg.get(k) for k in ("whisper_model", "language", "batch_size",
+                                                    "min_speakers", "max_speakers") if cfg.get(k) is not None},
+                           timing=timing_tx(mname), duration_hint=audio_seconds(audio_path)),
+               "ckpt": ckpt}
         p.stdin.write((json.dumps(job) + "\n").encode("utf-8"))
-        p.stdin.flush()                     # stdin stays open: if this app closes, the child exits too
-        for raw in p.stdout:
+        p.stdin.flush()
+        _quiet(p.stdin.close)               # the job is all it gets; it watches this process to know we're gone
+        last_text = "Starting the speech engine…" if not attempt else "Picking up where it left off…"
+        last_pct, last_eta = None if attempt else 0, None
+        heard = step_start = last_tick = wall = time.time()
+        shown = -1
+        while True:
+            try:
+                raw = inbox.get(timeout=1.0)
+            except queue.Empty:
+                raw = False
+            now = time.time()
+            if now - wall > 20:                 # the computer was asleep: that time isn't "silence"
+                heard += now - wall - 1.0
+                step_start += now - wall - 1.0
+                last_tick = now
+            wall = now
+            if raw is False:
+                if tok is not None and tok.paused.is_set():   # frozen on purpose: the clocks don't run
+                    heard += now - last_tick
+                    step_start += now - last_tick
+                    last_tick = now
+                    continue
+                last_tick = now
+                if now - heard > WORKER_STALL_SECS:
+                    stalled = last_text
+                    _kill_tree(p)
+                    break
+                secs = int(now - step_start)
+                if now - heard >= 8 and secs >= 10 and secs // 5 != shown:   # gone quiet: show it's still going
+                    shown = secs // 5
+                    set_eta(None if last_eta is None else last_eta - (now - heard))
+                    progress(f"{last_text.rstrip('…')}… ({secs // 60}:{secs % 60:02d})", last_pct)
+                continue
+            if raw is None:
+                break
             line = raw.decode("utf-8", errors="replace")
             if not line.startswith(_WORKER_TAG):
                 continue
+            heard = last_tick = time.time()
             msg = json.loads(line[len(_WORKER_TAG):])
             if msg["t"] == "p":
+                if msg["text"] != last_text:
+                    step_start, shown = heard, -1
+                last_text, last_pct, last_eta = msg["text"], msg.get("pct"), msg.get("eta")
+                set_eta(last_eta)
                 progress(msg["text"], msg.get("pct"))
             elif msg["t"] == "r":
                 result = msg
@@ -3751,6 +5774,7 @@ def transcribe(audio_path, cfg, hf_token, progress):
         ok = True
     finally:
         forget()
+        unpause()
         if not ok:                          # stopped by an error here (or cancelled): don't leave it running
             _kill_tree(p)
         _quiet(p.stdin.close)
@@ -3758,16 +5782,52 @@ def transcribe(audio_path, cfg, hf_token, progress):
             p.wait(timeout=30)
         except Exception:
             _kill_tree(p)
-    check_cancelled()
-    if error is not None:
-        if error.get("missing_module"):
-            raise ModuleNotFoundError(error["msg"], name=error["missing_module"])
-        raise WorkerError(error["msg"])
-    if result is None:
-        raise WorkerError("The transcription process stopped unexpectedly (exit code "
-                          f"{p.returncode}). If this keeps happening, the computer may be running out of memory "
-                          "— try a smaller speech model in Settings.")
-    return result["segments"], result["duration"], result["diarized"], result["aligned"]
+    return result, error, stalled, p.returncode
+
+
+def _freeze_process(p, freeze):
+    """Pause (freeze) or continue a worker process exactly where it is."""
+    if p.poll() is not None:
+        return
+    if IS_WIN:
+        import ctypes
+        nt = ctypes.WinDLL("ntdll")
+        fn = nt.NtSuspendProcess if freeze else nt.NtResumeProcess
+        fn.argtypes = (ctypes.c_void_p,)
+        fn(ctypes.c_void_p(int(p._handle)))
+    else:
+        import signal
+        sig = signal.SIGSTOP if freeze else signal.SIGCONT
+        try:
+            os.killpg(p.pid, sig)                  # the worker and anything it started (ffmpeg)
+        except OSError:
+            os.kill(p.pid, sig)
+
+
+def _watch_parent(pid):
+    """Worker: exit the moment the app that started it is gone (closed, crashed, or killed).
+
+    This must NOT be done by waiting to read stdin. On Windows, while one thread waits to read a
+    pipe, every other query of that pipe waits too — and loading the speech engine's libraries
+    queries stdin (their C runtime start-up does), so the engine froze forever while loading NumPy.
+    Waiting on the app's process handle touches no pipe at all."""
+    if not pid:
+        return
+    if IS_WIN:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        k32.WaitForSingleObject.restype = wintypes.DWORD
+        k32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        handle = k32.OpenProcess(0x00100000, False, int(pid))         # SYNCHRONIZE
+        if handle:
+            k32.WaitForSingleObject(handle, 0xFFFFFFFF)                  # returns when the app ends
+    else:
+        while os.getppid() == int(pid):
+            time.sleep(1.0)
+    os._exit(3)
 
 
 def transcribe_worker_main():
@@ -3776,7 +5836,11 @@ def transcribe_worker_main():
     devnull = os.open(os.devnull, os.O_WRONLY)
     os.dup2(devnull, 1)              # anything WhisperX/C libraries print goes nowhere, not into our pipe
     sys.stdout = open(os.devnull, "w")
-    sys.stderr = open(os.devnull, "w")
+    # stderr is NOT thrown away: the app writes it (with the recording's file name blanked out) to a
+    # log on this computer, so a crash or hang while loading leaves something to go on
+    import faulthandler
+    real_err = sys.stderr      # kept: during transcription sys.stderr is the progress catcher, not a file
+    faulthandler.enable(file=real_err)                # a hard crash prints where it happened
     lock = threading.Lock()
 
     def plain(o):                       # numpy numbers/arrays inside WhisperX results
@@ -3789,110 +5853,336 @@ def transcribe_worker_main():
         with lock:
             out.write(_WORKER_TAG + json.dumps(m, default=plain) + "\n")
             out.flush()
-    job = json.loads(sys.stdin.readline() or "{}")
-
-    def watch_parent():                 # the app closed (or was killed): stop right away
-        try:
-            while sys.stdin.read(1):
+        if m.get("t") == "p":                         # progress made: re-arm the "silent for 3 min" stack dump
+            try:                                      # (diagnostics only: must never stop a transcription)
+                faulthandler.cancel_dump_traceback_later()
+                faulthandler.dump_traceback_later(180, repeat=True, file=real_err)
+            except Exception:
                 pass
-        finally:
-            os._exit(3)
-    threading.Thread(target=watch_parent, daemon=True).start()
+    job = json.loads(sys.stdin.readline() or "{}")
+    print(f"[worker] start {time.strftime('%Y-%m-%d %H:%M:%S')} python {sys.version.split()[0]} "
+          f"model={(job.get('cfg') or {}).get('whisper_model') or 'large-v3-turbo'}", file=sys.stderr, flush=True)
+
+    _quiet(sys.stdin.close)            # never read stdin again (see _watch_parent)
+    threading.Thread(target=_watch_parent, args=(job.get("parent_pid"),), daemon=True).start()
     try:
         segs, dur, diar, aligned = transcribe_here(job["audio"], job.get("cfg") or {}, job.get("hf_token"),
-                                                   lambda text, pct=None: send(t="p", text=text, pct=pct))
-        send(t="r", segments=segs, duration=dur, diarized=diar, aligned=aligned)
+                                                   lambda text, pct=None: send(t="p", text=text, pct=pct,
+                                                                               eta=getattr(_TASK, "eta", None)),
+                                                   job.get("ckpt"))
+        send(t="r", segments=segs, duration=dur, diarized=diar, aligned=aligned,
+             timing=getattr(transcribe_here, "last_timing", None))
     except ModuleNotFoundError as e:
         send(t="e", msg=friendly_error(e), missing_module=getattr(e, "name", None) or "whisperx")
     except Exception as e:
+        import traceback
+        traceback.print_exc(file=sys.stderr)
         send(t="e", msg=friendly_error(e))
+    faulthandler.cancel_dump_traceback_later()
+    print(f"[worker] end {time.strftime('%Y-%m-%d %H:%M:%S')}", file=sys.stderr, flush=True)
     out.flush()
+    _quiet(sys.stderr.flush)
     os._exit(0)                         # skip slow library teardown
 
 
-def transcribe_here(audio_path, cfg, hf_token, progress):
-    """progress(text, percent) — percent is overall 0-100 across every step."""
+class _TimedPlan:
+    """Overall percent and time left across the transcription's steps, from how long each step takes on
+    this computer (learned — see timing_tx). Steps that report no progress of their own (loading a model)
+    fill by time. Time spent frozen — paused, or the computer asleep — doesn't count, and isn't learned."""
+    TIME_FILL = ("load", "read", "spk_load")
+
+    def __init__(self, say, est):
+        self.say, self.order, self.est = say, [k for k, _ in est], dict(est)
+        self.lock = threading.Lock()
+        self.span, self.pct, self.frozen, self._last = {}, 0.0, 0.0, time.time()
+        self.cur, self.cur_start, self.frac, self.text, self.times, self.done = None, 0.0, 0.0, "", {}, False
+        self._replan(0)
+        threading.Thread(target=self._fill, daemon=True).start()
+
+    def clock(self):
+        return time.time() - self.frozen
+
+    def _replan(self, i):
+        """Share what's left of the bar among the remaining steps, by their expected time."""
+        rest = self.order[i:]
+        tot = sum(self.est[k] for k in rest) or 1.0
+        lo = self.pct
+        for k in rest:
+            hi = lo + (100.0 - self.pct) * self.est[k] / tot
+            self.span[k], lo = (lo, hi), hi
+
+    def set_est(self, step, secs):
+        with self.lock:
+            self.est[step] = max(0.1, float(secs))
+            if self.cur in self.order:
+                self._replan(self.order.index(self.cur))
+
+    def _speed(self):
+        """How this run compares with the estimates so far (finished steps that scale with the audio)."""
+        done = [k for k in self.times if k not in self.TIME_FILL and self.est.get(k)]
+        if not done:
+            return 1.0
+        return max(0.4, min(2.5, sum(self.times[k] for k in done) / sum(self.est[k] for k in done)))
+
+    def _eta(self):
+        cur_left = 0.0
+        if self.cur in self.est:
+            spent = self.clock() - self.cur_start
+            cur_left = max(self.est[self.cur] * (1 - self.frac), self.est[self.cur] - spent, 0.0)
+            if self.cur in self.TIME_FILL:
+                cur_left = max(self.est[self.cur] - spent, 0.1 * self.est[self.cur])
+        rest = self.order[self.order.index(self.cur) + 1:] if self.cur in self.order else []
+        return cur_left + self._speed() * sum(self.est[k] for k in rest)
+
+    def _emit(self):
+        lo, hi = self.span.get(self.cur, (self.pct, self.pct))
+        self.pct = max(self.pct, lo + (hi - lo) * self.frac)
+        self.say(self.text, self.pct, self._eta())
+
+    def begin(self, step, text):
+        with self.lock:
+            now = self.clock()
+            if self.cur is not None:
+                self.times[self.cur] = self.times.get(self.cur, 0.0) + now - self.cur_start
+            self.cur, self.cur_start, self.frac, self.text = step, now, 0.0, text
+            if step in self.order:
+                self.pct = max(self.pct, self.span[step][0])
+                self._replan(self.order.index(step))
+            self._emit()
+
+    def update(self, frac, text=None):
+        with self.lock:
+            self.frac = max(self.frac, min(float(frac), 1.0))
+            if text:
+                self.text = text
+            self._emit()
+
+    def finish(self):
+        with self.lock:
+            if self.cur is not None:
+                self.times[self.cur] = self.times.get(self.cur, 0.0) + self.clock() - self.cur_start
+            self.cur, self.done = None, True
+            self.pct = 100.0
+        self.say("Finishing up…", 100, 0)
+
+    def _fill(self):
+        while not self.done:
+            time.sleep(0.5)
+            now = time.time()
+            gap, self._last = now - self._last, now
+            if gap > 3.0:                    # we were frozen (paused / asleep): that time doesn't count
+                self.frozen += gap - 0.5
+            with self.lock:
+                if self.done or self.cur not in self.TIME_FILL:
+                    continue
+                f = min(0.95, (self.clock() - self.cur_start) / max(self.est[self.cur], 0.1))
+                if f > self.frac + 0.004:
+                    self.frac = f
+                    self._emit()
+
+
+def transcribe_here(audio_path, cfg, hf_token, progress, ckpt=None):
+    """progress(text, percent) — percent is overall 0-100 across every step, in proportion to how long
+    each step takes on this computer; set_eta() carries the time left alongside. With ckpt (see
+    checkpoint_for) every finished piece is saved as it's done, and a later run carries on from there."""
     diarize = bool(hf_token)
-    # overall % ranges for each step
-    R = ({"load": (0, 4), "read": (4, 6), "tx": (6, 62), "align": (62, 72), "spk_load": (72, 75),
-          "spk": (75, 99)} if diarize else
-         {"load": (0, 4), "read": (4, 6), "tx": (6, 82), "align": (82, 99)})
+    mname = cfg.get("whisper_model") or "large-v3-turbo"
+    prof = cfg.get("timing") or timing_tx(mname)
+    dev_guess = prof.get("last_device") or "cpu"
+    ck = _Checkpoint(ckpt)
+    saved = ck.load("plan") or {}
+    bounds = [tuple(b) for b in saved.get("bounds") or []]
 
-    def at(step, frac=0.0):
-        lo, hi = R[step]
-        return lo + (hi - lo) * frac
+    def pieces(prefix):
+        got = {}
+        for i in range(len(bounds)):
+            v = ck.load(f"{prefix}-{i}")
+            if v is not None:
+                got[i] = v
+        return got
+    tx_done, al_done = pieces("tx"), pieces("al")
+    spk_done = ck.load("spk") if diarize else None
+    resumed = bool(tx_done)
+    mins = (saved.get("duration") or cfg.get("duration_hint") or prof.get("typical_secs") or 45 * 60) / 60
 
-    progress("Loading the speech model…", at("load"))
-    import torch
-    import whisperx
+    def left_frac(done):              # share of the recording a step still has to do
+        if not bounds or not saved.get("n"):
+            return 1.0
+        return max(0.0, 1.0 - sum(bounds[i][1] - bounds[i][0] for i in done) / saved["n"])
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute = "float16" if device == "cuda" else "int8"
-    lang = cfg.get("language") or None
-    model = _stage(f"loading the speech model ({cfg.get('whisper_model') or 'large-v3-turbo'})", whisperx.load_model,
-                   cfg.get("whisper_model") or "large-v3-turbo", device, compute_type=compute, language=lang)
-    progress("Reading the recording…", at("read"))
-    audio = _stage("reading the audio file (FFmpeg)", whisperx.load_audio, audio_path)
-    duration = len(audio) / 16000
-    label = f"Transcribing {fmt_ts(duration)} of audio"
-    progress(label + "…", at("tx"))
-    result = _stage("transcribing", _with_progress,
-                    lambda f: progress(f"{label}…", at("tx", f)), duration,
-                    _call_with_optional, model.transcribe, {"print_progress": True, "verbose": True},
-                    audio, batch_size=int(cfg.get("batch_size", 8)), language=lang)
-    lang = result.get("language") or lang or "en"
-    del model
-    gc.collect()
-    # Alignment gives every word its own timestamps. Word-level speaker assignment
-    # (and therefore clean speaker turns) is impossible without it.
-    progress(f"Lining words up with timestamps ({lang})…", at("align"))
-    aligned = False
+    def estimates(dev, minutes):
+        p = prof.get(dev) or TX_DEFAULTS[dev]
+        skip_load = bool(bounds) and len(tx_done) == len(bounds)
+        est = [("load", 1.0 if skip_load else p["load"]), ("read", p["read"] * minutes + 1),
+               ("tx", max(0.1, p["tx"] * minutes * left_frac(tx_done))),
+               ("align", max(0.1, p["align"] * minutes * left_frac(al_done)))]
+        if diarize:
+            est += [("spk_load", 0.1 if spk_done else p["spk_load"]), ("spk", 0.1 if spk_done else p["spk"] * minutes)]
+        return est
+
+    def say(text, pct, eta):
+        set_eta(eta)
+        progress(text, pct)
+    plan = _TimedPlan(say, estimates(dev_guess, mins))
+    sr = 16000
     try:
-        model_a, md = whisperx.load_align_model(language_code=lang, device=device)
-        result = _with_progress(lambda f: progress("Lining words up with timestamps…", at("align", f)),
-                                duration, _call_with_optional, whisperx.align, {"print_progress": True},
-                                result["segments"], model_a, md, audio, device, return_char_alignments=False)
-        aligned = any(w.get("start") is not None for s in result["segments"] for w in s.get("words", []))
-        del model_a
-        gc.collect()
-    except Exception as e:
-        progress(f"Word alignment failed ({type(e).__name__}) — speaker labels will be less precise.",
-                 at("align", 1))
-    diarized = False
-    if diarize:
-        progress("Loading the speaker model…", at("spk_load"))
-        DP = getattr(whisperx, "DiarizationPipeline", None)
-        if DP is None:
-            from whisperx.diarize import DiarizationPipeline as DP
+        t0 = time.time()
+        if resumed:
+            done_secs = sum(bounds[i][1] - bounds[i][0] for i in tx_done) / sr
+            plan.begin("load", f"Picking up where it left off ({fmt_ts(done_secs)} already transcribed)…")
+            print(f"[worker] resuming: {len(tx_done)}/{len(bounds)} pieces transcribed, {len(al_done)} aligned, "
+                  f"speakers {'done' if spk_done else 'to do'}", file=sys.stderr, flush=True)
+        else:
+            plan.begin("load", "Starting the speech engine…")
+        import torch
+        import whisperx
+        print(f"[worker] engine imported in {time.time() - t0:.1f}s; torch {torch.__version__}", file=sys.stderr, flush=True)
 
-        def make_dp():
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        compute = "float16" if device == "cuda" else "int8"
+        lang = saved.get("language") or cfg.get("language") or None
+        if device != dev_guess:
+            for k, v in estimates(device, mins):
+                plan.set_est(k, v)
+        model = None
+
+        def load_model():
+            plan.update(0, f"Loading the speech model ({mname}, " + ("graphics card" if device == "cuda" else
+                           "processor — can take a minute or two") + ")…")
+            t1 = time.time()
+            m = _stage(f"loading the speech model ({mname})", whisperx.load_model,
+                       mname, device, compute_type=compute, language=lang)
+            print(f"[worker] model {mname} loaded on {device}/{compute} in {time.time() - t1:.1f}s",
+                  file=sys.stderr, flush=True)
+            return m
+        if not bounds or len(tx_done) < len(bounds):
+            model = load_model()
+        plan.begin("read", "Reading the recording…")
+        audio = _stage("reading the audio file (FFmpeg)", whisperx.load_audio, audio_path)
+        n = len(audio)
+        duration = n / sr
+        if bounds and saved.get("n") != n:                 # not the same audio after all: start over
+            ck.reset()
+            bounds, tx_done, al_done, spk_done, resumed, saved = [], {}, {}, None, False, {}
+            if model is None:
+                model = load_model()
+        if not bounds:
+            bounds = _chunk_bounds(audio, sr)
+            saved = {"bounds": bounds, "n": n, "duration": duration, "language": lang}
+            ck.save("plan", saved)
+        for k, v in estimates(device, duration / 60):        # now the real length is known
+            if k not in ("load", "read"):
+                plan.set_est(k, v)
+
+        def piece(a, b):
+            return audio if len(bounds) == 1 else audio[a:b]
+        label = f"Transcribing {fmt_ts(duration)} of audio"
+        done_secs = sum(bounds[i][1] - bounds[i][0] for i in tx_done) / sr
+        plan.begin("tx", label + (f" — carrying on from {fmt_ts(done_secs)}" if done_secs else "") + "…")
+        todo_secs = max(duration - done_secs, 0.1)
+        base = 0.0
+        for i, (a, b) in enumerate(bounds):
+            if i in tx_done:
+                continue
+            cd = (b - a) / sr
+            res = _stage("transcribing", _with_progress,
+                         lambda f, base=base, cd=cd: plan.update((base + f * cd) / todo_secs), cd,
+                         _call_with_optional, model.transcribe, {"print_progress": True, "verbose": True},
+                         piece(a, b), batch_size=int(cfg.get("batch_size", 8)), language=lang)
+            lang = lang or res.get("language")
+            tx_done[i] = {"segments": _shift_segments(res.get("segments"), a / sr), "language": res.get("language")}
+            ck.save(f"tx-{i}", tx_done[i])               # this piece is safe now, whatever happens next
+            if lang and saved.get("language") != lang:
+                saved["language"] = lang
+                ck.save("plan", saved)
+            base += cd
+        lang = lang or next((v.get("language") for v in tx_done.values() if v.get("language")), None) or "en"
+        model = None
+        gc.collect()
+        # Alignment gives every word its own timestamps. Word-level speaker assignment
+        # (and therefore clean speaker turns) is impossible without it.
+        plan.begin("align", f"Lining words up with timestamps ({lang})…")
+        need = [i for i in range(len(bounds)) if i not in al_done]
+        if need:
             try:
-                return DP(use_auth_token=hf_token, device=device)
-            except TypeError:
-                return DP(token=hf_token, device=device)
-        dm = _stage("loading the speaker model (pyannote)", make_dp)
-        # pyannote's steps and how much of the speaker step each one takes
-        spans = {"segmentation": (0.0, 0.30), "speaker_counting": (0.30, 0.35),
-                 "embeddings": (0.35, 0.95), "discrete_diarization": (0.95, 1.0)}
-        names = {"segmentation": "Finding where each person speaks",
-                 "speaker_counting": "Counting speakers",
-                 "embeddings": "Recognizing each speaker's voice",
-                 "discrete_diarization": "Assigning speakers"}
+                model_a, md = whisperx.load_align_model(language_code=lang, device=device)
+                todo_al = max(sum(bounds[i][1] - bounds[i][0] for i in need) / sr, 0.1)
+                base = 0.0
+                for i in need:
+                    a, b = bounds[i]
+                    cd = (b - a) / sr
+                    local = _shift_segments(tx_done[i]["segments"], -a / sr)
+                    if local:
+                        r = _with_progress(lambda f, base=base, cd=cd: plan.update(
+                                               (base + f * cd) / todo_al, "Lining words up with timestamps…"),
+                                           cd, _call_with_optional, whisperx.align, {"print_progress": True},
+                                           local, model_a, md, piece(a, b), device, return_char_alignments=False)
+                        al_done[i] = {"segments": _shift_segments(r["segments"], a / sr)}
+                    else:
+                        al_done[i] = {"segments": []}
+                    ck.save(f"al-{i}", al_done[i])
+                    base += cd
+                del model_a
+                gc.collect()
+            except Exception as e:
+                plan.update(1, f"Word alignment failed ({type(e).__name__}) — speaker labels will be less precise.")
+        segments = []
+        for i in range(len(bounds)):
+            segments += (al_done.get(i) or tx_done[i])["segments"]
+        aligned = any(w.get("start") is not None for s in segments for w in s.get("words") or [])
+        result = {"segments": segments}
+        diarized = False
+        if diarize:
+            if spk_done is not None:
+                plan.begin("spk_load", "Speakers were already identified…")
+                import pandas as pd
+                segs = pd.DataFrame(spk_done["rows"], columns=["start", "end", "speaker"])
+            else:
+                plan.begin("spk_load", "Loading the speaker model…")
+                DP = getattr(whisperx, "DiarizationPipeline", None)
+                if DP is None:
+                    from whisperx.diarize import DiarizationPipeline as DP
 
-        def hook(step, artifact=None, file=None, total=None, completed=None, **_):
-            lo, hi = spans.get(step, (0.0, 1.0))
-            frac = lo + (hi - lo) * (completed / total if total and completed is not None else 0.0)
-            progress(f"Identifying speakers: {names.get(step, step)}…", at("spk", frac))
-        if hasattr(dm, "model"):
-            dm.model = _HookedPipeline(dm.model, hook)
-        progress("Identifying speakers…", at("spk"))
-        segs = _stage("identifying speakers", _with_progress, lambda f: None, duration, dm, audio,
-                      min_speakers=int(cfg.get("min_speakers", 2)), max_speakers=int(cfg.get("max_speakers", 2)))
-        result = whisperx.assign_word_speakers(segs, result)   # labels each word, not just segments
-        diarized = True
-        del dm
-        gc.collect()
-    progress("Finishing up…", 100)
+                def make_dp():
+                    try:
+                        return DP(use_auth_token=hf_token, device=device)
+                    except TypeError:
+                        return DP(token=hf_token, device=device)
+                dm = _stage("loading the speaker model (pyannote)", make_dp)
+                # pyannote's steps and how much of the speaker step each one takes
+                spans = {"segmentation": (0.0, 0.30), "speaker_counting": (0.30, 0.35),
+                         "embeddings": (0.35, 0.95), "discrete_diarization": (0.95, 1.0)}
+                names = {"segmentation": "Finding where each person speaks",
+                         "speaker_counting": "Counting speakers",
+                         "embeddings": "Recognizing each speaker's voice",
+                         "discrete_diarization": "Assigning speakers"}
+
+                def hook(step, artifact=None, file=None, total=None, completed=None, **_):
+                    lo, hi = spans.get(step, (0.0, 1.0))
+                    frac = lo + (hi - lo) * (completed / total if total and completed is not None else 0.0)
+                    plan.update(frac, f"Identifying speakers: {names.get(step, step)}…")
+                if hasattr(dm, "model"):
+                    dm.model = _HookedPipeline(dm.model, hook)
+                plan.begin("spk", "Identifying speakers…")
+                segs = _stage("identifying speakers", _with_progress, lambda f: None, duration, dm, audio,
+                              min_speakers=int(cfg.get("min_speakers", 2)),
+                              max_speakers=int(cfg.get("max_speakers", 2)))
+                try:
+                    ck.save("spk", {"rows": [{"start": float(r["start"]), "end": float(r["end"]),
+                                              "speaker": str(r["speaker"])}
+                                             for r in segs[["start", "end", "speaker"]].to_dict("records")]})
+                except Exception:
+                    pass
+                del dm
+                gc.collect()
+            result = whisperx.assign_word_speakers(segs, result)   # labels each word, not just segments
+            diarized = True
+        plan.finish()
+    finally:
+        plan.done = True
+    # a resumed run's times cover only part of the recording: not learned (they'd skew the estimates)
+    transcribe_here.last_timing = None if resumed else {
+        "device": device, "audio_secs": duration, "times": {k: round(v, 2) for k, v in plan.times.items()}}
     return result["segments"], duration, diarized, aligned
 
 
@@ -4040,6 +6330,35 @@ def client_hider(client):
     return lambda s: apply_name_map(s or "", pairs)
 
 
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}(?!\d)")
+_URL_RE = re.compile(r"\bhttps?://\S+|\bwww\.\S+", re.I)
+
+
+def scrub_contact_details(text):
+    """Email addresses, phone numbers and links -> placeholders (messages often carry them in signatures
+    and headers, and the patient's names-to-hide list doesn't cover them)."""
+    text = _EMAIL_RE.sub("[EMAIL]", text or "")
+    text = _URL_RE.sub("[LINK]", text)
+    return _PHONE_RE.sub("[PHONE]", text)
+
+
+def read_messages_file(path):
+    """Text of a saved message file: .eml (headers + text body), or anything extract_text reads."""
+    if path.lower().endswith(".eml"):
+        import email
+        from email import policy
+        with open(path, "rb") as f:
+            msg = email.message_from_binary_file(f, policy=policy.default)
+        body = msg.get_body(preferencelist=("plain", "html"))
+        text = body.get_content() if body else ""
+        if body is not None and body.get_content_type() == "text/html":
+            text = re.sub(r"<[^>]+>", " ", text)
+        head = "\n".join(f"{h}: {msg[h]}" for h in ("From", "To", "Date", "Subject") if msg[h])
+        return (head + "\n\n" + text.strip()).strip()
+    return extract_text(path)
+
+
 # --------------------------------------------------------------------------- #
 # Local LLM (LM Studio)
 # --------------------------------------------------------------------------- #
@@ -4063,8 +6382,12 @@ def _http_json(url, body=None, timeout=30):
         detail = e.read().decode("utf-8", errors="replace")[:300]
         raise RuntimeError(f"LM Studio returned an error ({e.code}): {detail}") from None
     except (urllib.error.URLError, ConnectionError, socket.timeout) as e:
-        raise RuntimeError("Couldn't reach LM Studio. Open LM Studio, load a model, and start the "
-                           f"local server (Developer tab). Details: {e}") from None
+        err = RuntimeError("Couldn't reach LM Studio. Open LM Studio, load a model, and start the "
+                           f"local server (Developer tab). Details: {e}")
+        # not running at all (vs. a connection dropped part-way, e.g. by the computer sleeping)
+        err.refused = isinstance(e, ConnectionRefusedError) or isinstance(getattr(e, "reason", None),
+                                                                          ConnectionRefusedError)
+        raise err from None
 
 
 def list_models(cfg, timeout=30):
@@ -4072,7 +6395,36 @@ def list_models(cfg, timeout=30):
     return [m.get("id") for m in data.get("data", []) if m.get("id")]
 
 
-def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=None, temperature=0.2):
+LLM_RETRY_WAITS = (5, 15, 30)      # seconds before trying LM Studio again after a dropped connection
+
+
+def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=None, temperature=0.2,
+             on_eta=None):
+    """Ask the local model (see _llm_chat_once). If the connection to LM Studio drops part-way — most
+    often because the computer went to sleep — the request is sent again after a short wait instead of
+    failing; finished steps of the notes are kept by the caller, so only this step is redone."""
+    _SleepWatch.start()
+    keep_awake(True)
+    try:
+        for i, wait in enumerate(LLM_RETRY_WAITS + (None,)):
+            started = time.time()
+            try:
+                return _llm_chat_once(cfg, prompt, on_progress, expected, system, on_text, temperature, on_eta)
+            except RuntimeError as e:
+                if wait is None or not str(e).startswith("Couldn't reach LM Studio"):
+                    raise
+                if getattr(e, "refused", False) and not _SleepWatch.slept_since(started - 120):
+                    raise                 # LM Studio simply isn't running: say so now, don't make you wait
+            end = time.time() + wait
+            while time.time() < end:                      # (stops at once if cancelled)
+                check_cancelled()
+                time.sleep(0.25)
+    finally:
+        keep_awake(False)
+
+
+def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=None, temperature=0.2,
+                   on_eta=None):
     """Ask the local model. Streams the reply so on_progress(fraction 0..1) can
     drive a progress bar; `expected` is the rough length (characters) of a
     typical answer, used to estimate the fraction while it's being written.
@@ -4088,7 +6440,27 @@ def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=
             "messages": [{"role": "system", "content": system or SYSTEM_PROMPT},
                          {"role": "user", "content": prompt}]}
     text, thinking, finish = "", 0, None
-    report = on_progress or (lambda f: None)
+    report_f = on_progress or (lambda f: None)
+    eta_out = on_eta or set_eta
+    # Learned speed of this model on this computer: how long reading the prompt and writing the answer take.
+    rates = timing_llm(model)
+    prompt_chars = len(prompt) + len(system or SYSTEM_PROMPT)
+    pre_est = prompt_chars / max(rates["prefill"], 1.0)
+    gen_est = max(expected, 1) / max(rates["gen"], 0.1)
+    share = pre_est / (pre_est + gen_est)
+    clock = {"sent": None, "first": None, "chars": 0, "stop": False}
+
+    def report(f, eta):
+        eta_out(eta)
+        report_f(f)
+
+    def reading_prompt():                  # nothing streams back while LM Studio reads: fill by time
+        while not clock["stop"]:
+            time.sleep(0.5)
+            if clock["stop"] or clock["first"] is not None or clock["sent"] is None:
+                continue
+            el = time.time() - clock["sent"]
+            _quiet(report, share * min(0.95, el / max(pre_est, 0.1)), max(pre_est - el, 0.0) + gen_est)
     u = urllib.parse.urlparse(url)
     conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
     conn = conn_cls(u.hostname, u.port, timeout=1800)
@@ -4108,6 +6480,8 @@ def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=
         check_cancelled()
         conn.request("POST", (u.path or "/") + (f"?{u.query}" if u.query else ""),
                      body=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"})
+        clock["sent"] = time.time()
+        threading.Thread(target=reading_prompt, daemon=True).start()
         r = conn.getresponse()
         if r.status >= 400:
             detail = r.read().decode("utf-8", errors="replace")[:300]
@@ -4140,20 +6514,38 @@ def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=
                 visible = len(shown)
                 if on_text is not None and delta.get("content"):
                     on_text(shown)
+                now = time.time()
+                if clock["first"] is None and (delta.get("content") or thinking):
+                    clock["first"] = now
+                clock["chars"] = len(text) + thinking
                 # thinking counts a little, so the bar still moves for reasoning models
-                report(min(0.97, (visible + 0.15 * (thinking + len(text) - visible)) / max(expected, 1)))
+                g = min(0.97, (visible + 0.15 * (thinking + len(text) - visible)) / max(expected, 1))
+                if clock["first"] is not None and now - clock["first"] > 1.5:
+                    rate = clock["chars"] / (now - clock["first"])          # this answer's own pace
+                else:
+                    rate = rates["gen"]
+                left = max(expected * 1.0 - visible, 0.03 * expected) / max(rate, 0.1)
+                report(share + (1 - share) * g, left)
     except (Cancelled, RuntimeError, NetworkBlocked):
         raise
     except Exception as e:
         check_cancelled()                  # a read cut short by cancelling is a cancel, not an error
         if isinstance(e, (KeyError, IndexError, ValueError)):
             raise RuntimeError("LM Studio sent back an unexpected response.") from None
-        raise RuntimeError("Couldn't reach LM Studio. Open LM Studio, load a model, and start the "
-                           f"local server (Developer tab). Details: {e}") from None
+        err = RuntimeError("Couldn't reach LM Studio. Open LM Studio, load a model, and start the "
+                           f"local server (Developer tab). Details: {e}")
+        # not running at all (vs. a connection dropped part-way, e.g. by the computer sleeping)
+        err.refused = isinstance(e, ConnectionRefusedError) or isinstance(getattr(e, "reason", None),
+                                                                          ConnectionRefusedError)
+        raise err from None
     finally:
+        clock["stop"] = True
         forget()
         _quiet(conn.close)
-    report(1.0)
+    report(1.0, 0.0)
+    if clock["sent"] and clock["first"] and not _SleepWatch.slept_since(clock["sent"]):   # learn its speed
+        _quiet(record_llm, model, prompt_chars, clock["first"] - clock["sent"], clock["chars"],
+               time.time() - clock["first"])
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     text = re.sub(r"^\s*```[a-z]*\n|\n```\s*$", "", text.strip())
     if finish == "length":
@@ -4163,20 +6555,42 @@ def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=
 
 
 class _Steps:
-    """Overall progress across several AI calls, weighted by expected length."""
+    """Overall progress across several AI calls. Each step's share of the bar is how long it's expected to
+    take on this computer: reading its prompt plus writing a document of the length that step usually
+    produces (both learned). Time left covers the steps still to come."""
 
-    def __init__(self, progress, plan):
-        self.progress, self.plan = progress, plan          # plan: [(label, expected_chars)]
-        self.total = sum(w for _, w in plan) or 1
-        self.done = 0
+    def __init__(self, progress, plan, prompt_hint=8000):
+        # plan: [(label, expected_chars)] or [(label, expected_chars, prompt_chars)]
+        self.progress, self.rates = progress, timing_llm()
+        self.labels = [p[0] for p in plan]
+        self.out = [expected_out(p[0], p[1]) for p in plan]
+        self.secs = [self._secs(p[2] if len(p) > 2 else prompt_hint, o) for p, o in zip(plan, self.out)]
+        self.pct = 0.0
+
+    def _secs(self, prompt_chars, out_chars):
+        return prompt_chars / max(self.rates["prefill"], 1.0) + out_chars / max(self.rates["gen"], 0.1)
 
     def run(self, i, cfg, prompt):
-        label, weight = self.plan[i]
-        base = self.done
-        self.progress(f"{label}…", 100 * base / self.total)
-        out = llm_chat(cfg, prompt, lambda f: self.progress(f"{label}…", 100 * (base + f * weight) / self.total),
-                       expected=weight)
-        self.done += weight
+        label = self.labels[i]
+        self.secs[i] = self._secs(len(prompt), self.out[i])          # the real prompt is known now
+        lo = self.pct
+        hi = lo + (100.0 - lo) * self.secs[i] / (sum(self.secs[i:]) or 1.0)
+        later = sum(self.secs[i + 1:])
+        memo = getattr(_TASK, "memo", None)      # finished steps of a paused-then-resumed task
+        key = hashlib.sha256((label + "\0" + prompt).encode("utf-8", "replace")).hexdigest()
+        if memo is not None and key in memo:
+            set_eta(later)
+            self.progress(f"{label} — already done before the pause…", hi)
+            self.pct = hi
+            return memo[key]
+        set_eta(self.secs[i] + later)
+        self.progress(f"{label}…", lo)
+        out = llm_chat(cfg, prompt, lambda f: self.progress(f"{label}…", lo + (hi - lo) * f),
+                       expected=self.out[i], on_eta=lambda e: set_eta((e or 0) + later))
+        record_out(label, len(out))
+        if memo is not None:
+            memo[key] = out
+        self.pct = hi
         return out
 
 
@@ -4194,7 +6608,7 @@ def split_chunks(text, max_chars, sep="\n"):
 
 
 def session_label(meta):
-    kind = "Intake" if meta.get("kind") == "intake" else \
+    kind = "Intake" if meta.get("kind") == "intake" else CONTACT_NAMES[contact_with(meta)][2] if meta.get("kind") == "parent" else \
         (f"Session {meta['session_number']}" if meta.get("session_number") else "Session")
     return f"{kind} — {fmt_date(meta.get('session_date', '?'))}" + (" (imported)" if meta.get("source") == "imported" else "")
 
@@ -4217,6 +6631,9 @@ def day_title(records):
     metas = [d.get("meta", {}) for _, d in records]
     if any(m.get("kind") == "intake" for m in metas):
         return "Intake"
+    if metas and all(m.get("kind") == "parent" for m in metas):
+        names = {CONTACT_NAMES[contact_with(m)][2] for m in metas}
+        return names.pop() if len(names) == 1 else "Outside contacts"
     num = next((m.get("session_number") for m in metas if m.get("session_number")), "")
     return f"Session {num}" if num else "Session"
 
@@ -4226,13 +6643,14 @@ def record_docs(d):
     m = d.get("meta", {})
     intake = m.get("kind") == "intake"
     if m.get("source") == "imported":
-        return [("Imported intake" if intake else "Imported note", "note")]
-    labels = KIND_LABELS["intake" if intake else "progress"]
+        return [("Imported intake" if intake else "Imported " + CONTACT_NAMES[contact_with(m)][2].lower()
+                 if m.get("kind") == "parent" else "Imported note", "note")]
+    labels = doc_labels(m)
     docs = [(labels[0], "note")]
     if d.get("overview", "").strip():
         docs.append((labels[1], "overview"))
     if d.get("transcript", "").strip():
-        docs.append(("Transcript", "transcript"))
+        docs.append(("Messages" if m.get("source") == "messages" else "Transcript", "transcript"))
     return docs
 
 
@@ -4415,8 +6833,12 @@ def build_context(client, prior_sessions, n_prev, hide, same_day=None):
     if intakes:
         d = intakes[-1]
         intake_txt = f"\nINTAKE ASSESSMENT ({session_label(d['meta'])}):\n{hide(d['note'])[:6000]}\n"
-    notes = [d for d in prior_sessions if d.get("note", "").strip() and d.get("meta", {}).get("kind") != "intake"]
+    notes = [d for d in prior_sessions if d.get("note", "").strip()
+             and d.get("meta", {}).get("kind") not in ("intake", "parent")]
     recent = notes[-max(0, n_prev):] if n_prev else []
+    parents = [d for d in prior_sessions if d.get("meta", {}).get("kind") == "parent" and d.get("note", "").strip()]
+    parent_txt = ("\nRECENT CONTACTS OUTSIDE SESSIONS — with the patient, a parent/guardian or others (oldest first):\n" + "\n\n".join(
+        f"{session_label(d['meta'])}:\n{hide(d['note'])[:2500]}" for d in parents[-2:]) + "\n") if parents else ""
     if recent:
         prev = "\nPREVIOUS SESSION NOTES (oldest first):\n" + "\n\n".join(
             f"{session_label(d['meta'])}:\n{hide(d['note'])}" for d in recent)
@@ -4439,9 +6861,18 @@ def build_context(client, prior_sessions, n_prev, hide, same_day=None):
         plan_txt = (f"\nCURRENT TREATMENT PLAN (version {plan['version']}, {plan.get('created', '')[:10]}) — relate "
                     f"progress to these goals:\n{hide(plan_for_ehr(plan['text']))[:5000]}\n")
         used.append(f"treatment plan v{plan['version']}")
+    hw = homework_text(client)
+    if hw:
+        parent_txt += "\nHOMEWORK ASSIGNED EARLIER (if this session followed it up, say how it went):\n" + hw + "\n"
+        used = used + ["open homework"]
+    meas = measures_text(client)
+    if meas:
+        parent_txt += "\nOUTCOME MEASURES (latest scores; mention them in the note only where relevant):\n" + meas + "\n"
+        used = used + ["PHQ-9/GAD-7 scores"]
     return fill(CONTEXT_HEADER, {"background": hide(client.get("background", "").strip()) or "(not provided)",
                                  "plan": plan_txt,
-                                 "intake": intake_txt, "case": case_txt, "previous": prev}), used
+                                 "intake": intake_txt, "case": case_txt, "previous": prev + parent_txt}), \
+        used + [session_label(d["meta"]) for d in parents[-2:]]
 
 
 def generate_documents(cfg, values, transcript, context, progress, kind="progress", reference=None,
@@ -4453,11 +6884,15 @@ def generate_documents(cfg, values, transcript, context, progress, kind="progres
     chunks = split_chunks(transcript, max_chars) if len(transcript) > max_chars else []
     if kind == "intake":
         tail = [("Writing the intake assessment", 4000), ("Filling in the 13-section intake questionnaire", 5000)]
+    elif kind == "parent":
+        tail = [("Writing the contact note", 1200), ("Writing the conversation summary", 2500)]
     else:
         tail = [("Writing the progress note", 1000), ("Writing the session overview", 3500)]
     tail = [t for t, name in zip(tail, ("first", "second")) if name in which]
-    steps = _Steps(progress, [(f"Long session — condensing part {i} of {len(chunks)}", 3000)
-                              for i in range(1, len(chunks) + 1)] + tail)
+    # how much each step has to read, roughly — so the first estimate already reflects a long session
+    final_read = len(context) + (3000 * len(chunks) if chunks else len(transcript)) + 6000
+    steps = _Steps(progress, [(f"Long session — condensing part {i} of {len(chunks)}", 3000, len(c) + 1500)
+                              for i, c in enumerate(chunks, 1)] + [(lbl, w, final_read) for lbl, w in tail])
     if chunks:
         digests = []
         for i, chunk in enumerate(chunks, 1):
@@ -4468,23 +6903,1424 @@ def generate_documents(cfg, values, transcript, context, progress, kind="progres
         kind_txt = ("a detailed, time-stamped digest of the session (the full transcript was too long "
                     "to include in one pass)")
     else:
-        source, kind_txt = transcript, "the full session transcript"
+        source, kind_txt = transcript, ("the full transcript of the conversation with "
+                                        + values.get("contact_party", "the patient's parent or guardian")
+                                        if kind == "parent" else "the full session transcript")
+    if values.get("source_kind") and not chunks:          # e.g. "the parent's text messages, in order"
+        kind_txt = values["source_kind"]
     v = dict(values, transcript=source, source_kind=kind_txt)
+    v.setdefault("contact_method", "Conversation (recorded)")
+    if kind == "parent":
+        for k, val in contact_values(values.get("contact_with") or "parent", values.get("contact_who", "")).items():
+            v.setdefault(k, val)
     style = style_block(reference, kind)
-    lead = context + ("\n\n" + style if style else "") + "\n\n"
+    prefs = style_notes_block(values.get("style_notes"))
+    lead = context + prefs + ("\n\n" + style if style else "") + "\n\n"
     extra = (f"\n\nCLINICIAN'S INSTRUCTIONS FOR THIS DRAFT (follow them, as long as the transcript supports "
              f"it):\n{instructions.strip()}" if instructions.strip() else "")
     n = len(chunks)
-    t1, t2 = ("intake_assessment.txt", "intake_questionnaire.txt") if kind == "intake" else \
-        ("session_note.txt", "overview.txt")
+    t1, t2 = {"intake": ("intake_assessment.txt", "intake_questionnaire.txt"),
+              "parent": ("parent_note.txt", "parent_summary.txt")}.get(kind, ("session_note.txt", "overview.txt"))
     first = second = None
     if "first" in which:
         first = steps.run(n, cfg, lead + fill(read_template(t1), v) + extra)
         n += 1
     if "second" in which:
-        second = steps.run(n, cfg, context + "\n\n" + fill(read_template(t2), v) + extra)
+        second = steps.run(n, cfg, context + prefs + "\n\n" + fill(read_template(t2), v) + extra)
     progress("Done.", 100)
     return first, second
+
+
+
+# --------------------------------------------------------------------------- #
+# Session review: the session map (computed here), skills feedback and techniques used (local AI)
+# --------------------------------------------------------------------------- #
+_NEG_WORDS = set("""sad sadness unhappy hopeless helpless worthless useless anxious anxiety nervous worried worry worrying
+scared afraid fear fearful terrified panic panicked angry anger mad furious rage frustrated frustrating annoyed
+upset hurt hurting pain painful cry cried crying tears lonely alone isolated empty numb tired exhausted drained
+stressed stress overwhelmed overwhelming depressed depression miserable awful terrible horrible hate hated guilty
+guilt ashamed shame embarrassed jealous resent resentful bitter rejected abandoned betrayed disappointed
+disappointing struggle struggling struggled hard difficult worse worst failing failed failure lost confused
+insecure irritable restless trapped stuck broken grief grieving dead die dying death kill suicide suicidal cut
+cutting harm hurtful abuse abused yelled yelling screamed fight fighting argument argued""".split())
+_POS_WORDS = set("""happy happier happiness glad good great better best proud pride calm calmer relaxed relief relieved
+hope hopeful excited exciting fun enjoy enjoyed enjoying love loved loving grateful thankful safe secure confident
+peaceful content comfortable optimistic motivated strong stronger progress improved improving accomplished
+connected supported supportive understood laugh laughed laughing smile smiled nice wonderful amazing excellent
+fine okay ok""".split())
+_NEGATORS = {"not", "no", "never", "don't", "dont", "didn't", "didnt", "isn't", "isnt", "wasn't", "wasnt", "can't",
+             "cant", "won't", "wont", "nothing", "hardly"}
+_OPEN_Q = ("what", "how", "why", "tell", "describe", "explain", "walk", "help me", "in what", "where do", "say more",
+           "talk about", "share")
+_CLOSED_Q = ("do", "did", "does", "is", "are", "was", "were", "can", "could", "will", "would", "have", "has", "had",
+             "should", "any", "anything", "is there", "are there", "who", "when", "which")
+
+
+def _tone_of(text):
+    """(score -1..1, negative words, positive words) for a stretch of speech (a simple word list, no AI)."""
+    words = re.findall(r"[a-z']+", (text or "").lower())
+    neg = pos = 0
+    for i, w in enumerate(words):
+        flipped = any(x in _NEGATORS for x in words[max(0, i - 2):i])
+        if w in _NEG_WORDS:
+            pos, neg = (pos + 1, neg) if flipped else (pos, neg + 1)
+        elif w in _POS_WORDS:
+            pos, neg = (pos, neg + 1) if flipped else (pos + 1, neg)
+    return (pos - neg) / (pos + neg + 1.0), neg, pos
+
+
+def question_kind(sentence):
+    s = sentence.strip().lower().lstrip("\"'([ ")
+    s = re.sub(r"^(so|and|but|okay|ok|well|um|uh|now|like)[, ]+", "", s)
+    if any(s.startswith(p) for p in _OPEN_Q):
+        return "open"
+    if any(s.startswith(p + " ") or s == p for p in _CLOSED_Q):
+        return "closed"
+    return "other"
+
+
+def session_map(lines, roles, counselor_label, window=120.0):
+    """Who talked when, how much, and how the patient's words felt over the session — computed on this
+    computer from the transcript (no AI). Returns None when there's no timed transcript."""
+    lines = [l for l in lines or [] if l.get("end") is not None and l.get("start") is not None
+             and (l.get("text") or "").strip()]
+    if not lines:
+        return None
+    label = lambda l: roles.get(l["speaker"], l["speaker"])
+    dur = max(float(l["end"]) for l in lines)
+    per = {}
+    for l in lines:
+        sp = per.setdefault(label(l), {"label": label(l), "secs": 0.0, "turns": 0, "longest": 0.0, "words": 0})
+        d = max(0.0, float(l["end"]) - float(l["start"]))
+        sp["secs"] += d
+        sp["turns"] += 1
+        sp["longest"] = max(sp["longest"], d)
+        sp["words"] += len(l["text"].split())
+    talk = sum(s["secs"] for s in per.values()) or 1.0
+    speakers = sorted(per.values(), key=lambda s: -s["secs"])
+    for s in speakers:
+        s["pct"] = round(100 * s["secs"] / talk)
+        s["avg_turn"] = s["secs"] / max(s["turns"], 1)
+    others = [s["label"] for s in speakers if s["label"] != counselor_label]
+    patient = others[0] if others else None
+    tone, heavy = [], []
+    n_win = max(1, int(math.ceil(dur / window)))
+    for k in range(n_win):
+        a, b = k * window, (k + 1) * window
+        said = [l for l in lines if label(l) != counselor_label and a <= float(l["start"]) < b]
+        text = " ".join(l["text"] for l in said)
+        score, neg, pos = _tone_of(text)
+        tone.append({"t": min(b, dur) - (min(b, dur) - a) / 2, "score": round(score, 3), "neg": neg, "pos": pos,
+                     "words": len(text.split())})
+        if neg >= 2 and score < -0.2:
+            best = max(said, key=lambda l: _tone_of(l["text"])[1])
+            heavy.append({"t": float(best["start"]), "neg": neg, "quote": best["text"].strip()[:160]})
+    heavy = sorted(sorted(heavy, key=lambda h: -h["neg"])[:3], key=lambda h: h["t"])
+    q = {"open": 0, "closed": 0, "other": 0}
+    for l in lines:
+        if label(l) == counselor_label:
+            for sent in re.findall(r"[^.?!]*\?", l["text"]):
+                q[question_kind(sent)] += 1
+    gaps = sum(max(0.0, float(b["start"]) - float(a["end"])) for a, b in zip(lines, lines[1:]))
+    return {"duration": dur, "speakers": speakers, "counselor": counselor_label, "patient": patient,
+            "timeline": [(float(l["start"]), float(l["end"]), label(l)) for l in lines],
+            "tone": tone, "heavy": heavy, "questions": dict(q, total=sum(q.values())),
+            "silence_pct": round(100 * gaps / dur) if dur else 0}
+
+
+def session_map_text(m):
+    """The map's numbers in words (for the page, and for the AI's skills feedback)."""
+    if not m:
+        return ""
+    out = [f"Length {fmt_ts(m['duration'])}. Talk time: " + ", ".join(
+        f"{s['label']} {s['pct']}% ({s['turns']} turns, longest {round(s['longest'])} s)" for s in m["speakers"])
+        + f". Pauses between turns: {m['silence_pct']}% of the session."]
+    q = m["questions"]
+    if q["total"]:
+        out.append(f"{m['counselor']}'s questions: {q['total']} — {q['open']} open, {q['closed']} closed"
+                   + (f", {q['other']} other" if q["other"] else "") + ".")
+    if m["heavy"]:
+        out.append("Heaviest moments (most distress words): " + "; ".join(
+            f"[{fmt_ts(h['t'])}] “{h['quote']}”" for h in m["heavy"]) + ".")
+    return "\n".join(out)
+
+
+REVIEW_FEEDBACK_PROMPT = """You are an experienced, warm clinical supervisor reviewing a session recorded by a \
+counseling trainee (the "{counselor}" in the transcript; the other speaker is the "{patient}"). The trainee's \
+theoretical orientation: {orientation}. Write feedback the trainee can learn from, like good supervision notes.
+
+Use these plain-text headings, in this order:
+
+WHAT WENT WELL
+2-4 specific moments that worked. For each: the timestamp, the trainee's exact words in quotes, and one sentence \
+on why it helped.
+
+MISSED OPPORTUNITIES
+2-5 moments where a reflection of feeling or meaning, a follow-up question, a summary or a pause could have \
+deepened the work. For each: the timestamp, what the {patient} said (exact quote), what the trainee did instead, \
+and one example of what could have been said.
+
+WHERE THE {patient_upper} PULLED BACK
+Moments the {patient} seemed to disengage: shorter answers, changing the subject, deflecting with humor, \
+"I don't know", contradicting. For each: the timestamp, the quote, and a hypothesis (label it as one) about what \
+happened just before. Write "None noticed" if there were none.
+
+ONE THING TO PRACTICE NEXT SESSION
+One concrete, specific skill, with an example of how it might sound with this {patient}.
+
+Rules: quote only words that are actually in the transcript, with their [mm:ss] timestamps. Keep placeholders \
+such as [Patient] exactly as written. Be specific, supportive and honest — no generic praise. Don't diagnose. \
+If risk or safety came up, note in one line whether it was explored and documented.
+
+Numbers measured from the recording (who talked how much, the trainee's questions):
+{map}
+
+Below is {part}.
+
+{transcript}"""
+
+REVIEW_TECHNIQUES_PROMPT = """Identify the therapeutic techniques and counselor skills the {counselor} (a \
+counseling trainee; orientation: {orientation}) actually used in this session transcript. Use the agency's \
+own terms where they fit:
+{vocabulary}
+
+Write one line per technique, most significant first, at most 10, each exactly like this:
+- <technique> — [mm:ss] "<the {counselor}'s exact words>" — <a short phrase on how it was used>
+
+Only list a technique with clear evidence in the transcript; quote exactly. Then, after one blank line:
+
+For the note: <one sentence in the agency's note style naming the 2-3 main interventions, for example \
+"Person centered therapy was used to ...; Counselor utilized reflection of feeling and validation ...">
+
+Below is {part}.
+
+{transcript}"""
+
+
+def review_transcript(d, roles=None):
+    """The transcript with timestamps and role names (what the review reads)."""
+    roles = roles if roles is not None else d.get("roles") or {}
+    if d.get("lines"):
+        return render_transcript(d["lines"], roles)
+    return d.get("transcript", "")
+
+
+def generate_session_review(cfg, client, d, counselor, patient, orientation, reference, progress,
+                            which=("feedback", "techniques")):
+    """{"feedback": text, "techniques": text} for one recorded session. Names are hidden first; a long
+    session is read in parts (each part's feedback is kept, labelled)."""
+    hide = client_hider(client)
+    transcript = hide(review_transcript(d))
+    smap = session_map(d.get("lines"), d.get("roles") or {}, counselor)
+    max_chars = int(cfg.get("max_chars", 24000))
+    parts = split_chunks(transcript, max_chars) if len(transcript) > max_chars else [transcript]
+    vocab = (reference or {}).get("vocabulary") or BUILTIN_REFERENCE.get("vocabulary", "")
+    plan = []
+    for kind in which:
+        for i, p in enumerate(parts, 1):
+            name = "Writing skills feedback" if kind == "feedback" else "Finding the techniques used"
+            plan.append((name + (f" (part {i} of {len(parts)})" if len(parts) > 1 else ""),
+                         2600 if kind == "feedback" else 1400, len(p) + 2500))
+    steps = _Steps(progress, plan)
+    out, n = {}, 0
+    for kind in which:
+        texts = []
+        for i, p in enumerate(parts, 1):
+            part = ("the full session transcript" if len(parts) == 1 else
+                    f"part {i} of {len(parts)} of the session transcript")
+            v = {"counselor": counselor, "patient": patient or "patient", "patient_upper": (patient or "patient").upper(),
+                 "orientation": orientation or "not specified", "map": session_map_text(smap) or "(not available)",
+                 "vocabulary": vocab, "part": part, "transcript": p}
+            t = steps.run(n, cfg, fill(REVIEW_FEEDBACK_PROMPT if kind == "feedback" else REVIEW_TECHNIQUES_PROMPT, v))
+            n += 1
+            texts.append((f"— Part {i} of {len(parts)} —\n" if len(parts) > 1 else "") + t.strip())
+        out[kind] = "\n\n".join(texts)
+    progress("Done.", 100)
+    return out
+
+
+
+# --------------------------------------------------------------------------- #
+# Supervision prep packet
+# --------------------------------------------------------------------------- #
+SUPERVISION_PATIENT_PROMPT = """Prepare a counseling trainee's notes for SUPERVISION about one patient ({code}), \
+covering {start} to {end}. Use ONLY the documentation below; never invent facts. Keep placeholders such as \
+[Patient] exactly as written. Plain text, with exactly these labels, each followed by 1-4 short lines \
+starting with "- ":
+
+This period:
+(what the sessions and contacts covered, with dates)
+
+Risk and safety:
+(anything documented — suicidal or homicidal thoughts, self-harm, abuse, safety planning — and what was done; \
+or "- Nothing documented")
+
+Progress toward goals:
+(movement on the treatment goals, or what's stalled)
+
+Bring to supervision:
+(1-3 specific questions the trainee could ask — clinical decisions, being stuck, the trainee's own reactions, \
+ethics or next steps — written as questions)
+
+The trainee's theoretical orientation: {orientation}
+Treatment goals: {goals}
+
+Documentation for this period (oldest first):
+{docs}"""
+
+
+def supervision_inputs(client, sessions, start, end):
+    """The documentation one patient contributes to a supervision packet (names hidden)."""
+    hide = client_hider(client)
+    docs = []
+    for sid, d in sessions:
+        day = d.get("meta", {}).get("session_date") or ""
+        if not (start <= day <= end):
+            continue
+        part = f"{session_label(d['meta'])}:\n{hide(d.get('note', ''))[:3500]}"
+        fb = (d.get("review") or {}).get("feedback", "")
+        if fb:
+            part += "\n(Skills feedback on this session, for the trainee:)\n" + hide(fb)[:1500]
+        docs.append(part)
+    return docs
+
+
+def practice_points(sessions, start, end):
+    """'ONE THING TO PRACTICE' from each session review in the period: [(date, text)]."""
+    out = []
+    for _, d in sessions:
+        day = d.get("meta", {}).get("session_date") or ""
+        fb = (d.get("review") or {}).get("feedback", "")
+        if start <= day <= end and fb:
+            m = re.search(r"ONE THING TO PRACTICE[^\n]*\n+(.+?)(?:\n\s*\n|$)", fb, re.S)
+            if m:
+                out.append((day, re.sub(r"\s+", " ", m.group(1)).strip()))
+    return out
+
+
+def generate_supervision_packet(cfg, patients, start, end, questions, orientation, progress):
+    """patients: [(client, sessions)]. Returns the packet text (plain text with CAPS headings)."""
+    work = []
+    for client, sessions in patients:
+        docs = supervision_inputs(client, sessions, start, end)
+        if docs:
+            work.append((client, sessions, docs))
+    steps = _Steps(progress, [(f"Preparing {c.get('code', '')}", 900, sum(len(x) for x in docs) + 1500)
+                              for c, _, docs in work])
+    sections, practice = [], []
+    for i, (client, sessions, docs) in enumerate(work):
+        hide = client_hider(client)
+        text = steps.run(i, cfg, fill(SUPERVISION_PATIENT_PROMPT, {
+            "code": client.get("code", ""), "start": fmt_date(start), "end": fmt_date(end),
+            "orientation": orientation or "not specified", "goals": hide(client.get("goals", "")) or "(none listed)",
+            "docs": "\n\n".join(docs)}))
+        n = len(docs)
+        sections.append(f"{client.get('code', '')} — {n} session{'s' if n != 1 else ''} or contact{'s' if n != 1 else ''}"
+                        f"\n{text.strip()}")
+        practice += [(client.get("code", ""), day, t) for day, t in practice_points(sessions, start, end)]
+    head = (f"SUPERVISION PREP\n{fmt_date(start)} to {fmt_date(end)} · prepared "
+            f"{fmt_date(date.today().isoformat())} · {len(work)} patient{'s' if len(work) != 1 else ''}")
+    out = [head]
+    if (questions or "").strip():
+        out.append("MY QUESTIONS\n" + "\n".join(("- " + q.strip().lstrip("-• ").strip())
+                                                  for q in questions.splitlines() if q.strip()))
+    if practice:
+        out.append("SKILLS I'M WORKING ON (from my session reviews)\n" + "\n".join(
+            f"- {code}, {fmt_date(day)}: {t}" for code, day, t in practice))
+    out.append("PATIENTS\n\n" + ("\n\n".join(sections) if sections else "No sessions or contacts in this period."))
+    progress("Done.", 100)
+    return "\n\n".join(out)
+
+
+def text_to_blocks(title, text):
+    """Plain text with CAPS headings -> write_docx/write_pdf blocks."""
+    blocks = [("title", title)]
+    para = []
+
+    def flush():
+        if para:
+            blocks.append(("p", "\n".join(para)))
+            para.clear()
+    for line in (text or "").splitlines():
+        s_ = line.strip()
+        if s_ and len(s_) <= 90 and s_.upper() == s_ and re.search(r"[A-Z]", s_) and not s_.startswith("-"):
+            flush()
+            blocks.append(("h1", s_.title() if len(s_) > 3 else s_))
+        elif not s_:
+            flush()
+        else:
+            para.append(line.rstrip())
+    flush()
+    return blocks
+
+
+
+# --------------------------------------------------------------------------- #
+# Goals check: which treatment goals each note addresses
+# --------------------------------------------------------------------------- #
+GOALS_STALE_AFTER = 3          # a goal not addressed in this many of the latest sessions is flagged
+
+
+def llm_json(text):
+    """The first JSON object in a model's reply ({} if there isn't a readable one)."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.S)
+    start = text.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                esc = (ch == "\\" and not esc)
+                if ch == '"' and not esc:
+                    in_str = False
+                elif ch != "\\":
+                    esc = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        val = json.loads(text[start:i + 1])
+                        return val if isinstance(val, dict) else {}
+                    except ValueError:
+                        break
+        start = text.find("{", start + 1)
+    return {}
+
+
+def patient_goals(client):
+    """The goals notes are checked against: the current treatment plan's, else the profile's."""
+    plan = current_plan(client)
+    goals = plan_goals(plan["text"]) if plan else []
+    if not goals:
+        goals = [re.sub(r"^\s*(?:[-•*]|\d+[.)])\s*", "", g).strip() for g in (client.get("goals") or "").splitlines()]
+    return [g for g in goals if g]
+
+
+def goals_key(goals):
+    return hashlib.sha256("\n".join(goals).encode("utf-8")).hexdigest()[:16]
+
+
+GOALS_CHECK_PROMPT = """Below are a patient's treatment goals, numbered, and the documentation of one session \
+or contact. For EACH goal, decide whether this documentation shows the goal was addressed — worked on, \
+discussed, or progress or a setback reported. Be strict: a passing mention that isn't related to the goal \
+doesn't count.
+
+Reply with JSON only, one entry per goal number, exactly like:
+{{"1": {{"addressed": true, "evidence": "at most 15 words from or about the note"}}, "2": {{"addressed": false, "evidence": ""}}}}
+
+Goals:
+{goals}
+
+Documentation ({label}):
+{note}"""
+
+
+def goals_check_note(cfg, client, d, goals, steps, i):
+    """[{goal, addressed, evidence}] for one saved record."""
+    hide = client_hider(client)
+    numbered = "\n".join(f"{n}. {hide(g)}" for n, g in enumerate(goals, 1))
+    prompt = GOALS_CHECK_PROMPT.replace("{{", "{").replace("}}", "}")
+    prompt = fill(prompt, {"goals": numbered, "label": session_label(d.get("meta", {})),
+                           "note": hide(d.get("note", ""))[:6000]})
+    ans = llm_json(steps.run(i, cfg, prompt))
+    out = []
+    for n, g in enumerate(goals, 1):
+        a = ans.get(str(n)) or {}
+        out.append({"goal": g, "addressed": bool(a.get("addressed")) if isinstance(a, dict) else False,
+                    "evidence": (a.get("evidence") or "").strip()[:200] if isinstance(a, dict) else ""})
+    return out
+
+
+def goals_todo(client, sessions):
+    """Saved records whose goals check is missing or out of date."""
+    goals = patient_goals(client)
+    if not goals:
+        return goals, []
+    key = goals_key(goals)
+    return goals, [(sid, d) for sid, d in sessions if (d.get("note") or "").strip()
+                   and (d.get("goals_check") or {}).get("key") != key]
+
+
+def goals_summary(client, sessions, stale_after=GOALS_STALE_AFTER):
+    """{goals, columns: [(date, sid, [bool|None per goal])], last: {goal: date}, stale: [(goal, n, since)]}."""
+    goals = patient_goals(client)
+    key = goals_key(goals) if goals else None
+    cols = []
+    for sid, d in sorted(sessions, key=lambda x: session_sort_key(x[1])):
+        gc = d.get("goals_check") or {}
+        if not (d.get("note") or "").strip():
+            continue
+        hits = [it["addressed"] for it in gc.get("items", [])] if gc.get("key") == key else [None] * len(goals)
+        cols.append((d["meta"].get("session_date") or "", sid, hits))
+    last, stale = {}, []
+    checked = [c for c in cols if c[2] and c[2][0] is not None]
+    for gi, g in enumerate(goals):
+        dates = [day for day, _, hits in checked if gi < len(hits) and hits[gi]]
+        last[g] = dates[-1] if dates else None
+        run = 0
+        for day, _, hits in reversed(checked):
+            if gi < len(hits) and hits[gi]:
+                break
+            run += 1
+        if run >= stale_after:
+            stale.append((g, run, last[g]))
+    return {"goals": goals, "columns": cols, "last": last, "stale": stale}
+
+
+
+# --------------------------------------------------------------------------- #
+# Risk timeline: every documented mention of suicidal or homicidal thoughts, self-harm, abuse or other
+# safety concerns, with what was done
+# --------------------------------------------------------------------------- #
+RISK_VERSION = 1
+RISK_RE = re.compile(
+    r"\b(suicid\w*|kill(?:ing)? (?:my|him|her|them)sel(?:f|ves)|want(?:ed|s)? to die|wish(?:ed)? (?:i|he|she|they) "
+    r"(?:was|were) dead|end (?:it|my life|things)|not (?:want|wanting) to (?:be here|live|wake up)|self[- ]?harm\w*|"
+    r"cut(?:ting|s)? (?:my|him|her|them)sel(?:f|ves)|cutting|overdos\w*|hurt(?:ing)? (?:my|him|her|them)sel(?:f|ves)|"
+    r"homicid\w*|hurt (?:someone|somebody|others|him|her|them)|weapons?|guns?|firearms?|abus\w*|molest\w*|"
+    r"assault\w*|neglect\w*|hit(?:s|ting)? (?:me|him|her)|beat(?:s|ing)? (?:me|him|her)|threat\w*|"
+    r"safety plan\w*|\bSI\b|\bHI\b|\bSIB\b|crisis|988|hospitali[sz]\w*|psych(?:iatric)? (?:er|emergency|eval\w*))", re.I)
+RISK_TYPES = ["suicidal thoughts", "self-harm", "homicidal thoughts or violence", "abuse or neglect",
+              "other safety concern", "screened — denied"]
+
+RISK_PROMPT = """Read the documentation of one counseling session or contact and list every mention of risk or \
+safety: suicidal thoughts, self-harm, homicidal thoughts or violence, abuse or neglect (of the patient or \
+by the patient), or another safety concern. Also list a risk SCREENING where the patient DENIED these \
+(for example "denied SI/HI"). Use only what's written; keep placeholders such as [Patient] exactly.
+
+Reply with JSON only, exactly like:
+{{"items": [{{"type": "one of: {types}", "summary": "what was said or observed, at most 25 words", \
+"when": "the [mm:ss] timestamp if there is one, else \\"\\"", "action": "what the counselor did — assessed, \
+safety plan made or reviewed, crisis line given, supervisor or guardian notified, referral — or \\"not documented\\""}}], \
+"safety_plan": "created" or "reviewed" or "not mentioned"}}
+If there is nothing about risk or safety at all, reply {{"items": [], "safety_plan": "not mentioned"}}.
+
+Documentation ({label}):
+{text}"""
+
+
+def risk_source(d):
+    """The parts of a record worth reading for risk: the note and overview in full, and the transcript lines
+    that mention a risk word (with the line before and after)."""
+    parts = []
+    for key in ("note", "overview"):
+        if (d.get(key) or "").strip():
+            parts.append(f"[{key}]\n{d[key].strip()}")
+    tl = (d.get("transcript") or "").splitlines()
+    keep = set()
+    for i, ln in enumerate(tl):
+        if RISK_RE.search(ln):
+            keep.update({i - 1, i, i + 1})
+    if keep:
+        parts.append("[transcript excerpts]\n" + "\n".join(tl[i] for i in sorted(keep) if 0 <= i < len(tl)))
+    return "\n\n".join(parts)
+
+
+def risk_todo(sessions):
+    """[(sid, d, source, key)] for records whose risk check is missing or out of date."""
+    out = []
+    for sid, d in sessions:
+        src = risk_source(d)
+        key = hashlib.sha256(f"{RISK_VERSION}\0{src}".encode("utf-8")).hexdigest()[:16]
+        if (d.get("risk_check") or {}).get("key") != key:
+            out.append((sid, d, src, key))
+    return out
+
+
+def risk_check_record(cfg, client, d, src, steps=None, i=0):
+    """{"items": [...], "safety_plan": ...}; records that never mention a risk word skip the AI."""
+    if not RISK_RE.search(src or ""):
+        return {"items": [], "safety_plan": "not mentioned"}
+    hide = client_hider(client)
+    prompt = RISK_PROMPT.replace("{{", "{").replace("}}", "}")
+    prompt = fill(prompt, {"types": " | ".join(RISK_TYPES), "label": session_label(d.get("meta", {})),
+                           "text": hide(src)[:9000]})
+    ans = llm_json(steps.run(i, cfg, prompt) if steps else llm_chat(cfg, prompt, expected=500))
+    items = []
+    for it in ans.get("items") or []:
+        if not isinstance(it, dict) or not (it.get("summary") or "").strip():
+            continue
+        t = (it.get("type") or "other safety concern").strip().lower()
+        t = next((x for x in RISK_TYPES if x.split()[0] in t), "other safety concern")
+        items.append({"type": t, "summary": it["summary"].strip()[:300], "when": (it.get("when") or "").strip()[:12],
+                      "action": (it.get("action") or "not documented").strip()[:300]})
+    sp = (ans.get("safety_plan") or "not mentioned").strip().lower()
+    return {"items": items, "safety_plan": sp if sp in ("created", "reviewed") else "not mentioned"}
+
+
+def risk_summary(client, sessions, recent_days=30):
+    """The timeline (newest first), the latest screening, safety-plan status and anything recent."""
+    rows, screens, plans = [], [], []
+    for sid, d in sessions:
+        rc = d.get("risk_check") or {}
+        day = d.get("meta", {}).get("session_date") or ""
+        for it in rc.get("items") or []:
+            row = dict(it, date=day, sid=sid, label=session_label(d.get("meta", {})))
+            (screens if it["type"] == "screened — denied" else rows).append(row)
+        if rc.get("safety_plan") in ("created", "reviewed"):
+            plans.append((day, rc["safety_plan"]))
+    rows.sort(key=lambda r: r["date"], reverse=True)
+    screens.sort(key=lambda r: r["date"], reverse=True)
+    plans.sort(reverse=True)
+    files = [f_ for f_ in client.get("files") or [] if "safety" in (f_.get("name") or "").lower()]
+    cutoff = (date.today() - timedelta(days=recent_days)).isoformat()
+    recent = [r for r in rows if r["date"] >= cutoff]
+    return {"rows": rows, "last_screen": screens[0] if screens else None, "plans": plans, "plan_files": files,
+            "recent": recent, "needs_plan": bool(recent) and not plans and not files,
+            "checked": sum(1 for _, d in sessions if d.get("risk_check"))}
+
+
+
+# --------------------------------------------------------------------------- #
+# Outcome measures: PHQ-9 (depression) and GAD-7 (anxiety)
+# --------------------------------------------------------------------------- #
+MEASURES = {
+    "PHQ-9": {"items": 9, "max": 27, "bands": [(0, "minimal"), (5, "mild"), (10, "moderate"),
+                                                (15, "moderately severe"), (20, "severe")],
+              "questions": ["Little interest or pleasure in doing things", "Feeling down, depressed, or hopeless",
+                            "Trouble falling or staying asleep, or sleeping too much", "Feeling tired or having little energy",
+                            "Poor appetite or overeating", "Feeling bad about yourself", "Trouble concentrating",
+                            "Moving or speaking slowly / being fidgety or restless",
+                            "Thoughts that you would be better off dead, or of hurting yourself"]},
+    "GAD-7": {"items": 7, "max": 21, "bands": [(0, "minimal"), (5, "mild"), (10, "moderate"), (15, "severe")],
+              "questions": ["Feeling nervous, anxious, or on edge", "Not being able to stop or control worrying",
+                            "Worrying too much about different things", "Trouble relaxing",
+                            "Being so restless that it's hard to sit still", "Becoming easily annoyed or irritable",
+                            "Feeling afraid as if something awful might happen"]},
+}
+MEASURE_CHANGE = 5            # a change of this many points is clinically meaningful (both scales)
+
+
+def measure_band(kind, total):
+    spec = MEASURES.get(kind)
+    if not spec or total is None:
+        return ""
+    return [name for lo, name in spec["bands"] if total >= lo][-1]
+
+
+def measure_entry(kind, day, total=None, items=None, source="manual", note=""):
+    """A validated score entry (ValueError with a plain message if it doesn't add up)."""
+    spec = MEASURES[kind]
+    if items is not None:
+        items = [int(x) for x in items]
+        if len(items) != spec["items"] or any(x not in (0, 1, 2, 3) for x in items):
+            raise ValueError(f"{kind} needs {spec['items']} answers, each 0-3.")
+        if total is not None and int(total) != sum(items):
+            raise ValueError(f"The {kind} answers add up to {sum(items)}, not {total}.")
+        total = sum(items)
+    if total is None:
+        raise ValueError(f"Enter the {kind} total or its answers.")
+    total = int(total)
+    if not 0 <= total <= spec["max"]:
+        raise ValueError(f"A {kind} total is between 0 and {spec['max']}.")
+    if not re.fullmatch(r"\d{4}-\d\d-\d\d", day or ""):
+        raise ValueError("Enter the date it was completed.")
+    return {"id": uuid.uuid4().hex[:12], "kind": kind, "date": day, "total": total, "items": items,
+            "source": source, "note": note, "added": datetime.now().isoformat(timespec="seconds")}
+
+
+def measure_series(client, kind):
+    return sorted((m for m in client.get("measures") or [] if m.get("kind") == kind),
+                  key=lambda m: (m["date"], m.get("added", "")))
+
+
+def measure_trend(client, kind):
+    """{"latest", "previous", "first", "change", "worse", "better", "item9"} for one scale (None if no scores)."""
+    s = measure_series(client, kind)
+    if not s:
+        return None
+    last, prev = s[-1], (s[-2] if len(s) > 1 else None)
+    ch = last["total"] - prev["total"] if prev else 0
+    band_up = prev is not None and [b for _, b in MEASURES[kind]["bands"]].index(measure_band(kind, last["total"])) > \
+        [b for _, b in MEASURES[kind]["bands"]].index(measure_band(kind, prev["total"]))
+    return {"latest": last, "previous": prev, "first": s[0], "change": ch,
+            "worse": prev is not None and (ch >= MEASURE_CHANGE or band_up),
+            "better": prev is not None and ch <= -MEASURE_CHANGE,
+            "item9": kind == "PHQ-9" and bool(last.get("items")) and last["items"][8] > 0}
+
+
+def measures_text(client):
+    """One line per scale for notes, the patient page and the AI's context (empty if no scores)."""
+    out = []
+    for kind in MEASURES:
+        t = measure_trend(client, kind)
+        if not t:
+            continue
+        l_ = t["latest"]
+        line = f"{kind} {l_['total']} ({measure_band(kind, l_['total'])}) on {fmt_date(l_['date'])}"
+        if t["previous"]:
+            p_ = t["previous"]
+            line += (f", {'up' if t['change'] > 0 else 'down' if t['change'] < 0 else 'no change'}"
+                     + (f" {abs(t['change'])}" if t["change"] else "") + f" from {p_['total']} on {fmt_date(p_['date'])}")
+        if t["item9"]:
+            line += f"; item 9 (thoughts of being better off dead or self-harm) answered {l_['items'][8]}"
+        out.append(line + ".")
+    return "\n".join(out)
+
+
+MEASURE_EXTRACT_PROMPT = """Below is the text of a patient's registration packet (read from a form). Find the \
+PHQ-9 and the GAD-7 questionnaires, if they are there, and read the patient's answers. Each answer is scored \
+0 = "Not at all", 1 = "Several days", 2 = "More than half the days", 3 = "Nearly every day". Use a total only if \
+it's written on the form. Never guess: if an answer can't be read, use null for it.
+
+Reply with JSON only, exactly like:
+{{"PHQ-9": {{"found": true, "items": [0, 1, 2, 0, 1, 0, 3, 0, 0], "total": 7, "date": "YYYY-MM-DD or null"}}, \
+"GAD-7": {{"found": false, "items": [], "total": null, "date": null}}}}
+
+PHQ-9 questions, in order: {phq}
+GAD-7 questions, in order: {gad}
+
+Form text:
+{text}"""
+
+
+def form_text(data, ext):
+    """A form's readable text plus, for fillable PDFs, its field values (that's where ticked answers live)."""
+    text = text_from_bytes(data, ext) if ext in (".pdf", ".docx", ".txt", ".md") else ""
+    if ext == ".pdf":
+        try:
+            import io
+            from pypdf import PdfReader
+            fields = PdfReader(io.BytesIO(data)).get_fields() or {}
+            vals = [f"{k}: {v.get('/V')}" for k, v in fields.items() if v.get("/V") not in (None, "", "/Off")]
+            if vals:
+                text += "\n\nFORM FIELDS (name: value):\n" + "\n".join(vals)
+        except Exception:
+            pass
+    return text
+
+
+def extract_measures(cfg, client, text, default_day):
+    """[measure entries] read from a registration form's text by the local AI (names hidden). Answers that
+    can't be read leave that scale out unless the form states its total."""
+    hide = client_hider(client)
+    prompt = MEASURE_EXTRACT_PROMPT.replace("{{", "{").replace("}}", "}")
+    prompt = fill(prompt, {"phq": " | ".join(MEASURES["PHQ-9"]["questions"]),
+                           "gad": " | ".join(MEASURES["GAD-7"]["questions"]), "text": hide(text)[:20000]})
+    ans = llm_json(llm_chat(cfg, prompt, expected=400, temperature=0.0))
+    out = []
+    for kind in MEASURES:
+        a = ans.get(kind) or {}
+        if not isinstance(a, dict) or not a.get("found"):
+            continue
+        items = a.get("items") or []
+        day = a.get("date") if re.fullmatch(r"\d{4}-\d\d-\d\d", str(a.get("date") or "")) else default_day
+        try:
+            if len(items) == MEASURES[kind]["items"] and all(isinstance(x, int) for x in items):
+                out.append(measure_entry(kind, day, items=items, source="registration form"))
+            elif isinstance(a.get("total"), int):
+                out.append(measure_entry(kind, day, total=a["total"], source="registration form"))
+        except ValueError:
+            continue
+    return out
+
+
+
+# --------------------------------------------------------------------------- #
+# Pre-session brief
+# --------------------------------------------------------------------------- #
+BRIEF_PROMPT = """Write a short PRE-SESSION BRIEF that a counseling trainee will read in the two minutes before \
+seeing patient {code}. About half a page. Plain text with exactly these headings, each followed by 1-4 short \
+lines starting with "- ". Use ONLY the material below; never invent. Keep placeholders such as [Patient] exactly.
+
+LAST TIME
+(the main themes of the most recent session, with its date)
+
+OPEN THREADS
+(topics left unfinished, things the patient said they'd try, questions to follow up)
+
+HOMEWORK AND FOLLOW-UPS TO CHECK
+(homework assigned and anything the counselor promised; "- None recorded" if there's nothing)
+
+WHAT THE PLAN SAYS TO WORK ON
+(treatment goals to focus on next — especially any that haven't come up lately)
+
+WATCH FOR
+(risk or safety items and score changes worth checking in on; "- Nothing flagged" if none)
+
+WAYS TO OPEN
+(1-2 natural opening questions for this patient, in the counselor's own voice)
+
+The trainee's theoretical orientation: {orientation}
+
+MATERIAL
+{material}"""
+
+
+def brief_material(client, sessions, n_recent=3):
+    """What the brief is written from (names hidden by the caller)."""
+    parts = []
+    goals = patient_goals(client)
+    if goals:
+        sm = goals_summary(client, sessions)
+        stale = {g for g, _, _ in sm["stale"]}
+        parts.append("Treatment goals:\n" + "\n".join(
+            f"- {g}" + (" (not worked on in recent sessions)" if g in stale else "")
+            + (f" (last worked on {fmt_date(sm['last'][g])})" if sm["last"].get(g) else "") for g in goals))
+    recs = [d for _, d in sorted(sessions, key=lambda x: session_sort_key(x[1])) if (d.get("note") or "").strip()]
+    for d in recs[-n_recent:]:
+        part = f"{session_label(d['meta'])} — note:\n{d['note'][:3000]}"
+        if (d.get("overview") or "").strip() and d is recs[-1]:
+            part += f"\n{session_label(d['meta'])} — overview:\n{d['overview'][:4000]}"
+        parts.append(part)
+    hw = [x for x in client.get("homework") or [] if x.get("status") == "assigned"]
+    if hw:
+        parts.append("Homework assigned and not yet followed up:\n" + "\n".join(
+            f"- {x['title']} (given {fmt_date(x.get('date', ''))})" for x in hw))
+    fu = [x for x in client.get("followups") or [] if not x.get("done")]
+    if fu:
+        parts.append("Open follow-ups the counselor or others agreed to:\n" + "\n".join(
+            f"- {x['text']} ({fmt_date(x.get('date', ''))})" for x in fu))
+    meas = measures_text(client)
+    if meas:
+        parts.append("Questionnaire scores:\n" + meas)
+    rs = risk_summary(client, sessions)
+    if rs["recent"]:
+        parts.append("Risk documented in the last 30 days:\n" + "\n".join(
+            f"- {fmt_date(r['date'])}: {r['type']} — {r['summary']} (done: {r['action']})" for r in rs["recent"][:4]))
+    if rs["last_screen"]:
+        parts.append(f"Latest risk screening: {fmt_date(rs['last_screen']['date'])} — {rs['last_screen']['summary']}")
+    pp = practice_points(sessions, "0000", "9999")
+    if pp:
+        parts.append(f"The counselor's own practice focus (from their last session review): {pp[-1][1]}")
+    return "\n\n".join(parts)
+
+
+def generate_brief(cfg, client, sessions, orientation, progress):
+    hide = client_hider(client)
+    material = hide(brief_material(client, sessions))
+    if not material.strip():
+        raise RuntimeError("There's nothing documented for this patient yet.")
+    steps = _Steps(progress, [("Writing the pre-session brief", 1400, len(material) + 1500)])
+    text = steps.run(0, cfg, fill(BRIEF_PROMPT, {"code": client.get("code", ""), "orientation": orientation or
+                                                 "not specified", "material": material}))
+    progress("Done.", 100)
+    return text.strip()
+
+
+
+# --------------------------------------------------------------------------- #
+# Worksheet library (your own handouts) and homework
+# --------------------------------------------------------------------------- #
+WORKSHEET_DIR = "worksheets"            # in the data folder (synced): handouts, no patient information
+WORKSHEET_TYPES = (".pdf", ".docx", ".txt", ".md")
+HOMEWORK_STATUS = {"assigned": "Assigned", "done": "Done", "partly": "Partly done", "not done": "Not done"}
+
+
+def worksheet_root(cfg):
+    return os.path.join(data_root(cfg), WORKSHEET_DIR)
+
+
+def worksheet_catalog(folder, cache_path=None):
+    """[{"title", "file", "summary"}] for the library (each file's opening text, cached by modification time)."""
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.lower().endswith(WORKSHEET_TYPES) and not n.startswith("~$"))
+    except OSError:
+        return []
+    cache = {}
+    if cache_path:
+        try:
+            with open(cache_path, encoding="utf-8") as f:
+                cache = json.load(f)
+        except (OSError, ValueError):
+            cache = {}
+    out, changed = [], False
+    for n in names:
+        p = os.path.join(folder, n)
+        try:
+            stamp = f"{os.path.getmtime(p):.0f}:{os.path.getsize(p)}"
+        except OSError:
+            continue
+        hit = cache.get(n)
+        if not hit or hit.get("stamp") != stamp:
+            try:
+                txt = re.sub(r"\s+", " ", extract_text(p))[:700]
+            except Exception:
+                txt = ""
+            hit = {"stamp": stamp, "summary": txt}
+            cache[n] = hit
+            changed = True
+        title = re.sub(r"[_-]+", " ", os.path.splitext(n)[0]).strip()
+        out.append({"title": title, "file": n, "summary": hit["summary"]})
+    if cache_path and changed:
+        try:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            _atomic_json(cache_path, {k: v for k, v in cache.items() if k in names})
+        except OSError:
+            pass
+    return out
+
+
+WORKSHEET_PROMPT = """A counseling trainee wants to suggest a between-session worksheet or exercise for patient \
+{code}. Choose up to {n} from THEIR LIBRARY below that genuinely fit what came up in this session and the \
+treatment goals. Use the exact titles. If nothing fits, return an empty list — don't force it.
+
+Reply with JSON only, exactly like:
+{{"suggestions": [{{"title": "<exact library title>", "why": "one sentence tied to something specific from the session"}}]}}
+
+Treatment goals: {goals}
+Homework already assigned and not yet followed up: {open_hw}
+
+THE LIBRARY (title — opening text):
+{library}
+
+THIS SESSION ({label}):
+{session}"""
+
+
+def suggest_worksheets(cfg, client, d, catalog, progress=None, n=3):
+    """[{"title", "file", "why"}] chosen from the library by the local AI (names hidden)."""
+    if not catalog:
+        return []
+    hide = client_hider(client)
+    lib = "\n".join(f"- {w['title']} — {w['summary'][:260]}" for w in catalog[:80])
+    session = hide((d.get("note") or "") + ("\n\n" + d["overview"] if (d.get("overview") or "").strip() else ""))[:9000]
+    open_hw = ", ".join(x["title"] for x in client.get("homework") or [] if x.get("status") == "assigned") or "none"
+    prompt = WORKSHEET_PROMPT.replace("{{", "{").replace("}}", "}")
+    prompt = fill(prompt, {"code": client.get("code", ""), "n": n, "goals": hide("; ".join(patient_goals(client))) or
+                           "(none listed)", "open_hw": open_hw, "library": lib,
+                           "label": session_label(d.get("meta", {})), "session": session})
+    if progress:
+        reply = _Steps(progress, [("Choosing worksheets from your library", 500, len(prompt))]).run(0, cfg, prompt)
+    else:
+        reply = llm_chat(cfg, prompt, expected=500)
+    by_title = {w["title"].lower(): w for w in catalog}
+    out = []
+    for s_ in llm_json(reply).get("suggestions") or []:
+        if not isinstance(s_, dict):
+            continue
+        w = by_title.get(str(s_.get("title", "")).strip().lower())
+        if w and w["file"] not in {o["file"] for o in out}:
+            out.append({"title": w["title"], "file": w["file"], "why": str(s_.get("why") or "").strip()[:300]})
+    return out[:n]
+
+
+def homework_entry(title, day, sid="", worksheet=""):
+    return {"id": uuid.uuid4().hex[:12], "title": title.strip()[:200], "date": day, "sid": sid,
+            "worksheet": worksheet, "status": "assigned", "added": datetime.now().isoformat(timespec="seconds")}
+
+
+def homework_text(client):
+    """Open homework for the AI's context when it writes the next note."""
+    hw = [x for x in client.get("homework") or [] if x.get("status") == "assigned"]
+    return "\n".join(f"- {x['title']} (assigned {fmt_date(x.get('date', ''))})" for x in hw)
+
+
+
+# --------------------------------------------------------------------------- #
+# Letters and documents (attendance, school / provider, referral, coordination email)
+# --------------------------------------------------------------------------- #
+LETTER_TYPES = {
+    "attendance": ("Attendance letter", ["dates", "count"]),
+    "school": ("School or provider letter", ["dates", "count", "goals", "progress", "recommendations"]),
+    "referral": ("Referral", ["reason", "goals", "progress", "diagnosis", "scores", "recommendations"]),
+    "coordination": ("Coordination email", ["goals", "progress", "recommendations"]),
+}
+LETTER_PARTS = {"dates": "Dates of sessions attended", "count": "Number of sessions", "reason": "Reason for referral",
+                "diagnosis": "Diagnosis (from the treatment plan)", "goals": "Treatment goals",
+                "progress": "Summary of progress", "scores": "PHQ-9 / GAD-7 scores",
+                "recommendations": "Recommendations"}
+
+LETTER_PROMPT = """Write a {kind_name} from a counselor at an outpatient mental health agency.
+Recipient: {to}
+Purpose, in the counselor's words: {purpose}
+
+Share ONLY the information listed under "MAY SHARE" — nothing else from the record, even if it seems helpful \
+(minimum necessary). Keep placeholders such as [Patient] exactly as written; never invent names, dates, \
+diagnoses or details. Professional, warm and brief. {format}
+
+End with this signature block exactly:
+{signature}
+
+MAY SHARE:
+{shared}"""
+
+
+def letter_facts(client, sessions, parts):
+    """The facts a letter may use, per the clinician's choices (names still in; hidden by the caller)."""
+    out = []
+    days = sorted({d["meta"].get("session_date") for _, d in sessions
+                   if d.get("meta", {}).get("session_date") and d["meta"].get("kind") != "parent"})
+    if "dates" in parts and days:
+        out.append("Session dates attended: " + ", ".join(fmt_date(x) for x in days))
+    if "count" in parts:
+        out.append(f"Number of sessions attended: {len(days)}" + (f" (first {fmt_date(days[0])}, most recent "
+                                                                    f"{fmt_date(days[-1])})" if days else ""))
+    plan = current_plan(client)
+    if "diagnosis" in parts and plan:
+        m = re.search(r"(?im)^\s*(?:diagnos[ie]s|dx)\s*[:\-–]\s*(.+)$", plan_for_ehr(plan["text"]))
+        if m:
+            out.append("Diagnosis: " + m.group(1).strip())
+    if "goals" in parts and patient_goals(client):
+        out.append("Treatment goals:\n" + "\n".join(f"- {g}" for g in patient_goals(client)))
+    if "progress" in parts:
+        case = (client.get("case_overview") or {}).get("text", "")
+        recent = [d.get("note", "") for _, d in sorted(sessions, key=lambda x: session_sort_key(x[1]))
+                  if (d.get("note") or "").strip()][-3:]
+        src = case[:4000] if case else "\n\n".join(r[:1500] for r in recent)
+        if src:
+            out.append("Clinical material to summarize progress from (summarize briefly in general terms; do not "
+                       "quote it or include sensitive personal details):\n" + src)
+    if "scores" in parts and measures_text(client):
+        out.append("Questionnaire scores:\n" + measures_text(client))
+    return "\n\n".join(out)
+
+
+def generate_letter(cfg, client, sessions, kind, to, purpose, parts, signature, fill_names, progress):
+    hide = client_hider(client)
+    name, _ = LETTER_TYPES[kind]
+    fmt = ("Write it as an email: a subject line first (\"Subject: ...\"), then the message."
+           if kind == "coordination" else "Format it as a letter with today's date (" + fmt_date(date.today().isoformat())
+           + "), the recipient, \"Re: [Patient]\", the body and the signature.")
+    facts = hide(letter_facts(client, sessions, parts))
+    if "reason" in parts and purpose.strip():
+        facts = "Reason for referral: " + hide(purpose.strip()) + "\n\n" + facts
+    prompt = fill(LETTER_PROMPT, {"kind_name": name.lower(), "to": hide(to.strip()) or "(not specified)",
+                                  "purpose": hide(purpose.strip()) or "(not specified)", "format": fmt,
+                                  "signature": signature.strip() or "[Your name, credentials]\n[Agency]",
+                                  "shared": facts or "(nothing beyond the purpose above)"})
+    text = _Steps(progress, [(f"Writing the {name.lower()}", 1500, len(prompt))]).run(0, cfg, prompt).strip()
+    if fill_names:
+        text = unhide_names(client, text)
+    progress("Done.", 100)
+    return text
+
+
+def unhide_names(client, text):
+    """Put the real names back in place of their placeholders — on this computer, after the AI is done."""
+    first = {}
+    for name, ph in client_name_map(client):
+        first.setdefault(ph, name)
+    for ph, name in first.items():
+        text = text.replace(ph, name)
+    return text
+
+
+
+# --------------------------------------------------------------------------- #
+# Learning from your edits: what you change in AI drafts becomes standing preferences for future drafts
+# --------------------------------------------------------------------------- #
+LEARN_AFTER = 3              # new edited drafts before the preferences are updated (in the background)
+LEARN_KEEP = 12              # edited drafts remembered (encrypted, in the vault's settings)
+
+
+def edit_changed(draft, final):
+    """True when the clinician changed a draft meaningfully (not just whitespace or a word or two)."""
+    import difflib
+    a, b = re.sub(r"\s+", " ", draft or "").strip(), re.sub(r"\s+", " ", final or "").strip()
+    if not a or not b or a == b:
+        return False
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() < 0.97
+
+
+def record_edit(settings, client, kind, doc_key, draft, final):
+    """Remember one draft→final pair (names hidden). Returns True if it was new."""
+    if not edit_changed(draft, final):
+        return False
+    hide = client_hider(client)
+    key = hashlib.sha256((draft + "\0" + final).encode("utf-8")).hexdigest()[:16]
+    pairs = settings.setdefault("edit_pairs", [])
+    if any(p.get("key") == key for p in pairs):
+        return False
+    pairs.append({"key": key, "kind": kind, "doc": doc_key, "draft": hide(draft)[:2500], "final": hide(final)[:2500],
+                  "date": date.today().isoformat()})
+    del pairs[:-LEARN_KEEP]
+    settings["edits_pending"] = int(settings.get("edits_pending", 0)) + 1
+    return True
+
+
+def record_instruction(settings, text):
+    """An instruction given to 'Revise with AI' is a stated preference too."""
+    text = (text or "").strip()
+    if not text:
+        return
+    ins = settings.setdefault("edit_instructions", [])
+    ins.append({"text": text[:300], "date": date.today().isoformat()})
+    del ins[:-15]
+    settings["edits_pending"] = int(settings.get("edits_pending", 0)) + 1
+
+
+LEARN_PROMPT = """A counselor reviews AI-drafted clinical documents and edits them before filing them. Below are \
+DRAFT → FINAL pairs (oldest first) and instructions the counselor gave when asking for revisions. Work out the \
+counselor's CONSISTENT preferences: length, structure, wording they add or remove, terms they prefer or avoid, \
+tone, level of detail, what they always fix. Merge them with the current list.
+
+Output only a list of at most 12 short, specific, actionable bullets starting with "- ", most important first, \
+each saying which document it applies to when it isn't all of them (e.g. "Progress note: ..."). Keep a \
+preference only if more than one edit shows it or an instruction states it; drop current bullets the edits \
+contradict. Never include patient details. No commentary.
+
+CURRENT PREFERENCES:
+{current}
+
+INSTRUCTIONS GIVEN:
+{instructions}
+
+EDITS:
+{pairs}"""
+
+
+def learn_style(cfg, settings, progress):
+    """Updated preference bullets from the remembered edits."""
+    names = {"note": "note", "overview": "overview"}
+    pairs = "\n\n".join(
+        f"[{p['date']} · {KIND_LABELS.get(p['kind'], ('Note', 'Overview'))[0 if p['doc'] == 'note' else 1]}]\n"
+        f"DRAFT:\n{p['draft']}\nFINAL:\n{p['final']}" for p in settings.get("edit_pairs") or [])
+    ins = "\n".join(f"- {x['text']}" for x in settings.get("edit_instructions") or []) or "(none)"
+    prompt = fill(LEARN_PROMPT, {"current": settings.get("style_notes") or "(none yet)", "instructions": ins,
+                                 "pairs": pairs or "(none)"})
+    out = _Steps(progress, [("Learning from your edits", 900, len(prompt))]).run(0, cfg, prompt)
+    bullets = [l.strip() for l in out.splitlines() if l.strip().startswith(("-", "•", "*"))]
+    progress("Done.", 100)
+    return "\n".join("- " + b.lstrip("-•* ").strip() for b in bullets[:12])
+
+
+def style_notes_block(notes):
+    notes = (notes or "").strip()
+    return ("\n\nTHE CLINICIAN'S OWN PREFERENCES (learned from how they edit drafts — follow them unless this "
+            "session's facts say otherwise):\n" + notes) if notes else ""
+
+
+
+# --------------------------------------------------------------------------- #
+# Revise a saved document by instruction
+# --------------------------------------------------------------------------- #
+REVISE_PROMPT = """Revise this {label} as the counselor asks. Change only what the instruction calls for and \
+keep everything else — facts, structure, headings and wording — as it is. Never add facts that aren't in the \
+document (use [VERIFY: ...] if the instruction needs information you don't have). Keep placeholders such as \
+[Patient] exactly as written. Reply with the full revised document only, no commentary.
+
+INSTRUCTION: {instruction}
+
+DOCUMENT:
+{text}"""
+REVISE_QUICK = ["Make it shorter", "Fix grammar and spelling only", "Use more clinical language",
+                "Name the interventions used", "Add a line on risk screening"]
+
+
+def revise_document(cfg, client, label, text, instruction, progress):
+    hide = client_hider(client)
+    original = text or ""
+    prompt = fill(REVISE_PROMPT, {"label": label.lower(), "instruction": hide(instruction.strip()),
+                                  "text": hide(original)})
+    out = _Steps(progress, [(f"Revising the {label.lower()}", max(len(original), 300), len(prompt))]).run(0, cfg, prompt)
+    out = re.sub(r"^\s*```[a-z]*\n|\n```\s*$", "", out.strip())
+    first = {}
+    for name, ph in client_name_map(client):             # names that were in the document go back in
+        first.setdefault(ph, name)
+    for ph, name in first.items():
+        if ph not in original and ph in out:
+            out = out.replace(ph, name)
+    progress("Done.", 100)
+    return out.strip()
+
+
+def diff_marks(old, new):
+    """[(text, tag)] for showing a revision: tag is "add", "del" or "" (word-level)."""
+    import difflib
+    a, b = re.findall(r"\s+|\S+", old or ""), re.findall(r"\s+|\S+", new or "")
+    out = []
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+        if op == "equal":
+            out.append(("".join(a[i1:i2]), ""))
+        else:
+            if i2 > i1:
+                out.append(("".join(a[i1:i2]), "del"))
+            if j2 > j1:
+                out.append(("".join(b[j1:j2]), "add"))
+    return out
+
+
+
+# --------------------------------------------------------------------------- #
+# Recurring themes per patient (counted on this computer — no AI)
+# --------------------------------------------------------------------------- #
+THEME_WORDS = {
+    "Work": "work job boss manager coworker coworkers office shift career fired hired promotion workplace salary",
+    "School": "school class classes teacher teachers homework grades test tests exam exams college professor semester",
+    "Family": "mom mother dad father parents parent sister brother siblings family grandma grandmother grandpa "
+              "grandfather aunt uncle cousin stepdad stepmom",
+    "Partner & dating": "boyfriend girlfriend partner husband wife dating date relationship breakup divorce marriage "
+                        "married ex",
+    "Friends": "friend friends friendship lonely alone isolated social party",
+    "Sleep": "sleep sleeping slept insomnia tired exhausted nightmare nightmares bed bedtime nap",
+    "Anxiety & worry": "anxious anxiety worry worried worrying panic nervous overthinking scared afraid fear",
+    "Low mood": "sad depressed depression down hopeless empty numb crying cry tears unmotivated",
+    "Anger & conflict": "angry anger mad furious fight fighting argument argue yelled yelling frustrated annoyed",
+    "Self-worth": "confidence confident worthless failure ashamed shame guilt guilty insecure self-esteem proud",
+    "Body & health": "pain sick doctor health eating food appetite weight body exercise gym medication meds",
+    "Substances": "drink drinking alcohol drunk weed smoke smoking vape vaping high pills drugs sober",
+    "Loss & grief": "died death passed funeral grief grieving loss lost miss missing",
+    "Safety": "suicide suicidal kill die hurt harm cutting unsafe abuse hit threatened",
+    "Coping & progress": "breathing journal journaling walk walks meditate meditation coping better progress "
+                         "helped improve improving goal goals",
+}
+_THEME_OF = {w: t for t, ws in THEME_WORDS.items() for w in ws.split()}
+STOPWORDS = set("""a about above after again against all also am an and any are aren't as at be because been before being
+below between both but by can can't cannot could couldn't did didn't do does doesn't doing don't down during each few for
+from further get gets getting got had hadn't has hasn't have haven't having he he'd he'll he's her here here's hers herself
+him himself his how how's i i'd i'll i'm i've if in into is isn't it it's its itself just know let's like me more most
+mustn't my myself no nor not now of off on once only or other ought our ours ourselves out over own really right said same
+say says she she'd she'll she's should shouldn't so some such than that that's the their theirs them themselves then there
+there's these they they'd they'll they're they've thing things think this those though through to too um uh under until
+up very want was wasn't we we'd we'll we're we've were weren't what what's when when's where where's which while who who's
+whom why why's will with won't would wouldn't yeah yes you you'd you'll you're you've your yours yourself yourselves okay ok
+kind sort mean going go gonna wanna lot little bit time today week day days mhm hmm well actually maybe probably pretty
+something someone everything anything nothing even still back make made much many feel felt feeling feels guess told tell
+know knew see saw way kinda stuff"""
+                .split())
+
+
+def _norm_word(w):
+    w = w.lower().strip("'")
+    for suf, rep_ in (("ies", "y"), ("ing", ""), ("ed", ""), ("s", "")):
+        if len(w) > 5 and w.endswith(suf):
+            return w[: -len(suf)] + rep_
+    return w
+
+
+def patient_speech(d, counselor_label):
+    """What the patient said in a session (transcript lines not by the counselor), else the note."""
+    lines = d.get("lines") or []
+    roles = d.get("roles") or {}
+    said = [l.get("text", "") for l in lines if roles.get(l.get("speaker"), l.get("speaker")) != counselor_label]
+    return " ".join(said) if said else (d.get("note") or "")
+
+
+def session_themes(client, sessions, counselor_label, top_words=15):
+    """{"columns": [(date, words)], "themes": [(theme, [per-session rate per 1000 words], total)],
+    "words": [(word, [counts per session], sessions_with_it)]} — oldest session first."""
+    hide_names = {p.lower() for name, _ in client_name_map(client) for p in name.split() if len(p) > 1}
+    recs = [(d["meta"].get("session_date") or "", d) for _, d in sorted(sessions, key=lambda x: session_sort_key(x[1]))
+            if d.get("meta", {}).get("kind") != "parent" and (patient_speech(d, counselor_label) or "").strip()]
+    cols, theme_counts, word_counts, surface = [], [], [], {}
+    for day, d in recs:
+        words = re.findall(r"[A-Za-z][A-Za-z'-]+", patient_speech(d, counselor_label))
+        cols.append((day, len(words)))
+        tc, wc = collections.Counter(), collections.Counter()
+        for w in words:
+            lw = w.lower().strip("'")
+            if lw in hide_names:
+                continue
+            if lw in _THEME_OF:
+                tc[_THEME_OF[lw]] += 1
+            if len(lw) < 4 or lw in STOPWORDS or lw.endswith("n't"):
+                continue
+            n = _norm_word(lw)
+            wc[n] += 1
+            surface.setdefault(n, collections.Counter())[lw] += 1
+        theme_counts.append(tc)
+        word_counts.append(wc)
+    themes = []
+    for t in THEME_WORDS:
+        rates = [round(1000 * tc[t] / max(n, 1), 1) for tc, (_, n) in zip(theme_counts, cols)]
+        total = sum(tc[t] for tc in theme_counts)
+        if total:
+            themes.append((t, rates, total))
+    themes.sort(key=lambda x: -x[2])
+    allw = collections.Counter()
+    for wc in word_counts:
+        allw.update(wc)
+    scored = []
+    for w, n in allw.items():
+        present = sum(1 for wc in word_counts if wc[w])
+        if (present >= 2 and n >= 2) or (len(word_counts) == 1 and n >= 3):
+            scored.append((n * (1 + present), w))
+    scored.sort(reverse=True)
+    words = [(surface[w].most_common(1)[0][0], [wc[w] for wc in word_counts],
+              sum(1 for wc in word_counts if wc[w])) for _, w in scored[:top_words]]
+    return {"columns": cols, "themes": themes, "words": words}
+
+
+
+# --------------------------------------------------------------------------- #
+# Follow-ups: what you (or others) agreed to do — from contact notes' "Follow-up:" lists and, with the AI,
+# from what was said in sessions
+# --------------------------------------------------------------------------- #
+FU_VERSION = 1
+FU_SECTION_RE = re.compile(r"(?im)^\s*follow[- ]?ups?\s*:\s*$")
+COMMIT_RE = re.compile(r"\b(i'll|i will|i can|let me|i'm going to|i am going to|we'll|we will|i'd like to|"
+                       r"next (?:time|week|session)|by (?:monday|tuesday|wednesday|thursday|friday|next)|"
+                       r"send (?:you|it|that|over)|e-?mail|call (?:you|the|your|back)|check (?:with|on|in)|"
+                       r"look (?:into|up)|follow up|bring)\b", re.I)
+
+
+def followups_from_note(note):
+    """'- item' lines under a "Follow-up:" heading (contact notes have one), minus "None discussed"."""
+    out = []
+    m = FU_SECTION_RE.search(note or "")
+    if not m:
+        return out
+    for line in (note[m.end():]).splitlines():
+        s_ = line.strip()
+        if not s_:
+            if out:
+                break
+            continue
+        if not s_.startswith(("-", "•", "*")):
+            break
+        item = s_.lstrip("-•* ").strip()
+        if item and not re.match(r"(?i)none( discussed)?\.?$", item):
+            out.append(item)
+    return out
+
+
+def fu_norm(text):
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def followups_sync(client, sessions):
+    """Add follow-ups from contact notes' "Follow-up:" lists that aren't on the checklist yet.
+    Returns True if anything was added (the caller saves the client)."""
+    fus = client.setdefault("followups", [])
+    have = {(x.get("sid"), fu_norm(x["text"])) for x in fus}
+    added = False
+    for sid, d in sessions:
+        for item in followups_from_note(d.get("note", "")):
+            if (sid, fu_norm(item)) not in have:
+                fus.append({"id": uuid.uuid4().hex[:12], "text": item[:240], "sid": sid,
+                            "date": d.get("meta", {}).get("session_date", ""), "source": "contact note",
+                            "done": False, "added": datetime.now().isoformat(timespec="seconds")})
+                have.add((sid, fu_norm(item)))
+                added = True
+    return added
+
+
+FU_PROMPT = """From this counseling session's documentation, list the concrete FOLLOW-UPS that were agreed: \
+things the counselor said they would do (send a handout, call someone, check with the supervisor, look \
+something up, schedule something) and actions the patient or others agreed to that the counselor should check \
+on. Not general treatment plans or homework exercises — only specific commitments. Use only what's written; \
+keep placeholders such as [Patient] exactly.
+
+Reply with JSON only, exactly like:
+{{"items": [{{"who": "counselor" or "patient" or "other", "text": "short action, at most 15 words"}}]}}
+If there are none, reply {{"items": []}}.
+
+Documentation ({label}):
+{text}"""
+
+
+def followup_source(d):
+    """The note plus the transcript lines that sound like a commitment."""
+    parts = [f"[note]\n{d.get('note', '').strip()}"] if (d.get("note") or "").strip() else []
+    lines = [l for l in (d.get("transcript") or "").splitlines() if COMMIT_RE.search(l)]
+    if lines:
+        parts.append("[transcript lines]\n" + "\n".join(lines[:60]))
+    return "\n\n".join(parts)
+
+
+def followups_todo(sessions):
+    out = []
+    for sid, d in sessions:
+        if d.get("meta", {}).get("source") == "imported":
+            continue
+        src = followup_source(d)
+        key = hashlib.sha256(f"{FU_VERSION}\0{src}".encode("utf-8")).hexdigest()[:16]
+        if src and d.get("followups_scanned") != key and COMMIT_RE.search(src) \
+                and not FU_SECTION_RE.search(d.get("note") or ""):          # (those lists are read without the AI)
+            out.append((sid, d, src, key))
+    return out
+
+
+def find_followups(cfg, client, d, src, steps, i):
+    hide = client_hider(client)
+    prompt = FU_PROMPT.replace("{{", "{").replace("}}", "}")
+    prompt = fill(prompt, {"label": session_label(d.get("meta", {})), "text": hide(src)[:9000]})
+    out = []
+    for it in llm_json(steps.run(i, cfg, prompt)).get("items") or []:
+        if isinstance(it, dict) and (it.get("text") or "").strip():
+            who = (it.get("who") or "counselor").strip().lower()
+            prefix = "" if who == "counselor" else ("Patient: " if who == "patient" else "Other: ")
+            out.append(prefix + it["text"].strip()[:200])
+    return out
+
+
+def open_followups(clients):
+    """[(client, item)] across patients, oldest first."""
+    rows = [(c, x) for c in clients for x in c.get("followups") or [] if not x.get("done")]
+    return sorted(rows, key=lambda r: r[1].get("date") or "")
+
+
+
+# --------------------------------------------------------------------------- #
+# Caseload dashboard
+# --------------------------------------------------------------------------- #
+DASH_PLAN_SOON = 7            # plan reviews due within this many days are listed
+DASH_HOMEWORK_DAYS = 7        # homework still "assigned" after this many days, or after a later session
+
+
+def caseload(pairs, today=None):
+    """pairs: [(client, sessions)] (active patients). Returns {category: [row]} — each row has "client",
+    "text", "when", and where to open it ("select")."""
+    today = today or date.today().isoformat()
+    soon = (date.fromisoformat(today) + timedelta(days=DASH_PLAN_SOON)).isoformat()
+    old_hw = (date.fromisoformat(today) - timedelta(days=DASH_HOMEWORK_DAYS)).isoformat()
+    out = {k: [] for k in ("review", "plans", "no_note", "risk", "scores", "followups", "homework", "goals")}
+    for c, sessions in pairs:
+        days = sorted({d["meta"].get("session_date") or "" for _, d in sessions})
+        for sid, d in sessions:
+            m = d.get("meta", {})
+            day = m.get("session_date") or ""
+            if m.get("needs_review"):
+                out["review"].append({"client": c, "text": f"{session_label(m)} — {m.get('review_reason') or 'drafted unattended'}",
+                                      "when": day, "select": f"day:{day}"})
+            if (d.get("transcript") or "").strip() and not (d.get("note") or "").strip() and m.get("source") != "imported":
+                out["no_note"].append({"client": c, "text": f"{session_label(m)} — transcript saved, no note yet",
+                                       "when": day, "select": f"day:{day}"})
+        plan = current_plan(c)
+        due = plan_review_due(plan) if plan else None
+        if due and due.isoformat() <= soon:
+            out["plans"].append({"client": c, "text": ("Treatment plan review overdue since " if due.isoformat() < today
+                                                       else "Treatment plan review due ") + fmt_date(due.isoformat()),
+                                 "when": due.isoformat(), "select": "plan"})
+        elif not plan and len(days) >= 3:
+            out["plans"].append({"client": c, "text": f"No treatment plan yet ({len(days)} sessions)", "when": days[-1],
+                                 "select": "plan"})
+        rs = risk_summary(c, sessions)
+        for r in rs["recent"][:2]:
+            out["risk"].append({"client": c, "text": f"{r['type']}: {r['summary']}", "when": r["date"],
+                                "select": f"day:{r['date']}"})
+        if rs["needs_plan"]:
+            out["risk"].append({"client": c, "text": "Recent risk documented but no safety plan mentioned or on file",
+                                "when": rs["recent"][0]["date"], "select": "insights:risk"})
+        for kind in MEASURES:
+            t = measure_trend(c, kind)
+            if t and t["item9"]:
+                out["risk"].append({"client": c, "text": f"PHQ-9 item 9 answered {t['latest']['items'][8]}",
+                                    "when": t["latest"]["date"], "select": "insights:scores"})
+            if t and t["worse"]:
+                out["scores"].append({"client": c, "text": f"{kind} {t['previous']['total']} → {t['latest']['total']} "
+                                                           f"({measure_band(kind, t['latest']['total'])})",
+                                      "when": t["latest"]["date"], "select": "insights:scores"})
+        for x in c.get("followups") or []:
+            if not x.get("done"):
+                out["followups"].append({"client": c, "text": x["text"], "when": x.get("date") or "", "fid": x["id"],
+                                         "select": "insights:followups"})
+        for x in c.get("homework") or []:
+            if x.get("status") == "assigned" and ((x.get("date") or today) <= old_hw
+                                                   or any(dd > (x.get("date") or "") for dd in days)):
+                out["homework"].append({"client": c, "text": f"Check homework: {x['title']}", "when": x.get("date") or "",
+                                        "select": "insights:homework"})
+        try:
+            for g, n, since in goals_summary(c, sessions)["stale"]:
+                out["goals"].append({"client": c, "text": f"Goal not worked on in {n} sessions: {g}",
+                                     "when": since or "", "select": "insights:goals"})
+        except Exception:
+            pass
+    for k in out:
+        out[k].sort(key=lambda r: r["when"] or "", reverse=k not in ("plans", "followups", "homework"))
+    return out
+
+
+DASH_SECTIONS = [("risk", "Risk to look at", "Bad"), ("review", "Drafts to review", "Warn"),
+                 ("no_note", "Sessions without a note", "Warn"), ("plans", "Treatment plans", "Warn"),
+                 ("scores", "Scores getting worse", "Warn"), ("followups", "Follow-ups to do", "Accent"),
+                 ("homework", "Homework to check", "Accent"), ("goals", "Goals not worked on lately", "Muted")]
 
 
 def generate_case_overview(cfg, client, sessions, orientation, progress):
@@ -4583,7 +8419,63 @@ def install_theme(log):
         raise RuntimeError("pip couldn't install the theme.")
     return "Modern theme installed — restart the app to use it."
 STEPS = ["Recording", "Transcribe", "Check transcript", "Review notes"]
-KIND_LABELS = {"progress": ("Progress note", "Overview"), "intake": ("Intake assessment", "Intake questionnaire")}
+KIND_LABELS = {"progress": ("Progress note", "Overview"), "intake": ("Intake assessment", "Intake questionnaire"),
+               "parent": ("Parent contact note", "Conversation summary")}
+
+
+# Contacts outside sessions (kind "parent" in saved data, for compatibility): with the patient themself,
+# a parent/guardian, or someone else involved in their care (school, another provider…).
+CONTACT_WITH = [("patient", "The patient"), ("parent", "Parent / guardian"),
+                ("other", "Someone else (school, another provider…)")]
+CONTACT_NAMES = {"patient": ("Patient contact note", "Communication summary", "Patient contact"),
+                 "parent": ("Parent contact note", "Conversation summary", "Parent contact"),
+                 "other": ("Collateral contact note", "Conversation summary", "Collateral contact")}
+
+
+def contact_with(meta):
+    """Who an outside-session contact was with; records from before this choice existed were with a parent."""
+    w = (meta or {}).get("contact_with")
+    return w if w in CONTACT_NAMES else "parent"
+
+
+def contact_party(w, who=""):
+    """How the note refers to the other side of the contact."""
+    who = (who or "").strip()
+    if w == "patient":
+        return "the patient"
+    if w == "other":
+        return f"the patient's {who}" if who else "a collateral contact involved in the patient's care"
+    return "the patient's parent or guardian"
+
+
+def contact_values(w, who="", method=""):
+    """Template values for a contact note (see DEFAULT_PARENT_NOTE_TEMPLATE)."""
+    party = contact_party(w, who)
+    if w == "patient":
+        ref = 'Refer to the patient as "patient".'
+        rules = ("This is the patient's own communication with the Counselor between sessions: summarize any "
+                 "clinical content briefly and factually; if it was only scheduling or logistics, say so in one "
+                 "sentence.")
+        follow = "confirm or reschedule an appointment, send resources, check in, bring a topic to the next session"
+    elif w == "other":
+        ref = ("Refer to the other person by their role in the patient's life (for example \"patient's teacher\", "
+               "\"patient's psychiatrist\"), never by name." + (f" Their role: patient's {who.strip()}." if who.strip() else ""))
+        rules = ("Note whether a release of information covers this contact if the source says so; do not include "
+                 "the patient's confidential disclosures unless the source shows they were shared.")
+        follow = "send records once a release is signed, coordinate services, call back, schedule a meeting"
+    else:
+        ref = ('Use the parent\'s relationship to the patient (for example "patient\'s mother", "patient\'s father", '
+               '"patient\'s guardian"); if it isn\'t clear, write "patient\'s parent/guardian".')
+        rules = "Do not include the patient's confidential disclosures unless the source shows they were shared."
+        follow = "call back, send resources, schedule a family session, coordinate with the school"
+    return {"contact_party": party, "contact_ref": ref, "contact_rules": rules, "contact_followups": follow}
+
+
+def doc_labels(meta):
+    """(first document's label, second document's label) for a saved record."""
+    if (meta or {}).get("kind") == "parent":
+        return CONTACT_NAMES[contact_with(meta)][:2]
+    return KIND_LABELS.get((meta or {}).get("kind"), KIND_LABELS["progress"])
 
 
 def run_gui():
@@ -5711,15 +9603,38 @@ def run_gui():
             self.view_select = None
             root.after(10_000, self.sync_check)
             root.after(4_000, self.remote_tick)
+            self.phone_init()
+            self.queue_restore()
+            root.after(3_000, self.queue_persist_tick)
+            _SleepWatch.start()
+            threading.Thread(target=checkpoint_tidy, daemon=True).start()
 
         # ------------------------------------------------- multi-computer sync
         def sync_check(self):
             """Every 10 s: if files changed underneath us (synced from the other computer
             by Google Drive), refresh what's on screen. Never interrupts a session in
-            progress or an open dialog."""
+            progress or an open dialog. The folder is scanned in the background, so a slow
+            Google Drive never makes the window stutter."""
+            box = {}
+
+            def scan():
+                try:
+                    box["sig"] = vault.signature()
+                except Exception:                  # noqa: BLE001 — try again next time
+                    box["sig"] = None
+
+            threading.Thread(target=scan, daemon=True).start()
+
+            def wait(n=0):
+                if "sig" not in box and n < 400:
+                    root.after(25, wait, n + 1)
+                    return
+                self._sync_apply(box.get("sig"))
+            wait()
+
+        def _sync_apply(self, sig):
             try:
-                sig = vault.signature()
-                if sig != self._sig and not self.locked:
+                if sig is not None and sig != self._sig and not self.locked:
                     # only hold off while a modal dialog has the focus; the queue and Settings
                     # windows can stay open (the queue is often open while waiting for results)
                     dialog_open = bool(str(root.tk.call("grab", "current")))   # (a message box counts too)
@@ -5810,6 +9725,7 @@ def run_gui():
             hdr_btns.pack(side="right", fill="x", expand=True)
             self.queue_btn = hdr_btns.add(ttk.Button(hdr_btns, text="🎙  Queue recordings",
                                                      command=lambda: self.open_queue(self.client_id)))
+            hdr_btns.add(ttk.Button(hdr_btns, text="📋  Supervision prep", command=self.supervision_prep))
             hdr_btns.add(ttk.Button(hdr_btns, text="⚙  Settings", command=self.open_setup))
             hdr_btns.add(ttk.Button(hdr_btns, text="🔒  Lock", command=self.lock))
 
@@ -5826,6 +9742,7 @@ def run_gui():
             self.pct_label = ttk.Label(bottom, text="", width=22, anchor="e", style="BarMuted.TLabel")
             self.task_chip = ttk.Label(bottom, text="", style="ChipAccent.TLabel")   # whose task is running
             self.wait_btn = ttk.Menubutton(bottom, text="", style="Toolbutton")       # tasks waiting in line
+            self.pause_btn = ttk.Button(bottom, text="⏸  Pause", style="Toolbutton", command=self.toggle_pause)
             self.wait_menu = tk.Menu(self.wait_btn, tearoff=False)
             self.wait_btn.config(menu=self.wait_menu)
             self.pct_label.pack(side="right", padx=(0, px(10)))
@@ -5929,11 +9846,15 @@ def run_gui():
                 pct = self._last_pct                       # never move backwards
             self._last_pct = pct
             text = f"{pct:.0f}%"
-            if self._task_start and 3 <= pct < 99:
+            live = getattr(self, "_eta_live", None)
+            if live and time.time() - live[1] < 30 and pct < 99.5:
+                # from this computer's learned speed for each step (see timing.json)
+                text += " · " + fmt_left(live[0] - (time.time() - live[1]))
+            elif self._task_start and 3 <= pct < 99:
                 elapsed = time.time() - self._task_start
                 left = elapsed * (100 - pct) / pct
                 if elapsed > 8:
-                    text += (f" · ~{left / 60:.0f} min left" if left >= 90 else f" · ~{max(5, round(left / 5) * 5):.0f} s left")
+                    text += " · " + fmt_left(left)
             for bar in (self.busy_bar, self.page_bar if self.page_owns_task() else None):
                 if self._alive(bar):
                     if str(bar.cget("mode")) != "determinate":
@@ -5992,6 +9913,7 @@ def run_gui():
                 self.busy_bar.start(12)
                 self.pct_label.config(text="")
             else:
+                self._eta_live = None
                 self.busy_bar.stop()
                 self.busy_bar.pack_forget()
                 self.task_chip.pack_forget()
@@ -6000,19 +9922,20 @@ def run_gui():
                 self.pct_label.config(text="")
                 self._task_start = None
 
-        def run_bg(self, fn, on_done, on_error=None, label="", quiet=False, owner=None, patient="", on_start=None):
+        def run_bg(self, fn, on_done, on_error=None, label="", quiet=False, owner=None, patient="", on_start=None,
+                   pausable=False):
             """Run fn in the background. If something is already running, a task you started waits in
             line and starts by itself when the one before it finishes (returns "queued"). Automatic
             work (quiet=True: the recording queue, Settings steps) never waits in line — it returns
             False and tries again shortly, letting tasks you asked for go first."""
-            if self.busy or (quiet and self.waitlist):
+            if self.busy or (quiet and (self.waitlist or self.paused_task)):
                 if quiet:
                     return False
                 if owner is not None and any(j["owner"] == owner for j in self.waitlist):
                     self.set_status(f"That's already waiting in line ({label}).")
                     return "queued"
                 self.waitlist.append({"fn": fn, "on_done": on_done, "on_error": on_error, "label": label,
-                                      "owner": owner, "patient": patient, "on_start": on_start})
+                                      "owner": owner, "patient": patient, "on_start": on_start, "pausable": pausable})
                 n = len(self.waitlist)
                 self.set_status(f"Waiting in line: {label} — starts by itself after "
                                 f"{self.task_label or 'the current task'}" + (f" (and {n - 1} before it)" if n > 1 else "")
@@ -6025,9 +9948,9 @@ def run_gui():
                         self.page_bar.stop()
                         _quiet(self._page_row.pack_forget)
                 return "queued"
-            return self._start_bg(fn, on_done, on_error, label, owner, patient, on_start)
+            return self._start_bg(fn, on_done, on_error, label, owner, patient, on_start, pausable)
 
-        def _start_bg(self, fn, on_done, on_error, label, owner, patient, on_start=None):
+        def _start_bg(self, fn, on_done, on_error, label, owner, patient, on_start=None, pausable=False, memo=None):
             self.task_owner = owner
             self.task_patient = patient
             # the chip says "DS-01 · transcribing"; task_label keeps the full wording for messages
@@ -6035,13 +9958,18 @@ def run_gui():
             self.set_busy(True)
             self.task_label = label
             token = self.task_token = CancelToken()
+            memo = {} if memo is None else memo                 # finished AI steps, kept across a pause
+            self.task_job = {"fn": fn, "on_done": on_done, "on_error": on_error, "label": label, "owner": owner,
+                             "patient": patient, "on_start": on_start, "pausable": pausable, "memo": memo}
 
             def progress(t, pct=None):
                 token.check()                      # a cancelled task stops at its next step
-                self.msgs.put(("status", t, pct, token))
+                self.msgs.put(("status", t, pct, getattr(_TASK, "eta", None), token))
 
             def target():
                 _TASK.token = token
+                _TASK.eta = None
+                _TASK.memo = memo if pausable else None
                 try:
                     res = fn(progress)
                 except Exception as e:
@@ -6052,13 +9980,119 @@ def run_gui():
                         self.msgs.put(("done", on_done, res, token))
                 finally:
                     _TASK.token = None
+                    _TASK.memo = None
+                    _TASK.eta = None
             threading.Thread(target=target, daemon=True).start()
             if self._alive(self.progress_label) and self.page_owns_task():
                 self.progress_label.config(text=label[:1].upper() + label[1:] + "…")
             if on_start is not None:
                 _quiet(on_start)
             self.refresh_waiting()
+            self.refresh_pause()
             return True
+
+        # ---------------------------------------------- pause / resume
+        paused_task = None
+
+        def can_pause(self):
+            """Something is running that can be paused: the transcription process (frozen in place) or
+            note writing (stopped after its finished steps, which are kept)."""
+            tok, job = getattr(self, "task_token", None), getattr(self, "task_job", None) or {}
+            return bool(self.busy and not self.paused_task and tok is not None and not tok.is_set()
+                        and (tok.can_freeze() or job.get("pausable")))
+
+        def pause_task(self, auto=False, why=""):
+            """Pause the running task and free the app for something else. auto=True: resume it by itself
+            as soon as nothing else is running (used to answer a patient-AI question first)."""
+            if not self.can_pause():
+                return False
+            tok, job = self.task_token, dict(self.task_job)
+            if tok.can_freeze():
+                tok.pause()                                   # the worker process stops exactly where it is
+                mode = "freeze"
+            else:
+                tok.cancel()                                  # LM Studio stops; finished steps are in job["memo"]
+                mode = "restart"
+            self.paused_task = dict(job, token=tok, mode=mode, auto=auto, inbox=[], since=time.time())
+            for it in self._q()["items"]:                     # a handed-over recording: tell the sender
+                if it.get("_pub") is not None and it["status"] in ("transcribing", "writing"):
+                    it["_pub"].update(f"Paused on {platform.node() or 'the other computer'}", None)
+            self.task_token = None
+            self.set_busy(False)
+            what = job["label"] or "the current task"
+            self.set_status((why or f"Paused: {what}.") + ("" if auto else "  Click ▶ Resume to carry on."))
+            if self._alive(getattr(self, "progress_label", None)) and job["owner"] == getattr(self, "_page_owner", None):
+                self.progress_label.config(text="Paused" + (" — it carries on by itself after that." if auto
+                                                             else " — click ▶ Resume (bottom right) to carry on."))
+            self.refresh_pause()
+            self.queue_refresh()
+            return True
+
+        def resume_task(self):
+            pt = self.paused_task
+            if not pt:
+                return False
+            if self.busy:                                     # something else is running: resume right after it
+                pt["auto"] = True
+                self.set_status(f"{pt['label']} carries on as soon as {self.task_label or 'the current task'} finishes.")
+                self.refresh_pause()
+                return False
+            self.paused_task = None
+            if pt["mode"] == "freeze":
+                tok = pt["token"]
+                if tok.is_set():
+                    self.refresh_pause()
+                    return False
+                self.task_owner, self.task_patient = pt["owner"], pt["patient"]
+                self.task_label = re.sub(r"\s+((for|about)\s+)?" + re.escape(pt["patient"]) + r"$", "",
+                                         pt["label"]) if pt["patient"] else pt["label"]
+                self.set_busy(True)
+                self.task_label = pt["label"]
+                self.task_token = tok
+                self.task_job = {k: pt[k] for k in ("fn", "on_done", "on_error", "label", "owner", "patient",
+                                                    "on_start", "pausable", "memo")}
+                tok.resume()                                  # carries on from the same spot
+                for m in pt["inbox"]:                         # anything it finished in the instant it was paused
+                    self.msgs.put(m)
+            else:
+                self._start_bg(pt["fn"], pt["on_done"], pt["on_error"], pt["label"], pt["owner"], pt["patient"],
+                               None, pt["pausable"], pt["memo"])
+            self.set_status(f"Resumed: {pt['label']}.")
+            if self._alive(getattr(self, "progress_label", None)) and pt["owner"] == getattr(self, "_page_owner", None):
+                self.progress_label.config(text=pt["label"][:1].upper() + pt["label"][1:] + "…")
+            self.refresh_pause()
+            self.queue_refresh()
+            return True
+
+        def toggle_pause(self):
+            if self.paused_task:
+                self.resume_task()
+            elif not self.pause_task():
+                self.set_status("This step can't be paused — it'll finish shortly, or use Stop.")
+
+        def refresh_pause(self):
+            """The ⏸ Pause / ▶ Resume button in the bottom bar (and in the queue window)."""
+            btn = getattr(self, "pause_btn", None)
+            pt = self.paused_task
+            show = bool(pt) or self.can_pause()
+            text = ("▶  Resume" + (f" {pt['patient']}" if pt and pt.get("patient") else "")) if pt else "⏸  Pause"
+            if self._alive(btn):
+                if show:
+                    btn.config(text=text)
+                    if not btn.winfo_ismapped():
+                        btn.pack(side="right", padx=(px(6), 0), after=self.pct_label)
+                else:
+                    btn.pack_forget()
+            qw = getattr(self, "queue_win", None)
+            if qw and self._alive(qw["win"]) and qw.get("pause_btn"):
+                qb = qw["pause_btn"]
+                mine = (pt and pt["owner"] == ("queue",)) or (self.can_pause() and self.task_owner == ("queue",))
+                if mine:
+                    qb.config(text=text)
+                    if not qb.winfo_ismapped():
+                        qb.pack(side="right", padx=px(8))
+                else:
+                    qb.pack_forget()
 
         # ---------------------------------------------- tasks waiting in line
         def waiting_text(self, owner):
@@ -6070,12 +10104,22 @@ def run_gui():
             return None
 
         def pump_waitlist(self):
-            """Start the next task in line once nothing is running."""
-            if self.busy or not self.waitlist:
+            """Start the next task in line once nothing is running. Patient-AI questions go first; then a
+            task that was paused for one carries on; then the rest of the line."""
+            self.refresh_pause()
+            if self.busy:
                 self.refresh_waiting()
                 return
-            j = self.waitlist.pop(0)
-            self._start_bg(j["fn"], j["on_done"], j["on_error"], j["label"], j["owner"], j["patient"], j["on_start"])
+            ask = next((i for i, j in enumerate(self.waitlist) if j["owner"] and j["owner"][0] == "ask"), None)
+            if ask is None and self.paused_task and self.paused_task.get("auto"):
+                self.resume_task()
+                return
+            if not self.waitlist:
+                self.refresh_waiting()
+                return
+            j = self.waitlist.pop(ask or 0)
+            self._start_bg(j["fn"], j["on_done"], j["on_error"], j["label"], j["owner"], j["patient"], j["on_start"],
+                           j.get("pausable", False))
 
         def drop_waiting(self, owner=None, index=None, tell=False):
             """Take tasks out of the line (they never started, so nothing needs stopping)."""
@@ -6115,6 +10159,15 @@ def run_gui():
             process is killed / LM Studio is disconnected, nothing it was doing gets saved, and
             the app is free for the next task straight away."""
             dropped = self.drop_waiting(owner) if owner is not None else 0
+            pt = self.paused_task
+            if pt and (owner is None or pt["owner"] == owner):
+                pt["token"].cancel()                          # kills a frozen worker process too
+                self.paused_task = None
+                self.refresh_pause()
+                if not self.busy or owner is not None:
+                    self.set_status(why)
+                    root.after(300, self.pump_waitlist)
+                    return True
             token = getattr(self, "task_token", None)
             if not self.busy or token is None or (owner is not None and self.task_owner != owner):
                 if dropped:
@@ -6161,10 +10214,20 @@ def run_gui():
 
         def _handle_msg(self, m):
             kind = m[0]
+            pt = self.paused_task
+            if kind in ("done", "error") and len(m) > 3 and pt and m[-1] is pt.get("token"):
+                pt["inbox"].append(m)              # finished in the instant it was paused: deliver on resume
+                return
             if kind in ("status", "done", "error") and len(m) > 3 and m[-1] is not getattr(self, "task_token", None):
-                return                             # from a task that was cancelled: ignore
+                return                             # from a task that was cancelled (or is paused): ignore
             if kind == "status":
+                self._eta_live = (m[3], time.time()) if len(m) == 5 and m[3] is not None else None
                 self.set_status(m[1], m[2] if len(m) > 2 else None, from_task=True)
+                qw = getattr(self, "queue_win", None)          # the running queue row moves with the bar
+                if self.task_owner == ("queue",) and qw and self._alive(qw["win"]) and qw.get("rows") \
+                        and time.time() - getattr(self, "_qrow_at", 0) > 0.4:
+                    self._qrow_at = time.time()
+                    qw["rows"]()
             elif kind == "done":
                 self.set_busy(False)
                 try:
@@ -6443,6 +10506,8 @@ def run_gui():
             self.client_lb.selection_clear(0, "end")
 
             def build(f):
+                if any(not c.get("archived") for c in self.clients):
+                    return self._dashboard(f)            # patients already: the caseload dashboard
                 hour = datetime.now().hour
                 greet = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
                 ttk.Label(f, text=greet, style="Hero.TLabel").pack(anchor="w")
@@ -6573,6 +10638,8 @@ def run_gui():
                 self.refresh_clients()
                 return self.show_home()
             sessions = vault.sessions_for(cid)          # oldest first
+            if followups_sync(client, sessions):        # contact notes' "Follow-up:" lists → the checklist
+                _quiet(vault.save_client, client)
             self._sig = vault.signature()              # what's on screen is current
             self.show(lambda f: self._client_page(f, client, sessions, select))
 
@@ -6595,7 +10662,13 @@ def run_gui():
             pbtns.pack(side="right", fill="x", expand=True, anchor="n", padx=(px(16), 0))
             pbtns.add(ttk.Button(pbtns, text="＋  New session", style="Accent.TButton",
                                  command=lambda: self.start_wizard(client)))
+            pbtns.add(ttk.Button(pbtns, text="📝  Prep for next session", command=lambda: self.prep_brief(client)))
+            pbtns.add(ttk.Button(pbtns, text="✉  Letter…", command=lambda: self.letter_dialog(client)))
+            pbtns.add(ttk.Button(pbtns, text="＋  External communication…", command=lambda: self.external_comm(client)))
             pbtns.add(ttk.Button(pbtns, text="Import past notes…", command=lambda: self.import_dialog(client)))
+            nfiles = len(client.get("files") or [])
+            pbtns.add(ttk.Button(pbtns, text=f"📎  Files ({nfiles})" if nfiles else "📎  Files",
+                                 command=lambda: self.patient_files(client)))
             pbtns.add(ttk.Button(pbtns, text="⤓  Export…", command=lambda: self.export_all(client)))
             pbtns.add(ttk.Button(pbtns, text="Edit patient", command=lambda: self.edit_client(client)))
             more = ttk.Menubutton(pbtns, text="More")
@@ -6613,6 +10686,11 @@ def run_gui():
             more["menu"] = menu
             pbtns.add(more)
 
+            regs = [x for x in (client.get("files") or []) if x.get("kind") == "registration"]
+            if regs:
+                ttk.Label(f, text=f"📎  Registration form on file  ·  {regs[-1]['name']}  ·  added "
+                                  f"{fmt_date(regs[-1]['added'][:10])}", style="Caption.TLabel").pack(anchor="w",
+                                                                                                pady=(px(8), 0))
             if client.get("goals"):
                 ttk.Label(f, text="Goals  ·  " + "  ·  ".join(l.strip() for l in client["goals"].splitlines() if l.strip()),
                           style="Caption.TLabel", wraplength=px(860), justify="left").pack(anchor="w", pady=(px(8), 0))
@@ -6721,6 +10799,9 @@ def run_gui():
                 items.append(("ask", None))
                 n_chats = len(client.get("chats") or [])
                 lb.insert("end", "💬  Ask AI about this patient" + (f"  · {n_chats}" if n_chats else ""))
+                items.append(("insights", None))
+                flags = self.insight_flags(client, sessions)
+                lb.insert("end", "📈  Progress & risk" + (f"  · {flags}" if flags else ""))
                 for day, records in (reversed(days) if newest_first() else days):
                     items.append(("day", day))
                     n_docs = len(day_docs(records))
@@ -6749,9 +10830,11 @@ def run_gui():
                         self._render_day(viewer, client, val["day"], dict(days)[val["day"]],
                                          focus=(val["sid"], val["key"]), query=q)
                     return
-                self.view_select = kind if kind in ("case", "plan", "ask") else f"day:{val}"
+                self.view_select = kind if kind in ("case", "plan", "ask", "insights") else f"day:{val}"
                 if kind == "ask":
                     self._render_ask(viewer, client, sessions)
+                elif kind == "insights":
+                    self._render_insights(viewer, client, sessions)
                 elif kind == "plan":
                     self._render_plan(viewer, client, sessions)
                 elif kind == "case":
@@ -6824,6 +10907,10 @@ def run_gui():
                 idx = 1
             elif select == "ask" or (isinstance(select, str) and select.startswith("ask:")):
                 idx = 2
+            elif select == "insights" or (isinstance(select, str) and select.startswith("insights:")):
+                if isinstance(select, str) and select.startswith("insights:"):
+                    self._insight_tab = select[9:]
+                idx = 3
             elif select == "case" or (select is None and client.get("case_overview")):
                 idx = 0
             elif select:
@@ -6960,7 +11047,10 @@ def run_gui():
             self._sig = vault.signature()
             self._ask_open(client, None)
 
-        def _ask_send(self, client, chat_id, question):
+        def _ask_send(self, client, chat_id, question, hooks=None):
+            """Answer a question about a patient. hooks (from the phone): text(partial), waiting(msg),
+            done(answer, chat_id), failed(msg) — called alongside what the window shows."""
+            hooks = hooks or {}
             code = client.get("code", "")
             c = vault.load_client(client["id"])
             sessions = vault.sessions_for(client["id"])
@@ -6980,6 +11070,8 @@ def run_gui():
                     self.__dict__.get("_ask_chat", {}).get(client["id"]) == chat_id
 
             def on_text(txt):
+                if hooks.get("text"):
+                    _quiet(hooks["text"], txt)
                 now = time.time()
                 if now - live["at"] < 0.15:
                     return
@@ -7009,13 +11101,24 @@ def run_gui():
                 if was_here and self.client_id == client["id"] and not self.wizard:
                     self.open_client(client["id"], select="ask")
                 self.set_status(f"{code}: answer saved to “{ch['title'][:40]}”.")
+                if hooks.get("done"):
+                    hooks["done"](answer, ch["id"])
 
             def failed(msg):
+                if hooks.get("failed"):
+                    hooks["failed"](msg)
                 if view_ok():
                     self._ask_view["show"]((question, "⚠ " + msg))
+            # A question comes first: pause what's running (it carries on by itself after the answer)
+            if self.busy and self.task_owner != ("ask", client["id"]) and self.can_pause():
+                what = self.task_label or "the current task"
+                self.pause_task(auto=True, why=f"Paused {what} to answer your question about {code} first — "
+                                               "it carries on by itself after the answer.")
             started = self.run_bg(job, done, failed, label=f"answering a question about {code}",
                                   owner=("ask", client["id"]), patient=code,
                                   on_start=lambda: view_ok() and self._ask_view["show"]((question, "")))
+            if started == "queued" and hooks.get("waiting"):
+                hooks["waiting"](self.waiting_text(("ask", client["id"])) or "Waiting in line on the computer…")
             if started == "queued" and view_ok():
                 self._ask_view["show"]((question, "", self.waiting_text(("ask", client["id"]))))
 
@@ -7224,7 +11327,7 @@ def run_gui():
             if self.run_bg(lambda p: generate_treatment_plan(job_cfg, client, sessions, orient, review_days,
                                                              instructions, p), done,
                            label=f"writing the treatment plan for {code}", owner=("plan", client["id"]),
-                           patient=code):
+                           patient=code, pausable=True):
                 self.open_client(client["id"], select="plan")
 
         def _render_day(self, v, client, day, records, focus=None, query=None):
@@ -7255,19 +11358,22 @@ def run_gui():
             nb = ttk.Notebook(v)
             nb.pack(fill="both", expand=True, pady=(6, 0))
             v._tabs = {}
-            for label, key, sid, d in day_docs(records):
-                tab = ttk.Frame(nb, padding=(0, 6, 0, 0))
-                nb.add(tab, text=f"  {label}  ")
+            pending = {}                       # tab -> builder: a tab's contents are made when it's first shown
+
+            def build_tab(tab, label, key, sid, d):
                 bar = Flow(tab)
                 bar.pack(fill="x")
                 bar.add(ttk.Button(bar, text=f"Copy {label.split(' (')[0].lower()}", style="Accent.TButton",
-                                   command=lambda d=d, key=key, label=label: self.copy(d.get(key, ""), label)))
-                bar.add(ttk.Button(bar, text="Edit", command=lambda sid=sid, d=d: self.start_wizard(client, sid, d)))
+                                   command=lambda: self.copy(d.get(key, ""), label)))
+                bar.add(ttk.Button(bar, text="Edit", command=lambda: self.start_wizard(client, sid, d)))
+                if key != "transcript" and (d.get(key) or "").strip():
+                    bar.add(ttk.Button(bar, text="✎  Revise with AI…",
+                                       command=lambda: self.revise_dialog(client, sid, key, label, day)))
                 if key == "note":
-                    bar.add(self.note_copy_menu(bar, lambda d=d: d.get("note", "")))
+                    bar.add(self.note_copy_menu(bar, lambda: d.get("note", "")))
                 if len(records) > 1:
                     bar.add(ttk.Button(bar, text="Move to another date…",
-                                       command=lambda sid=sid, d=d: self.redate(client, [(sid, d)], day)))
+                                       command=lambda: self.redate(client, [(sid, d)], day)))
                 if key == "note" and d.get("context_used"):
                     ttk.Label(tab, text="Built on: " + ", ".join(d["context_used"]),
                               style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(4, 0))
@@ -7275,13 +11381,42 @@ def run_gui():
                 fr.pack(fill="both", expand=True, pady=(6, 0))
                 set_text(t, d.get(key, ""))
                 bar.add(find_button(bar, t))
-                bar.add(ttk.Button(bar, text="Delete…", command=lambda sid=sid, d=d: self.delete_session(client, sid, d)))
+                bar.add(ttk.Button(bar, text="Delete…", command=lambda: self.delete_session(client, sid, d)))
                 v._tabs[(sid, key)] = (tab, t)
+                return t
+
+            def ensure(tab):
+                b = pending.pop(str(tab), None)
+                return b() if b else None
+
+            first = None
+            for label, key, sid, d in day_docs(records):
+                tab = ttk.Frame(nb, padding=(0, 6, 0, 0))
+                nb.add(tab, text=f"  {label}  ")
+                pending[str(tab)] = (lambda tab=tab, label=label, key=key, sid=sid, d=d:
+                                     build_tab(tab, label, key, sid, d))
+                v._tabs[(sid, key)] = (tab, None)
+                first = first or tab
+            reviewable = [(rsid, rd) for rsid, rd in records if (rd.get("transcript") or "").strip()
+                          and rd["meta"].get("source") not in ("imported", "messages")]
+            for n_, (rsid, rd) in enumerate(reviewable, 1):     # your own review of the session (not the chart)
+                tab = ttk.Frame(nb, padding=(0, 6, 0, 0))
+                nb.add(tab, text="  Session review" + (f" ({n_})" if len(reviewable) > 1 else "") + "  ")
+                pending[str(tab)] = (lambda tab=tab, rsid=rsid, rd=rd:
+                                     self._build_review(tab, client, rsid, rd, day))
+                v._tabs[(rsid, "review")] = (tab, None)
+            if focus is None and getattr(self, "_focus_next", None) in v._tabs:
+                focus, self._focus_next = self._focus_next, None
+            nb.bind("<<NotebookTabChanged>>", lambda _e: ensure(nb.nametowidget(nb.select())) if nb.select() else None)
             if focus in v._tabs:
-                tab, t = v._tabs[focus]
+                tab = v._tabs[focus][0]
+                ensure(tab)
                 nb.select(tab)
-                if query:
+                t = v._tabs[focus][1]
+                if query and t is not None:
                     t.finder.show(query, focus=False)
+            elif first is not None:
+                ensure(first)
 
         def appointment_check(self, client):
             """Compare the library with TheraNest's appointment history report: which dates were real
@@ -7585,6 +11720,385 @@ def run_gui():
             self._redate_win = win
             win._apply, win._d, win._n = apply, d_var, n_var
 
+        def external_comm(self, client):
+            """Record a contact outside a session — with the patient themself (e.g. an adult client's texts or
+            emails), their parent/guardian, or someone else involved in their care: texts or emails (pasted or
+            from files), drafted straight into a contact note; or a phone-call recording, processed in the queue."""
+            cid, code = client["id"], client.get("code", "")
+            win = new_window(root, f"{code} — external communication", "880x780")
+            f = ttk.Frame(win, padding=(px(24), px(18)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=f"{code} — external communication", style="Title.TLabel").pack(anchor="w")
+            with_names = dict(CONTACT_WITH)
+            with_keys = {v: k for k, v in CONTACT_WITH}
+            last = client.get("external_with") if client.get("external_with") in with_names else "patient"
+            with_var = tk.StringVar(value=with_names[last])
+            who_var = tk.StringVar(value=client.get("external_who", "") if last == "other" else "")
+            wrow = Flow(f, gap=px(8))
+            wrow.pack(fill="x", pady=(px(8), 0))
+            wrow.add(ttk.Label(wrow, text="With", style="Strong.TLabel"))
+            wrow.add(ttk.Combobox(wrow, textvariable=with_var, values=[n for _, n in CONTACT_WITH], state="readonly",
+                                  width=34), gap=px(4))
+            who_lbl = wrow.add(ttk.Label(wrow, text="Their role (e.g. teacher)"), gap=px(18))
+            who_en = wrow.add(ttk.Entry(wrow, textvariable=who_var, width=22), gap=px(4))
+            mode_var = tk.StringVar(value="messages")
+            top = Flow(f, gap=px(14))
+            top.pack(fill="x", pady=(px(8), px(4)))
+            top.add(ttk.Radiobutton(top, text="Texts or emails", value="messages", variable=mode_var))
+            top.add(ttk.Radiobutton(top, text="Phone call recording", value="call", variable=mode_var))
+
+            def contact_choice():
+                w_ = with_keys.get(with_var.get(), "patient")
+                return w_, (who_var.get().strip()[:60] if w_ == "other" else "")
+
+            def with_changed(*_):
+                wrow.show(who_lbl, contact_choice()[0] == "other")
+                wrow.show(who_en, contact_choice()[0] == "other")
+            with_var.trace_add("write", with_changed)
+            with_changed()
+
+            def remember_choice():                  # next time, this patient's dialog starts with the same choice
+                w_, who_ = contact_choice()
+                if client.get("external_with") != w_ or client.get("external_who", "") != who_:
+                    try:
+                        c_ = vault.load_client(cid)
+                        c_["external_with"], c_["external_who"] = w_, who_
+                        vault.save_client(c_)
+                        client["external_with"], client["external_who"] = w_, who_
+                    except Exception:
+                        pass
+            row = Flow(f, gap=px(8))
+            row.pack(fill="x", pady=(px(6), px(6)))
+            date_var = tk.StringVar(value=date.today().isoformat())
+            row.add(ttk.Label(row, text="Date"))
+            row.add(date_field(row, date_var), gap=px(4))
+            method_var = tk.StringVar(value="Text messages")
+            m_lbl = row.add(ttk.Label(row, text="Type"), gap=px(18))
+            m_cb = row.add(ttk.Combobox(row, textvariable=method_var, values=["Text messages", "Email"],
+                                        state="readonly", width=16), gap=px(4))
+
+            msg_fr = ttk.Frame(f)
+            ttk.Label(msg_fr, text="Paste the messages (oldest first), or load them from files:",
+                      style="H2.TLabel").pack(anchor="w")
+            mfr, msgs = scrolled_text(msg_fr, height=12)
+            mfr.pack(fill="both", expand=True, pady=(px(4), px(4)))
+
+            def load_files():
+                paths = filedialog.askopenfilenames(parent=win, title="Messages to add", filetypes=[
+                    ("Messages", "*.txt *.eml *.docx *.pdf *.md"), ("All files", "*.*")])
+                for pth in paths or ():
+                    try:
+                        txt = read_messages_file(pth)
+                    except Exception as e:
+                        messagebox.showerror(APP_NAME, f"Couldn't read {os.path.basename(pth)}: {friendly_error(e)}",
+                                             parent=win)
+                        continue
+                    cur = get_text(msgs).strip()
+                    set_text(msgs, (cur + "\n\n" if cur else "") + txt.strip())
+                    if pth.lower().endswith(".eml"):
+                        method_var.set("Email")
+            ttk.Button(msg_fr, text="Load from files…", command=load_files).pack(anchor="w")
+
+            call_fr = ttk.Frame(f)
+            ttk.Label(call_fr, text="The phone-call recording:", style="H2.TLabel").pack(anchor="w")
+            audio_var = tk.StringVar()
+            arow = ttk.Frame(call_fr)
+            arow.pack(fill="x", pady=(px(4), 0))
+            ttk.Entry(arow, textvariable=audio_var).pack(side="left", fill="x", expand=True)
+
+            def pick_audio():
+                pth = filedialog.askopenfilename(parent=win, title="Phone-call recording", filetypes=[
+                    ("Audio", "*.m4a *.mp3 *.wav *.aac *.ogg *.flac *.wma *.mp4 *.mov *.3gp *.amr"), ("All files", "*.*")])
+                if pth:
+                    audio_var.set(pth)
+            ttk.Button(arow, text="Choose…", command=pick_audio).pack(side="left", padx=(px(8), 0))
+            ttk.Label(call_fr, text="It's added to the recording queue as a contact (phone call) and started — "
+                                    "transcribed and written like any recording, then saved as a draft to review.",
+                      style="Muted.TLabel", wraplength=px(800), justify="left").pack(anchor="w", pady=(px(6), 0))
+
+            obs_lbl = ttk.Label(f, text="Anything else to note? (optional)", style="H2.TLabel")
+            ofr, obs = scrolled_text(f, height=3)
+            hint = ttk.Label(f, text=f"Before the AI sees anything, names on {code}'s “names to hide” list are replaced "
+                                     "and email addresses, phone numbers and links are removed. If the other person's "
+                                     "name (a parent, a teacher…) isn't on that list yet, add it under Edit patient first.",
+                             style="Muted.TLabel", wraplength=px(820), justify="left")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            status = ttk.Label(btns, text="", style="Muted.TLabel")
+            status.pack(side="left")
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            go = ttk.Button(btns, text="Write the note", style="Accent.TButton")
+            go.pack(side="right", padx=px(8))
+            hint.pack(side="bottom", anchor="w", pady=(px(8), 0))      # bottom-up: hint, notes box, its heading
+            ofr.pack(side="bottom", fill="x", pady=(px(4), 0))
+            obs_lbl.pack(side="bottom", anchor="w", pady=(px(8), 0))
+
+            def mode_changed(*_):
+                msgs_mode = mode_var.get() == "messages"
+                (call_fr.pack_forget if msgs_mode else msg_fr.pack_forget)()
+                (msg_fr if msgs_mode else call_fr).pack(fill="both", expand=msgs_mode, pady=(px(4), 0))
+                row.show(m_lbl, msgs_mode)
+                row.show(m_cb, msgs_mode)
+                go.config(text="Write the note" if msgs_mode else "Add to queue and start")
+            mode_var.trace_add("write", mode_changed)
+            mode_changed()
+
+            def go_call():
+                pth, day = audio_var.get().strip(), date_var.get().strip()
+                if not pth or not os.path.isfile(pth):
+                    return status.config(text="Choose the phone-call recording first.")
+                if not day:
+                    return status.config(text="Enter the date of the call.")
+                Q = self._q()
+                Q["seq"] += 1
+                w_, who_ = contact_choice()
+                remember_choice()
+                Q["items"].append({"seq": Q["seq"], "path": pth, "audio_name": os.path.basename(pth), "client_id": cid,
+                                   "date": day, "number": "", "kind": "parent", "kind_manual": True,
+                                   "contact_with": w_, "contact_who": who_,
+                                   "contact_method": "Phone call (recorded)", "observations": get_text(obs).strip(),
+                                   "status": "waiting", "error": ""})
+                self.queue_renumber()
+                win.destroy()
+                self.open_queue(cid)
+                self.queue_refresh()
+                if not Q["running"]:
+                    self.queue_start()
+
+            def go_messages():
+                text, day = get_text(msgs).strip(), date_var.get().strip()
+                if not text:
+                    return status.config(text="Paste the messages (or load them from files) first.")
+                if not day:
+                    return status.config(text="Enter the date of the messages.")
+                method, note_txt = method_var.get(), get_text(obs).strip()
+                try:
+                    fresh = vault.load_client(cid)
+                    _code, hide, context, used, values = self._gen_inputs(fresh, None, day, "", note_txt)
+                except Exception as e:
+                    return messagebox.showerror(APP_NAME, friendly_error(e), parent=win)
+                w_, who_ = contact_choice()
+                remember_choice()
+                party = contact_party(w_, who_)
+                values.update(contact_method=method, contact_with=w_, contact_who=who_, source_kind=(
+                    f"the text messages between the Counselor and {party}, copied by the clinician (oldest first)"
+                    if method == "Text messages" else
+                    f"the email(s) between the Counselor and {party}, copied by the clinician (oldest first)"))
+                transcript = hide(scrub_contact_details(text))
+                job_cfg, reference = dict(cfg), self.settings.get("reference") or BUILTIN_REFERENCE
+
+                def done(res):
+                    now = datetime.now().isoformat(timespec="seconds")
+                    data = {"meta": {"client_id": cid, "client_code": code, "session_date": day, "session_number": "",
+                                     "created": now, "updated": now, "kind": "parent", "source": "messages",
+                                     "contact_with": w_, "contact_who": who_,
+                                     "contact_method": method, "needs_review": True,
+                                     "review_reason": f"drafted from the {method.lower()}"},
+                            "observations": note_txt, "transcript": text, "note": res[0] or "",
+                            "overview": res[1] or "", "context_used": used,
+                            "lines": [], "roles": {}, "diarized": False, "aligned": False}
+                    sid = vault.save_session(data)
+                    self.refresh_clients(self.client_id)
+                    if self._alive(win):
+                        win.destroy()
+                    self.set_status(f"{code}: {CONTACT_NAMES[w_][0].lower()} drafted from the {method.lower()} — review it.")
+                    self.open_client(cid, select=sid)
+
+                def failed(msg):
+                    if self._alive(win):
+                        go.config(state="normal")
+                        status.config(text="")
+                    messagebox.showerror(APP_NAME, f"Couldn't write the note: {msg}\n\nNothing was saved; your "
+                                                   "messages are still in the window.",
+                                         parent=win if self._alive(win) else None)
+                r = self.run_bg(lambda p: generate_documents(job_cfg, values, transcript, context, p, kind="parent",
+                                                             reference=reference),
+                                done, failed, label=f"writing the contact note for {code}", patient=code,
+                                pausable=True)
+                if r:
+                    go.config(state="disabled")
+                    status.config(text="Writing… (you can keep working; it opens when it's done)" if r != "queued"
+                                  else "Waiting in line — it starts when the current task finishes.")
+            go.config(command=lambda: go_messages() if mode_var.get() == "messages" else go_call())
+            self.parent_win = {"win": win, "with": with_var, "who": who_var, "mode": mode_var, "date": date_var,
+                               "method": method_var, "msgs": msgs,
+                               "obs": obs, "audio": audio_var, "go": go, "load": load_files, "status": status}
+
+        parent_comm = external_comm                     # (its earlier name)
+
+        FILE_KINDS = {"registration": "Registration form", "parent": "External communication", "other": "Other"}
+        FILE_TYPES = [("Documents", "*.pdf *.docx *.doc *.txt *.md *.rtf *.png *.jpg *.jpeg *.gif *.heic *.tif *.tiff"),
+                      ("All files", "*.*")]
+
+        def patient_file_add(self, cid, path, kind, note=""):
+            """Encrypt a file into the vault and list it on the patient. Returns the file's entry."""
+            with open(path, "rb") as fh:
+                data = fh.read()
+            fid = vault.save_file(data)
+            entry = {"id": fid, "name": os.path.basename(path), "kind": kind, "bytes": len(data),
+                     "added": datetime.now().isoformat(timespec="seconds"), "note": note}
+            client = vault.load_client(cid)                    # fresh copy: never overwrite another edit
+            client.setdefault("files", []).append(entry)
+            vault.save_client(client)
+            self.refresh_clients()
+            return entry
+
+        def patient_file_remove(self, cid, fid):
+            client = vault.load_client(cid)
+            client["files"] = [x for x in (client.get("files") or []) if x["id"] != fid]
+            vault.save_client(client)
+            vault.delete_file(fid)
+            self.refresh_clients()
+
+        def patient_files(self, client, kind=None):
+            """A patient's files: registration forms and other documents, kept encrypted in the vault."""
+            cid = client["id"]
+            win = new_window(root, f"{client.get('code', '')} — files", "820x520")
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=f"{client.get('code', '')} — files", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Registration forms and other documents for this patient. They're encrypted with your "
+                              "vault password and kept in your shared drive's vault folder, like the sessions — the "
+                              "readable original you picked isn't changed or moved.", style="Muted.TLabel",
+                      wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), px(10)))
+            cols = ("name", "kind", "added", "size")
+            box, tv = tree_box(f, columns=cols, show="headings", height=8, selectmode="browse")
+            for c, t, w in (("name", "File", 340), ("kind", "Type", 160), ("added", "Added", 120), ("size", "Size", 80)):
+                tv.heading(c, text=t, anchor="w")
+                tv.column(c, width=px(w), anchor="w", stretch=(c == "name"))
+            box.pack(fill="both", expand=True)
+            note = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(760), justify="left")
+            note.pack(anchor="w", pady=(px(6), 0))
+
+            def entries():
+                try:
+                    return vault.load_client(cid).get("files") or []
+                except Exception:
+                    return []
+
+            def refresh(sel=None):
+                tv.delete(*tv.get_children())
+                for e in entries():
+                    size = e.get("bytes", 0)
+                    tv.insert("", "end", iid=e["id"], values=(
+                        e["name"], self.FILE_KINDS.get(e.get("kind"), "Other"), fmt_date(e.get("added", "")[:10]),
+                        f"{size / 1048576:.1f} MB" if size >= 1048576 else f"{max(1, size // 1024)} KB"))
+                if sel and tv.exists(sel):
+                    tv.selection_set(sel)
+                if not tv.get_children():
+                    note.config(text="No files yet. Use “Import registration file…” to add this patient's "
+                                     "registration form.")
+                else:
+                    note.config(text="")
+
+            def current():
+                sel = tv.selection()
+                return next((e for e in entries() if sel and e["id"] == sel[0]), None)
+
+            def add(k):
+                path = filedialog.askopenfilename(parent=win, title="Choose the " +
+                                                  ("registration form" if k == "registration" else "file"),
+                                                  filetypes=self.FILE_TYPES)
+                if not path:
+                    return
+                try:
+                    e = self.patient_file_add(cid, path, k)
+                except Exception as ex:
+                    return messagebox.showerror(APP_NAME, f"Couldn't add that file: {friendly_error(ex)}", parent=win)
+                refresh(e["id"])
+                self.set_status(f"{client.get('code', '')}: {e['name']} added (encrypted).")
+                if self.client_id == cid:
+                    self.open_client(cid)
+                if k == "registration" and messagebox.askyesno(
+                        APP_NAME, "Read the PHQ-9 and GAD-7 scores from this registration form now? (The local AI "
+                                  "reads it; you check the scores before they're saved.)", parent=win):
+                    self.read_measures_from_file(vault.load_client(cid), e)
+
+            def view():
+                e = current()
+                if not e:
+                    return note.config(text="Select a file first.")
+                try:
+                    data = vault.load_file(e["id"])
+                except Exception as ex:
+                    return messagebox.showerror(APP_NAME, friendly_error(ex), parent=win)
+                ext = os.path.splitext(e["name"])[1].lower()
+                text = None
+                if ext in (".txt", ".md", ".rtf"):
+                    text = data.decode("utf-8", errors="replace")
+                elif ext in (".docx", ".pdf"):
+                    text = text_from_bytes(data, ext)        # read in memory: no readable copy on disk
+                if text is None:
+                    return note.config(text="This kind of file can't be shown inside Session Scribe — use “Open” "
+                                            "(a temporary copy, wiped when Session Scribe closes).")
+                vw = new_window(win, e["name"], "760x640")
+                vf = ttk.Frame(vw, padding=px(14))
+                vf.pack(fill="both", expand=True)
+                tb = register(tk.Text(vf, wrap="word", relief="flat", borderwidth=0, highlightthickness=1,
+                                      font=F["body"], padx=px(12), pady=px(10)), "doc")
+                tb.insert("1.0", text.strip() or "(This file has no readable text — it may be a scan. Use “Open”.)")
+                tb.config(state="disabled")
+                tb.pack(fill="both", expand=True)
+
+            def open_copy():
+                e = current()
+                if not e:
+                    return note.config(text="Select a file first.")
+                try:
+                    data = vault.load_file(e["id"])
+                    os.makedirs(OPEN_DIR, exist_ok=True)
+                    path = os.path.join(OPEN_DIR, e["id"][:8] + "_" + re.sub(r'[\\/:*?"<>|]', "_", e["name"]))
+                    with open(path, "wb") as fh:
+                        fh.write(data)
+                    open_path(path)
+                except Exception as ex:
+                    return messagebox.showerror(APP_NAME, f"Couldn't open it: {friendly_error(ex)}", parent=win)
+                note.config(text="Opened a temporary readable copy. It's wiped when Session Scribe closes.")
+
+            def save_copy():
+                e = current()
+                if not e:
+                    return note.config(text="Select a file first.")
+                path = filedialog.asksaveasfilename(parent=win, initialfile=e["name"])
+                if not path:
+                    return
+                if is_cloud_path(path) and not messagebox.askyesno(
+                        APP_NAME, "That location is a cloud-synced folder, so this UNENCRYPTED copy would be "
+                                  "uploaded as readable data.\n\nSave it there anyway?", parent=win):
+                    return
+                try:
+                    with open(path, "wb") as fh:
+                        fh.write(vault.load_file(e["id"]))
+                except Exception as ex:
+                    return messagebox.showerror(APP_NAME, f"Couldn't save it: {friendly_error(ex)}", parent=win)
+                self.set_status(f"Saved a copy of {e['name']} (not encrypted).")
+
+            def remove():
+                e = current()
+                if not e:
+                    return note.config(text="Select a file first.")
+                if not messagebox.askyesno(APP_NAME, f"Remove {e['name']} from {client.get('code', '')}'s files? "
+                                                     "The encrypted copy is deleted on both computers.", parent=win):
+                    return
+                self.patient_file_remove(cid, e["id"])
+                refresh()
+                if self.client_id == cid:
+                    self.open_client(cid)
+
+            tv.bind("<Double-1>", lambda _e: view())
+            bar = Flow(f, gap=px(8))
+            bar.pack(fill="x", pady=(px(10), 0))
+            bar.add(ttk.Button(bar, text="＋  Import registration file…", style="Accent.TButton",
+                               command=lambda: add("registration")))
+            bar.add(ttk.Button(bar, text="Add other file…", command=lambda: add("other")))
+            bar.add(ttk.Button(bar, text="View", command=view))
+            bar.add(ttk.Button(bar, text="Open", command=open_copy))
+            bar.add(ttk.Button(bar, text="Save a copy…", command=save_copy))
+            bar.add(ttk.Button(bar, text="Remove", command=remove))
+            refresh()
+            self.files_win = {"win": win, "add": add, "view": view, "remove": remove, "tv": tv, "refresh": refresh}
+            if kind:
+                win.after(100, lambda: add(kind))
+
         def edit_client(self, client):
             if self.client_dialog(client):
                 self.refresh_clients(client["id"])
@@ -7814,14 +12328,17 @@ def run_gui():
             ttk.Label(row, text="Session #").pack(side="left")
             ttk.Entry(row, textvariable=n_var, width=6).pack(side="left", padx=(6, 16))
             ttk.Label(row, text="Type").pack(side="left")
-            ttk.Combobox(row, textvariable=k_var, values=["Progress note", "Intake assessment", "Treatment plan"],
+            ttk.Combobox(row, textvariable=k_var, values=["Progress note", "Intake assessment", "Patient contact",
+                                                          "Parent contact", "Collateral contact", "Treatment plan"],
                          state="readonly", width=18).pack(side="left", padx=6)
             rm = ttk.Button(row, text="Remove entry")
             rm.pack(side="right")
             tfr, txt = scrolled_text(ed, height=8, doc=True)
             tfr.pack(fill="both", expand=True, pady=(6, 0))
             cur = {"i": None}
-            kind_name = {"progress": "Progress note", "intake": "Intake assessment", "plan": "Treatment plan"}
+            kind_name = {"progress": "Progress note", "intake": "Intake assessment", "plan": "Treatment plan",
+                         "parent": "Parent contact", "parent:patient": "Patient contact",
+                         "parent:other": "Collateral contact"}
             kind_key = {v: k for k, v in kind_name.items()}
 
             META = re.compile(r"\b(dob|birth date|date|client|patient name|session (start|end) time|duration|"
@@ -7975,7 +12492,10 @@ def run_gui():
                     vault.save_session({
                         "meta": {"client_id": client["id"], "client_code": client.get("code", ""),
                                  "session_date": it["date"], "session_number": it["number"],
-                                 "kind": it["kind"], "source": "imported", "created": now, "updated": now,
+                                 "kind": it["kind"].partition(":")[0], "source": "imported", "created": now,
+                                 "updated": now,
+                                 **({"contact_with": it["kind"].partition(":")[2] or "parent"}
+                                    if it["kind"].startswith("parent") else {}),
                                  "tidy_version": TIDY_VERSION if it.get("ehr") else 0},
                         "observations": "", "transcript": "", "note": it["text"], "overview": "",
                         "context_used": []})
@@ -8009,9 +12529,1493 @@ def run_gui():
                 self.set_status(f"{client.get('code', '')}: case overview updated. Review it before relying on it.")
             if self.run_bg(lambda p: generate_case_overview(job_cfg, client, sessions, orient, p), done,
                            label=f"writing the case overview for {client.get('code', '')}",
-                           owner=("case", client["id"]), patient=client.get("code", "")) == "queued" \
+                           owner=("case", client["id"]), patient=client.get("code", ""), pausable=True) == "queued" \
                     and self.client_id == client["id"] and not self.wizard:
                 self.open_client(client["id"], select="case")
+
+        # ======================================================== SESSION REVIEW (map, feedback, techniques)
+        def _counselor_patient(self):
+            labels = role_labels(cfg)
+            return labels[0], (labels[1] if len(labels) > 1 else "Patient")
+
+        def draw_session_map(self, parent, m):
+            """Who talked when (a row per speaker), the patient's tone over time, and the heaviest moments.
+            Fills the width it's given and redraws when that changes."""
+            rows = [s["label"] for s in m["speakers"]]
+            left, top, row_h, tone_h = px(110), px(8), px(22), px(56)
+            h = top + row_h * len(rows) + px(14) + tone_h + px(26)
+            c = register(tk.Canvas(parent, height=h, highlightthickness=0, borderwidth=0), "canvas")
+            c.configure(background=P("surface"))
+            dur = max(m["duration"], 1.0)
+            colors = [P("accent"), P("good"), P("warn"), P("bad")]
+            short = lambda t: fmt_ts(t)[3:] if fmt_ts(t).startswith("00:") else fmt_ts(t)
+
+            def draw(w):
+                c.delete("all")
+                right = w - px(16)
+                X = lambda t: left + (right - left) * (t / dur)
+                for i, name in enumerate(rows):
+                    y = top + i * row_h
+                    c.create_text(left - px(8), y + row_h / 2, text=name, anchor="e", fill=P("text"),
+                                  font=F["caption"])
+                    c.create_rectangle(left, y + px(4), right, y + row_h - px(4), outline="", fill=P("surface2"))
+                for a, b, name in m["timeline"]:
+                    i = rows.index(name) if name in rows else 0
+                    y = top + i * row_h
+                    c.create_rectangle(X(a), y + px(4), max(X(b), X(a) + 1), y + row_h - px(4), outline="",
+                                       fill=colors[i % len(colors)])
+                ty = top + row_h * len(rows) + px(14)
+                c.create_text(left - px(8), ty + tone_h / 2, text=f"{m.get('patient') or 'Patient'}'s\ntone",
+                              anchor="e", fill=P("text"), font=F["caption"], justify="right")
+                mid = ty + tone_h / 2
+                c.create_line(left, mid, right, mid, fill=P("border"), dash=(2, 3))
+                c.create_text(right, ty, text="lighter ▲", anchor="ne", fill=P("muted"), font=F["caption"])
+                c.create_text(right, ty + tone_h, text="heavier ▼", anchor="se", fill=P("muted"), font=F["caption"])
+                pts = [(X(t["t"]), mid - t["score"] * (tone_h / 2 - px(4))) for t in m["tone"] if t["words"] >= 15]
+                if len(pts) >= 2:
+                    c.create_line(*[v for p_ in pts for v in p_], fill=P("accent"), width=2, smooth=True)
+                for x_, y_ in pts:
+                    c.create_oval(x_ - 2, y_ - 2, x_ + 2, y_ + 2, fill=P("accent"), outline="")
+                for hv in m["heavy"]:
+                    x_ = X(hv["t"])
+                    c.create_line(x_, ty, x_, ty + tone_h, fill=P("bad"), dash=(3, 2))
+                    c.create_text(x_ + 3, ty + tone_h - px(2), text=short(hv["t"]), anchor="sw",
+                                  fill=P("bad"), font=F["caption"])
+                ay = ty + tone_h + px(6)
+                step = 300 if dur <= 3600 else 600
+                t_ = 0
+                while t_ <= dur:
+                    c.create_line(X(t_), ay, X(t_), ay + px(4), fill=P("muted"))
+                    c.create_text(X(t_), ay + px(6), text=short(t_), anchor="n", fill=P("muted"), font=F["caption"])
+                    t_ += step
+            c.bind("<Configure>", lambda e: draw(max(e.width, px(300))))
+            return c
+
+        def _build_review(self, tab, client, sid, d, day):
+            sc, box = scrollable(tab)
+            sc.pack(fill="both", expand=True)
+            counselor, patient = self._counselor_patient()
+            rv = d.get("review") or {}
+            head = Flow(box, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Session review", style="H2.TLabel"))
+            busy = self.busy and getattr(self, "task_owner", None) == ("review", sid)
+            gen = head.add(ttk.Button(head, text=("Update feedback & techniques" if rv.get("feedback")
+                                                  else "Write feedback & find techniques"),
+                                      style="Accent.TButton", command=lambda: self.make_review(client, sid)),
+                           gap=px(16))
+            if busy:
+                gen.config(state="disabled")
+            if rv.get("generated"):
+                head.add(ttk.Label(head, text=f"Written {fmt_date(rv['generated'][:10])}", style="Muted.TLabel"))
+            ttk.Label(box, text="For your own learning and supervision — not part of the patient's note. Read on "
+                                "this computer only; names are hidden from the AI.",
+                      style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
+            self.progress_panel(box, owner=("review", sid)).pack(anchor="w", fill="x", pady=(px(4), 0))
+
+            ttk.Label(box, text="Session map", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(4)))
+            m = session_map(d.get("lines"), d.get("roles") or {}, counselor)
+            if m:
+                self.draw_session_map(box, m).pack(anchor="w", fill="x", padx=(0, px(8)))
+                ttk.Label(box, text=session_map_text(m), style="Muted.TLabel", wraplength=px(760),
+                          justify="left").pack(anchor="w", pady=(px(6), 0))
+                ttk.Label(box, text="Tone is a simple count of feeling words in what the patient said, every two "
+                                    "minutes — a rough guide to where the session got heavy, not a measurement.",
+                          style="Caption.TLabel", wraplength=px(760), justify="left").pack(anchor="w")
+            else:
+                ttk.Label(box, text="Only recorded sessions (with timings) have a session map.",
+                          style="Muted.TLabel").pack(anchor="w")
+
+            for key, title, empty in (("feedback", "Skills feedback", "Click “Write feedback & find techniques” "
+                                       "for supervisor-style feedback on this session: what went well, missed "
+                                       "openings, where the patient pulled back, and one thing to practice."),
+                                      ("techniques", "Techniques used", "The techniques and skills you used, each "
+                                       "with the moment and your words as evidence — plus a sentence for the note.")):
+                row = Flow(box, gap=px(8))
+                row.pack(fill="x", pady=(px(14), px(4)))
+                row.add(ttk.Label(row, text=title, style="Strong.TLabel"))
+                if rv.get(key):
+                    row.add(ttk.Button(row, text="Copy", command=lambda k=key, t=title: self.copy(rv[k], t)),
+                            gap=px(16))
+                    fr, t = scrolled_text(box, readonly=True, doc=True, height=14)
+                    fr.pack(fill="both", expand=True)
+                    set_text(t, rv[key])
+                else:
+                    ttk.Label(box, text=empty, style="Muted.TLabel", wraplength=px(760),
+                              justify="left").pack(anchor="w")
+            self._review_extras(box, client, sid, d, day)
+
+        def make_review(self, client, sid, which=("feedback", "techniques")):
+            try:
+                d = vault.load_session(sid)
+            except Exception as e:
+                return messagebox.showerror(APP_NAME, friendly_error(e))
+            code = client.get("code", "")
+            counselor, patient = self._counselor_patient()
+            job_cfg, orient = dict(cfg), self.settings.get("orientation", "")
+            ref = self.settings.get("reference") or BUILTIN_REFERENCE
+            day = d["meta"].get("session_date", "")
+
+            def done(res):
+                dd = vault.load_session(sid)
+                rv = dict(dd.get("review") or {})
+                rv.update(res)
+                rv["generated"] = datetime.now().isoformat(timespec="seconds")
+                dd["review"] = rv
+                vault.save_session(dd, sid)
+                self._sig = vault.signature()
+                self._focus_next = (sid, "review")
+                if self.client_id == client["id"] and not self.wizard:
+                    self.open_client(client["id"], select=f"day:{day}")
+                self.set_status(f"{code}: session review written — it's for you and your supervisor, not the chart.")
+            r = self.run_bg(lambda p: generate_session_review(job_cfg, client, d, counselor, patient, orient, ref, p,
+                                                              which=which),
+                            done, label=f"reviewing the {fmt_date(day)} session for {code}", owner=("review", sid),
+                            patient=code, pausable=True)
+            if r and self.client_id == client["id"] and not self.wizard:
+                self._focus_next = (sid, "review")
+                self.open_client(client["id"], select=f"day:{day}")
+
+        # ======================================================== DOCUMENTS (shared) + SUPERVISION PREP
+        def export_text(self, parent, title, text, filename, footer="Confidential"):
+            """Save a document as Word or PDF (not encrypted — the user is warned for cloud folders)."""
+            path = filedialog.asksaveasfilename(parent=parent, defaultextension=".docx", initialfile=filename + ".docx",
+                                                filetypes=[("Word document", "*.docx"), ("PDF", "*.pdf")])
+            if not path:
+                return None
+            if is_cloud_path(path) and not messagebox.askyesno(
+                    APP_NAME, "That location is a cloud-synced folder, so this UNENCRYPTED export would be "
+                              "uploaded as readable text.\n\nSave it there anyway?", parent=parent):
+                return None
+            try:
+                (write_pdf if path.lower().endswith(".pdf") else write_docx)(path, text_to_blocks(title, text),
+                                                                              footer=footer)
+            except Exception as e:
+                messagebox.showerror(APP_NAME, f"Couldn't export: {friendly_error(e)}", parent=parent)
+                return None
+            self.set_status(f"Exported to {os.path.basename(path)} (not encrypted).")
+            return path
+
+        def doc_window(self, title, text, subtitle="", filename="document", on_save=None, footer="Confidential"):
+            """A document to read, edit, copy or export. on_save(text) keeps edits (encrypted)."""
+            win = new_window(root, title, "920x780")
+            f = ttk.Frame(win, padding=(px(24), px(18)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=title, style="Title.TLabel").pack(anchor="w")
+            if subtitle:
+                ttk.Label(f, text=subtitle, style="Muted.TLabel", wraplength=px(840), justify="left").pack(
+                    anchor="w", pady=(px(2), 0))
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            fr, t = scrolled_text(f, doc=True, height=24)
+            fr.pack(fill="both", expand=True, pady=(px(10), 0))
+            set_text(t, text)
+            status = ttk.Label(btns, text="", style="Muted.TLabel")
+            status.pack(side="left")
+            ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Export…", command=lambda: self.export_text(win, title, get_text(t), filename,
+                                                                              footer)).pack(side="right", padx=px(8))
+            ttk.Button(btns, text="Copy", command=lambda: self.copy(get_text(t), title)).pack(side="right")
+            if on_save:
+                def save():
+                    on_save(get_text(t).strip())
+                    status.config(text="Saved (encrypted).")
+                ttk.Button(btns, text="Save changes", style="Accent.TButton", command=save).pack(
+                    side="right", padx=px(8))
+            win._doc = {"text": t, "status": status}
+            return win
+
+        def supervision_prep(self):
+            """One page for the next supervision meeting: each patient's period, risk, progress and questions."""
+            win = new_window(root, "Supervision prep", "860x760")
+            f = ttk.Frame(win, padding=(px(24), px(18)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Supervision prep", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="A page for your next supervision meeting: for each patient, what happened, any risk, "
+                              "progress toward goals and questions to bring — plus the skills from your session "
+                              "reviews. Drafted by the local AI from your notes (names hidden); saved encrypted.",
+                      style="Muted.TLabel", wraplength=px(800), justify="left").pack(anchor="w", pady=(px(2), px(10)))
+            past = vault.list_reports("supervision")
+            start0 = (date.fromisoformat(past[0]["end"]) + timedelta(days=1)).isoformat() if past else \
+                (date.today() - timedelta(days=7)).isoformat()
+            a_var, b_var = tk.StringVar(value=start0), tk.StringVar(value=date.today().isoformat())
+            row = Flow(f, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="From"))
+            row.add(date_field(row, a_var, on_pick=lambda _d: fill_patients()), gap=px(4))
+            row.add(ttk.Label(row, text="to"), gap=px(12))
+            row.add(date_field(row, b_var, on_pick=lambda _d: fill_patients()), gap=px(4))
+            ttk.Label(f, text="Patients", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(2)))
+            plist = ttk.Frame(f)
+            plist.pack(fill="x")
+            picks = {}
+            ttk.Label(f, text="Questions you already want to bring (optional, one per line)", style="Strong.TLabel").pack(
+                anchor="w", pady=(px(12), px(2)))
+            qfr, qtxt = scrolled_text(f, height=4)
+            qfr.pack(fill="x")
+            info = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(800), justify="left")
+            info.pack(anchor="w", pady=(px(8), 0))
+            prev_fr = ttk.Frame(f)
+            prev_fr.pack(fill="x", pady=(px(8), 0))
+            if past:
+                ttk.Label(prev_fr, text="Earlier packets:", style="Muted.TLabel").pack(side="left")
+                for rp in past[:4]:
+                    ttk.Button(prev_fr, text=f"{fmt_date(rp['start'])} – {fmt_date(rp['end'])}",
+                               command=lambda rp=rp: self.open_report(rp["id"])).pack(side="left", padx=(px(6), 0))
+            all_sessions = {}
+
+            def fill_patients(*_):
+                for w_ in plist.winfo_children():
+                    w_.destroy()
+                a, b = a_var.get().strip(), b_var.get().strip()
+                shown = 0
+                for c in [c for c in self.clients if not c.get("archived")]:
+                    if c["id"] not in all_sessions:
+                        all_sessions[c["id"]] = vault.sessions_for(c["id"])
+                    n = sum(1 for _, d in all_sessions[c["id"]] if a <= (d["meta"].get("session_date") or "") <= b)
+                    var = picks.get(c["id"]) or tk.BooleanVar()
+                    if c["id"] not in picks:
+                        var.set(n > 0)
+                    picks[c["id"]] = var
+                    ttk.Checkbutton(plist, text=f"{c.get('code', '')}  ·  {n} in this period", variable=var).grid(
+                        row=shown // 3, column=shown % 3, sticky="w", padx=(0, px(18)))
+                    shown += 1
+                if not shown:
+                    ttk.Label(plist, text="No patients yet.", style="Muted.TLabel").grid(row=0, column=0)
+            fill_patients()
+            for v_ in (a_var, b_var):
+                v_.trace_add("write", lambda *_: root.after_idle(fill_patients))
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+            go = ttk.Button(btns, text="Prepare the packet", style="Accent.TButton")
+            go.pack(side="right", padx=px(8))
+
+            def run():
+                a, b = a_var.get().strip(), b_var.get().strip()
+                if not (re.fullmatch(r"\d{4}-\d\d-\d\d", a) and re.fullmatch(r"\d{4}-\d\d-\d\d", b)):
+                    return info.config(text="Enter both dates.", style="Bad.TLabel")
+                a, b = min(a, b), max(a, b)
+                chosen = [c for c in self.clients if picks.get(c["id"]) and picks[c["id"]].get()]
+                if not chosen:
+                    return info.config(text="Tick at least one patient.", style="Bad.TLabel")
+                pats = [(vault.load_client(c["id"]), all_sessions.get(c["id"]) or vault.sessions_for(c["id"]))
+                        for c in chosen]
+                questions, job_cfg, orient = get_text(qtxt), dict(cfg), self.settings.get("orientation", "")
+
+                def done(text):
+                    rid = vault.save_report({"kind": "supervision", "start": a, "end": b, "text": text,
+                                             "patients": [c.get("code", "") for c in chosen],
+                                             "created": datetime.now().isoformat(timespec="seconds")})
+                    if self._alive(win):
+                        win.destroy()
+                    self.set_status("Supervision packet ready (saved, encrypted).")
+                    self.open_report(rid)
+
+                def failed(msg):
+                    if self._alive(win):
+                        go.config(state="normal")
+                        info.config(text="Couldn't prepare it: " + msg, style="Bad.TLabel")
+                r = self.run_bg(lambda p: generate_supervision_packet(job_cfg, pats, a, b, questions, orient, p),
+                                done, failed, label="preparing your supervision packet", pausable=True)
+                if r:
+                    go.config(state="disabled")
+                    info.config(text="Preparing… it opens when it's ready (you can keep working)." if r != "queued"
+                                else "Waiting in line — it starts when the current task finishes.", style="Muted.TLabel")
+            go.config(command=run)
+            win._test = {"a": a_var, "b": b_var, "picks": picks, "q": qtxt, "go": go, "info": info}
+            return win
+
+        def open_report(self, rid):
+            rp = vault.load_report(rid)
+
+            def save(text):
+                r2 = vault.load_report(rid)
+                r2["text"] = text
+                r2["edited"] = datetime.now().isoformat(timespec="seconds")
+                vault.save_report(r2, rid)
+            kind = rp.get("kind")
+            title = {"supervision": "Supervision prep", "brief": f"Pre-session brief — {rp.get('code', '')}"}.get(
+                kind, rp.get("title") or "Document")
+            if kind == "supervision":
+                sub = f"{fmt_date(rp['start'])} to {fmt_date(rp['end'])} · {', '.join(rp.get('patients') or [])}"
+            elif kind == "letter":
+                title = f"{rp.get('title', 'Letter')} — {rp.get('code', '')}"
+                sub = (f"Drafted {fmt_date(rp['created'][:10])}" + (f" · to {rp['to']}" if rp.get("to") else "")
+                       + " · shared: " + (", ".join(LETTER_PARTS[k].lower() for k in rp.get("shared") or [] if k in LETTER_PARTS)
+                                          or "only the purpose") + ". Not encrypted once exported.")
+            elif kind == "brief":
+                sub = (f"Written {fmt_date(rp['created'][:10])} from {rp.get('code', '')}'s notes, plan, scores, "
+                       "risk timeline, homework and follow-ups. For you — not part of the chart.")
+            else:
+                sub = rp.get("subtitle", "")
+            fname = {"supervision": f"supervision_{rp.get('end', '')}", "brief": f"{rp.get('code', '')}_brief",
+                     "letter": f"{rp.get('code', '')}_{re.sub(r'[^A-Za-z]+', '_', rp.get('title', 'letter')).lower()}"}.get(
+                kind, re.sub(r"[^\w-]+", "_", title)[:60])
+            return self.doc_window(title, rp.get("text", ""), subtitle=sub, filename=fname, on_save=save,
+                                   footer=f"{rp.get('code', '')} · Confidential" if rp.get("code") else "Confidential")
+
+        # ======================================================== PROGRESS & RISK (patient-level insights)
+        def insight_flags(self, client, sessions):
+            """A few words for the patient's list entry when something needs a look."""
+            bits = []
+            try:
+                rs = risk_summary(client, sessions)
+                if rs["recent"]:
+                    bits.append(f"⚠ risk {fmt_date(rs['recent'][0]['date'])[5:]}")
+            except Exception:
+                pass
+            try:
+                for kind in MEASURES:
+                    t = measure_trend(client, kind)
+                    if t and t["item9"]:
+                        bits.append("⚠ PHQ-9 item 9")
+                    elif t and t["worse"]:
+                        bits.append(f"{kind} ↑")
+            except Exception:
+                pass
+            n_fu = sum(1 for x in client.get("followups") or [] if not x.get("done"))
+            if n_fu:
+                bits.append(f"{n_fu} to follow up")
+            try:
+                n = len(goals_summary(client, sessions)["stale"])
+                if n:
+                    bits.append(f"{n} goal{'s' if n != 1 else ''} idle")
+            except Exception:
+                pass
+            return " · ".join(bits)
+
+        def insight_tabs(self):
+            """[(key, tab title, builder(frame, client, sessions))] — each feature adds its tab here."""
+            return [("goals", "Goals check", self._ins_goals), ("risk", "Risk timeline", self._ins_risk),
+                    ("scores", "PHQ-9 / GAD-7", self._ins_scores), ("homework", "Homework", self._ins_homework),
+                    ("followups", "Follow-ups", self._ins_followups), ("themes", "Themes", self._ins_themes)]
+
+        def _render_insights(self, v, client, sessions, tab=None):
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Progress & risk", style="H2.TLabel"))
+            nb = ttk.Notebook(v)
+            nb.pack(fill="both", expand=True, pady=(px(6), 0))
+            built, frames = set(), {}
+            tabs = self.insight_tabs()
+            for key, title, builder in tabs:
+                fr = ttk.Frame(nb, padding=(0, px(6), 0, 0))
+                nb.add(fr, text=f"  {title}  ")
+                frames[str(fr)] = (key, builder, fr)
+
+            def show(_e=None):
+                cur = nb.select()
+                if not cur or cur in built:
+                    return
+                built.add(cur)
+                key, builder, fr = frames[cur]
+                self._insight_tab = key
+                builder(fr, client, sessions)
+            nb.bind("<<NotebookTabChanged>>", lambda e: (show(), setattr(self, "_insight_tab", frames[nb.select()][0])
+                                                          if nb.select() else None))
+            want = tab or getattr(self, "_insight_tab", None)
+            for t_ in nb.tabs():
+                if frames[t_][0] == want:
+                    nb.select(t_)
+                    break
+            show()
+            v._insights = nb
+
+        def _ins_goals(self, fr, client, sessions):
+            sc, box = scrollable(fr)
+            sc.pack(fill="both", expand=True)
+            goals, todo = goals_todo(client, sessions)
+            row = Flow(box, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="Which treatment goals each session worked on", style="Strong.TLabel"))
+            if not goals:
+                ttk.Label(box, text="No goals yet — add them to the treatment plan (or the patient profile under Edit "
+                                    "patient), then come back here.", style="Muted.TLabel", wraplength=px(700),
+                          justify="left").pack(anchor="w", pady=(px(6), 0))
+                return
+            btn = row.add(ttk.Button(row, text=f"Check {len(todo)} note{'s' if len(todo) != 1 else ''}" if todo
+                                     else "All notes checked", style="Accent.TButton" if todo else "TButton",
+                                     command=lambda: self.check_goals(client)), gap=px(16))
+            if not todo:
+                btn.config(state="disabled")
+            src = "treatment plan" if current_plan(client) and plan_goals(current_plan(client)["text"]) else "profile"
+            ttk.Label(box, text=f"Goals from the {src}. Each note is read by the local AI (names hidden); results are "
+                                "saved with the session. New notes are checked when you click the button.",
+                      style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
+            self.progress_panel(box, owner=("goals", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
+            sm = goals_summary(client, sessions)
+            for g, n, since in sm["stale"]:
+                ttk.Label(box, text=f"⚠  “{g[:90]}” hasn't come up in the last {n} sessions"
+                                    + (f" (last: {fmt_date(since)})." if since else " (not yet in any checked note)."),
+                          style="Warn.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(4), 0))
+            cols = sm["columns"][-12:]
+            grid = ttk.Frame(box)
+            grid.pack(anchor="w", fill="x", pady=(px(10), 0))
+            ttk.Label(grid, text="Goal", style="Strong.TLabel").grid(row=0, column=0, sticky="w")
+            for j, (day, sid, hits) in enumerate(cols, 1):
+                ttk.Label(grid, text=fmt_date(day)[5:] if len(fmt_date(day)) >= 10 else fmt_date(day),
+                          style="Caption.TLabel").grid(row=0, column=j, padx=px(4))
+            ttk.Label(grid, text="Last worked on", style="Strong.TLabel").grid(row=0, column=len(cols) + 1, sticky="w",
+                                                                               padx=(px(10), 0))
+            for i, g in enumerate(sm["goals"], 1):
+                ttk.Label(grid, text=g if len(g) <= 60 else g[:58] + "…", wraplength=px(300), justify="left").grid(
+                    row=i, column=0, sticky="w", pady=px(2))
+                for j, (day, sid, hits) in enumerate(cols, 1):
+                    h_ = hits[i - 1] if i - 1 < len(hits) else None
+                    ttk.Label(grid, text="✓" if h_ else "·" if h_ is False else "?",
+                              style="Good.TLabel" if h_ else "Muted.TLabel").grid(row=i, column=j, padx=px(4))
+                ttk.Label(grid, text=fmt_date(sm["last"].get(g)) if sm["last"].get(g) else "—",
+                          style="Muted.TLabel").grid(row=i, column=len(cols) + 1, sticky="w", padx=(px(10), 0))
+            ttk.Label(box, text="✓ worked on   ·  not this session   ?  not checked yet"
+                                + ("   (latest 12 sessions)" if len(sm["columns"]) > 12 else ""),
+                      style="Caption.TLabel").pack(anchor="w", pady=(px(6), 0))
+            ev = [(day, it) for day, sid, _ in cols[-3:]
+                  for it in (next((d for s_, d in sessions if s_ == sid), {}).get("goals_check") or {}).get("items", [])
+                  if it.get("addressed") and it.get("evidence")]
+            if ev:
+                ttk.Label(box, text="Evidence from the latest notes", style="Strong.TLabel").pack(anchor="w", pady=(px(12), 0))
+                for day, it in ev:
+                    ttk.Label(box, text=f"{fmt_date(day)} · {it['goal'][:50]}: {it['evidence']}", style="Muted.TLabel",
+                              wraplength=px(740), justify="left").pack(anchor="w")
+
+        def check_goals(self, client):
+            client = vault.load_client(client["id"])
+            sessions = vault.sessions_for(client["id"])
+            goals, todo = goals_todo(client, sessions)
+            if not todo:
+                return
+            job_cfg, key = dict(cfg), goals_key(goals)
+            code = client.get("code", "")
+
+            def job(p):
+                steps = _Steps(p, [(f"Checking goals in the {fmt_date(d['meta'].get('session_date'))} note", 400,
+                                    len(d.get("note", "")) + 1200) for _, d in todo])
+                for i, (sid, d) in enumerate(todo):
+                    items = goals_check_note(job_cfg, client, d, goals, steps, i)
+                    dd = vault.load_session(sid)
+                    dd["goals_check"] = {"key": key, "items": items,
+                                         "generated": datetime.now().isoformat(timespec="seconds")}
+                    vault.save_session(dd, sid)
+                p("Done.", 100)
+                return len(todo)
+
+            def done(n):
+                self._sig = vault.signature()
+                self._insight_tab = "goals"
+                if self.client_id == client["id"] and not self.wizard:
+                    self.open_client(client["id"], select="insights")
+                self.set_status(f"{code}: goals checked in {n} note{'s' if n != 1 else ''}.")
+            r = self.run_bg(job, done, label=f"checking treatment goals for {code}", owner=("goals", client["id"]),
+                            patient=code, pausable=True)
+            if r and self.client_id == client["id"] and not self.wizard:
+                self._insight_tab = "goals"
+                self.open_client(client["id"], select="insights")
+
+        def _ins_risk(self, fr, client, sessions):
+            sc, box = scrollable(fr)
+            sc.pack(fill="both", expand=True)
+            todo = risk_todo(sessions)
+            row = Flow(box, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="Every documented risk or safety mention, newest first", style="Strong.TLabel"))
+            btn = row.add(ttk.Button(row, text=f"Check {len(todo)} record{'s' if len(todo) != 1 else ''}" if todo
+                                     else "All records checked", style="Accent.TButton" if todo else "TButton",
+                                     command=lambda: self.check_risk(client)), gap=px(16))
+            if not todo:
+                btn.config(state="disabled")
+            ttk.Label(box, text="Notes, overviews and the transcript lines that mention risk are read by the local AI "
+                                "(names hidden). This helps you find things — it doesn't replace your own risk "
+                                "assessment or your site's procedures.", style="Caption.TLabel", wraplength=px(720),
+                      justify="left").pack(anchor="w", pady=(px(2), 0))
+            self.progress_panel(box, owner=("risk", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
+            rs = risk_summary(client, sessions)
+            card = ttk.Frame(box, style="Card.TFrame", padding=(px(14), px(10)))
+            card.pack(fill="x", pady=(px(10), 0))
+            ls = rs["last_screen"]
+            ttk.Label(card, text="Latest screening: " + (f"{fmt_date(ls['date'])} — {ls['summary']}" if ls else
+                                                         "none found in checked records"),
+                      wraplength=px(700), justify="left").pack(anchor="w")
+            plan_txt = ("Safety plan: " + (f"{rs['plans'][0][1]} {fmt_date(rs['plans'][0][0])}" if rs["plans"] else
+                                           "none mentioned in the notes")
+                        + (f"; file on record: {rs['plan_files'][-1]['name']}" if rs["plan_files"] else ""))
+            ttk.Label(card, text=plan_txt, wraplength=px(700), justify="left").pack(anchor="w", pady=(px(2), 0))
+            if rs["needs_plan"]:
+                ttk.Label(card, text="⚠  Risk was documented in the last 30 days but no safety plan is mentioned or on "
+                                     "file — check with your supervisor.", style="Warn.TLabel", wraplength=px(700),
+                          justify="left").pack(anchor="w", pady=(px(4), 0))
+            if not rs["rows"]:
+                ttk.Label(box, text="Nothing documented in the checked records." if rs["checked"] else
+                          "Not checked yet.", style="Muted.TLabel").pack(anchor="w", pady=(px(10), 0))
+                return
+            for r in rs["rows"]:
+                it = ttk.Frame(box, style="Card.TFrame", padding=(px(14), px(8)))
+                it.pack(fill="x", pady=(px(6), 0))
+                top_ = ttk.Frame(it)
+                top_.pack(fill="x")
+                ttk.Label(top_, text=f"{fmt_date(r['date'])}  ·  {r['type']}", style="Strong.TLabel").pack(side="left")
+                ttk.Button(top_, text="Open session",
+                           command=lambda day=r["date"]: self.open_client(client["id"], select=f"day:{day}")).pack(side="right")
+                when = r["when"].strip("[] ")
+                ttk.Label(it, text=(f"[{when}] " if when else "") + r["summary"], wraplength=px(700),
+                          justify="left").pack(anchor="w", pady=(px(2), 0))
+                ttk.Label(it, text="What was done: " + r["action"], style="Muted.TLabel" if r["action"] != "not documented"
+                          else "Warn.TLabel", wraplength=px(700), justify="left").pack(anchor="w")
+
+        def check_risk(self, client):
+            client = vault.load_client(client["id"])
+            todo = risk_todo(vault.sessions_for(client["id"]))
+            if not todo:
+                return
+            job_cfg, code = dict(cfg), client.get("code", "")
+            need_ai = [(sid, d, src, key) for sid, d, src, key in todo if RISK_RE.search(src)]
+
+            def job(p):
+                steps = _Steps(p, [(f"Reading the {fmt_date(d['meta'].get('session_date'))} record for risk", 500,
+                                    len(src) + 1500) for _, d, src, _ in need_ai]) if need_ai else None
+                n_ai = 0
+                for sid, d, src, key in todo:
+                    uses_ai = RISK_RE.search(src) is not None
+                    res = risk_check_record(job_cfg, client, d, src, steps, n_ai)
+                    n_ai += uses_ai
+                    dd = vault.load_session(sid)
+                    dd["risk_check"] = dict(res, key=key, generated=datetime.now().isoformat(timespec="seconds"))
+                    vault.save_session(dd, sid)
+                p("Done.", 100)
+                return len(todo)
+
+            def done(n):
+                self._sig = vault.signature()
+                self._insight_tab = "risk"
+                if self.client_id == client["id"] and not self.wizard:
+                    self.open_client(client["id"], select="insights")
+                self.set_status(f"{code}: {n} record{'s' if n != 1 else ''} checked for risk.")
+            r = self.run_bg(job, done, label=f"checking {code}'s records for risk", owner=("risk", client["id"]),
+                            patient=code, pausable=True)
+            if r and self.client_id == client["id"] and not self.wizard:
+                self._insight_tab = "risk"
+                self.open_client(client["id"], select="insights")
+
+        def draw_measure_chart(self, parent, kind, series):
+            """Scores over time on the scale's severity bands (fills the width it's given)."""
+            spec = MEASURES[kind]
+            h = px(150)
+            c = register(tk.Canvas(parent, height=h, highlightthickness=0, borderwidth=0), "canvas")
+            c.configure(background=P("surface"))
+            shades = [P("good_bg"), P("surface2"), P("warn_bg"), P("bad_bg"), P("bad_bg")]
+
+            def draw(w):
+                c.delete("all")
+                left, right, top, bottom = px(160), w - px(16), px(8), h - px(26)
+                Y = lambda v: bottom - (bottom - top) * v / spec["max"]
+                bands = spec["bands"] + [(spec["max"] + 1, "")]
+                for i, ((lo, name), (hi, _)) in enumerate(zip(bands, bands[1:])):
+                    c.create_rectangle(left, Y(min(hi, spec["max"])), right, Y(lo), outline="", fill=shades[i % 5])
+                    c.create_text(left - px(6), (Y(lo) + Y(min(hi, spec["max"]))) / 2, text=f"{name} {lo}+",
+                                  anchor="e", fill=P("muted"), font=F["caption"])
+                n = len(series)
+                X = lambda i: left + (right - left) * ((i + 0.5) / max(n, 1))
+                pts = [(X(i), Y(m["total"])) for i, m in enumerate(series)]
+                if len(pts) >= 2:
+                    c.create_line(*[v for p_ in pts for v in p_], fill=P("accent"), width=2)
+                for (x_, y_), m in zip(pts, series):
+                    c.create_oval(x_ - 4, y_ - 4, x_ + 4, y_ + 4, fill=P("accent"), outline=P("surface"))
+                    c.create_text(x_, y_ - px(10), text=str(m["total"]), fill=P("text"), font=F["caption_strong"])
+                    c.create_text(x_, bottom + px(4), text=fmt_date(m["date"]), anchor="n", fill=P("muted"),
+                                  font=F["caption"])
+            c.bind("<Configure>", lambda e: draw(max(e.width, px(320))))
+            return c
+
+        def _ins_scores(self, fr, client, sessions):
+            sc, box = scrollable(fr)
+            sc.pack(fill="both", expand=True)
+            client = vault.load_client(client["id"])
+            row = Flow(box, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="PHQ-9 (depression) and GAD-7 (anxiety)", style="Strong.TLabel"))
+            row.add(ttk.Button(row, text="＋  Add a score…", style="Accent.TButton",
+                               command=lambda: self.measure_dialog(client)), gap=px(16))
+            regs = [x for x in client.get("files") or [] if x.get("kind") == "registration"]
+            if regs:
+                row.add(ttk.Button(row, text="Read from registration form",
+                                   command=lambda: self.read_measures_from_file(client, regs[-1])))
+            summary = measures_text(client)
+            if summary:
+                row.add(ttk.Button(row, text="Copy summary", command=lambda: self.copy(summary, "Score summary")))
+            self.progress_panel(box, owner=("measures", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
+            if not client.get("measures"):
+                ttk.Label(box, text="No scores yet. Add them from the registration packet (“Read from registration form”, "
+                                    "or type them in with “Add a score…”) and again whenever the patient retakes them. "
+                                    "The latest scores and how they've changed are given to the AI when it writes "
+                                    "notes.", style="Muted.TLabel", wraplength=px(720), justify="left").pack(
+                    anchor="w", pady=(px(8), 0))
+                return
+            ttk.Label(box, text=summary, wraplength=px(740), justify="left").pack(anchor="w", pady=(px(8), 0))
+            for kind in MEASURES:
+                t = measure_trend(client, kind)
+                if not t:
+                    continue
+                if t["item9"]:
+                    ttk.Label(box, text=f"⚠  PHQ-9 item 9 (thoughts of being better off dead or of self-harm) was "
+                                        f"answered {t['latest']['items'][8]} on {fmt_date(t['latest']['date'])} — "
+                                        "follow up and document a risk assessment.", style="Bad.TLabel",
+                              wraplength=px(740), justify="left").pack(anchor="w", pady=(px(4), 0))
+                if t["worse"]:
+                    ttk.Label(box, text=f"⚠  {kind} got worse: {t['previous']['total']} → {t['latest']['total']}.",
+                              style="Warn.TLabel").pack(anchor="w", pady=(px(2), 0))
+                elif t["better"]:
+                    ttk.Label(box, text=f"✓  {kind} improved: {t['previous']['total']} → {t['latest']['total']}.",
+                              style="Good.TLabel").pack(anchor="w", pady=(px(2), 0))
+            for kind in MEASURES:
+                s_ = measure_series(client, kind)
+                if not s_:
+                    continue
+                ttk.Label(box, text=kind, style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(2)))
+                self.draw_measure_chart(box, kind, s_).pack(fill="x", padx=(0, px(8)))
+            ttk.Label(box, text="All scores", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(2)))
+            for m in sorted(client["measures"], key=lambda m: m["date"], reverse=True):
+                r_ = ttk.Frame(box)
+                r_.pack(fill="x", pady=px(1))
+                ttk.Label(r_, text=f"{fmt_date(m['date'])}   {m['kind']}  {m['total']}  ({measure_band(m['kind'], m['total'])})"
+                                   f"   · {m.get('source', 'manual')}"
+                                   + ("   · answers: " + " ".join(map(str, m["items"])) if m.get("items") else "")).pack(
+                    side="left")
+                ttk.Button(r_, text="Remove", command=lambda m=m: self.measure_remove(client, m["id"])).pack(side="right")
+
+        def measure_remove(self, client, mid):
+            if not messagebox.askyesno(APP_NAME, "Remove this score?"):
+                return
+            c = vault.load_client(client["id"])
+            c["measures"] = [m for m in c.get("measures") or [] if m["id"] != mid]
+            vault.save_client(c)
+            self._insight_tab = "scores"
+            self.open_client(client["id"], select="insights")
+
+        def measures_add(self, client, entries):
+            c = vault.load_client(client["id"])
+            c.setdefault("measures", []).extend(entries)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self._insight_tab = "scores"
+            if self.client_id == client["id"] and not self.wizard:
+                self.open_client(client["id"], select="insights")
+
+        def measure_dialog(self, client):
+            win = new_window(root, f"{client.get('code', '')} — add a score", "720x720")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Add a score", style="Title.TLabel").pack(anchor="w")
+            kind_var, day_var = tk.StringVar(value="PHQ-9"), tk.StringVar(value=date.today().isoformat())
+            top_ = Flow(f, gap=px(10))
+            top_.pack(fill="x", pady=(px(8), 0))
+            for k in MEASURES:
+                top_.add(ttk.Radiobutton(top_, text=k, value=k, variable=kind_var))
+            top_.add(ttk.Label(top_, text="Completed on"), gap=px(20))
+            top_.add(date_field(top_, day_var), gap=px(4))
+            ttk.Label(f, text="Enter each answer (0 = not at all, 1 = several days, 2 = more than half the days, 3 = "
+                              "nearly every day) — or just the total.", style="Muted.TLabel", wraplength=px(660),
+                      justify="left").pack(anchor="w", pady=(px(8), px(4)))
+            qbox = ttk.Frame(f)
+            qbox.pack(fill="x")
+            item_vars = []
+            total_var = tk.StringVar()
+            tot_row = Flow(f, gap=px(8))
+            tot_row.pack(fill="x", pady=(px(8), 0))
+            tot_row.add(ttk.Label(tot_row, text="Total", style="Strong.TLabel"))
+            tot_en = tot_row.add(ttk.Entry(tot_row, textvariable=total_var, width=6), gap=px(4))
+            band_lbl = tot_row.add(ttk.Label(tot_row, text="", style="Muted.TLabel"), gap=px(10))
+            msg = ttk.Label(f, text="", style="Bad.TLabel", wraplength=px(660), justify="left")
+            msg.pack(anchor="w", pady=(px(6), 0))
+
+            def answers():
+                vals = [v.get().strip() for v in item_vars]
+                if all(vals):
+                    return [int(x) for x in vals]
+                return None
+
+            def recount(*_):
+                a = answers()
+                if a is not None:
+                    total_var.set(str(sum(a)))
+                    tot_en.config(state="disabled")
+                else:
+                    tot_en.config(state="normal")
+                try:
+                    band_lbl.config(text=measure_band(kind_var.get(), int(total_var.get())))
+                except ValueError:
+                    band_lbl.config(text="")
+
+            def build(*_):
+                for w_ in qbox.winfo_children():
+                    w_.destroy()
+                item_vars.clear()
+                for i, q in enumerate(MEASURES[kind_var.get()]["questions"]):
+                    v = tk.StringVar()
+                    v.trace_add("write", recount)
+                    item_vars.append(v)
+                    ttk.Label(qbox, text=f"{i + 1}. {q}", wraplength=px(520), justify="left").grid(
+                        row=i, column=0, sticky="w", pady=px(1))
+                    ttk.Combobox(qbox, textvariable=v, values=["", "0", "1", "2", "3"], state="readonly",
+                                 width=4).grid(row=i, column=1, padx=(px(10), 0))
+                total_var.set("")
+                recount()
+            kind_var.trace_add("write", build)
+            total_var.trace_add("write", lambda *_: recount() if answers() is None else None)
+            build()
+
+            def save():
+                try:
+                    a = answers()
+                    e = measure_entry(kind_var.get(), day_var.get().strip(), items=a,
+                                      total=None if a is not None or not total_var.get().strip() else int(total_var.get()))
+                except ValueError as ex:
+                    return msg.config(text=str(ex))
+                win.destroy()
+                self.measures_add(client, [e])
+                self.set_status(f"{client.get('code', '')}: {e['kind']} {e['total']} saved.")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save score", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            win._test = {"kind": kind_var, "day": day_var, "items": item_vars, "total": total_var, "save": save, "msg": msg}
+            return win
+
+        def read_measures_from_file(self, client, entry):
+            """Read PHQ-9 / GAD-7 answers from a registration form with the local AI, then confirm before saving."""
+            code, job_cfg = client.get("code", ""), dict(cfg)
+            ext = os.path.splitext(entry["name"])[1].lower()
+            default_day = (entry.get("added") or date.today().isoformat())[:10]
+
+            def job(p):
+                p("Reading the registration form…", 10)
+                text = form_text(vault.load_file(entry["id"]), ext)
+                if len(text.strip()) < 40:
+                    raise RuntimeError("That form has no readable text (it may be a scanned image) — type the "
+                                       "scores in with “Add a score…”.")
+                p("Finding the PHQ-9 and GAD-7…", 40)
+                return extract_measures(job_cfg, client, text, default_day)
+
+            def done(found):
+                if not found:
+                    return messagebox.showinfo(APP_NAME, "No PHQ-9 or GAD-7 answers could be read from that form. "
+                                                         "Type them in with “Add a score…”.")
+                self.confirm_measures(client, found)
+            self.run_bg(job, done, lambda m: messagebox.showerror(APP_NAME, m),
+                        label=f"reading {code}'s registration form", owner=("measures", client["id"]), patient=code)
+
+        def confirm_measures(self, client, found):
+            win = new_window(root, "Scores found on the form", "640x440")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Scores found on the form", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Check them against the form before saving — the AI can misread ticked boxes.",
+                      style="Muted.TLabel", wraplength=px(580), justify="left").pack(anchor="w", pady=(px(2), px(10)))
+            keep = []
+            for e in found:
+                v = tk.BooleanVar(value=True)
+                keep.append((v, e))
+                ttk.Checkbutton(f, variable=v, text=f"{e['kind']}  {e['total']} ({measure_band(e['kind'], e['total'])})  "
+                                                    f"on {fmt_date(e['date'])}"
+                                + ("   · answers: " + " ".join(map(str, e["items"])) if e.get("items") else "")).pack(
+                    anchor="w", pady=px(2))
+
+            def save():
+                chosen = [e for v, e in keep if v.get()]
+                win.destroy()
+                if chosen:
+                    self.measures_add(client, chosen)
+                    self.set_status(f"{client.get('code', '')}: {len(chosen)} score(s) saved from the registration form.")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save checked scores", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            win._test = {"keep": keep, "save": save}
+            return win
+
+        def prep_brief(self, client):
+            """A half-page brief to read just before the next session."""
+            client = vault.load_client(client["id"])
+            sessions = vault.sessions_for(client["id"])
+            code, job_cfg, orient = client.get("code", ""), dict(cfg), self.settings.get("orientation", "")
+
+            def done(text):
+                rid = vault.save_report({"kind": "brief", "client_id": client["id"], "code": code, "text": text,
+                                         "created": datetime.now().isoformat(timespec="seconds"),
+                                         "end": date.today().isoformat()})
+                for old in vault.list_reports("brief", client["id"])[5:]:     # keep the latest five
+                    _quiet(vault.delete_report, old["id"])
+                self.set_status(f"{code}: pre-session brief ready.")
+                self.open_report(rid)
+            if not any((d.get("note") or "").strip() for _, d in sessions):
+                return messagebox.showinfo(APP_NAME, f"{code} has no notes yet — the brief is written from them.")
+            self.run_bg(lambda p: generate_brief(job_cfg, client, sessions, orient, p), done,
+                        lambda m: messagebox.showerror(APP_NAME, "Couldn't write the brief: " + m),
+                        label=f"writing the pre-session brief for {code}", patient=code, pausable=True)
+
+        # ======================================================== WORKSHEETS & HOMEWORK
+        def worksheet_catalog(self):
+            return worksheet_catalog(worksheet_root(cfg), os.path.join(LOCAL_DIR, "cache", "worksheets.json"))
+
+        def worksheets_add(self, parent=None):
+            paths = filedialog.askopenfilenames(parent=parent, title="Add worksheets to your library",
+                                                filetypes=[("Worksheets", "*.pdf *.docx *.txt *.md"), ("All files", "*.*")])
+            if not paths:
+                return 0
+            os.makedirs(worksheet_root(cfg), exist_ok=True)
+            n = 0
+            for pth in paths:
+                if pth.lower().endswith(WORKSHEET_TYPES):
+                    shutil.copy2(pth, os.path.join(worksheet_root(cfg), os.path.basename(pth)))
+                    n += 1
+            self.set_status(f"{n} worksheet(s) added to your library.")
+            return n
+
+        def open_worksheet_folder(self):
+            os.makedirs(worksheet_root(cfg), exist_ok=True)
+            open_path(worksheet_root(cfg))
+
+        def _review_extras(self, box, client, sid, d, day):
+            ttk.Label(box, text="Worksheets & homework", style="Strong.TLabel").pack(anchor="w", pady=(px(16), px(4)))
+            client = vault.load_client(client["id"])
+            cat = self.worksheet_catalog()
+            row = Flow(box, gap=px(8))
+            row.pack(fill="x")
+            if cat:
+                row.add(ttk.Button(row, text="Suggest worksheets", command=lambda: self.suggest_for(client, sid)))
+            else:
+                row.add(ttk.Label(row, text="Your worksheet library is empty — add your handouts and Session Scribe will "
+                                            "suggest ones that fit each session.", style="Muted.TLabel",
+                                  wraplength=px(520), justify="left"))
+                row.add(ttk.Button(row, text="Add worksheets…", command=lambda: self.worksheets_add() and
+                                   self.open_client(client["id"], select=f"day:{day}")))
+            row.add(ttk.Button(row, text="＋  Assign other homework…",
+                               command=lambda: self.assign_homework(client, sid, day)))
+            for s_ in (d.get("review") or {}).get("worksheets") or []:
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(px(6), 0))
+                top_ = ttk.Frame(card)
+                top_.pack(fill="x")
+                ttk.Label(top_, text=s_["title"], style="Strong.TLabel").pack(side="left")
+                given = any(x.get("sid") == sid and x.get("worksheet") == s_["file"] for x in client.get("homework") or [])
+                b = ttk.Button(top_, text="✓ Assigned" if given else "Assign as homework",
+                               command=lambda s_=s_: self.assign_homework(client, sid, day, s_["title"], s_["file"]))
+                b.pack(side="right")
+                if given:
+                    b.config(state="disabled")
+                ttk.Button(top_, text="Open", command=lambda f_=s_["file"]: open_path(
+                    os.path.join(worksheet_root(cfg), f_))).pack(side="right", padx=px(6))
+                ttk.Label(card, text=s_["why"], style="Muted.TLabel", wraplength=px(700), justify="left").pack(anchor="w")
+            mine = [x for x in client.get("homework") or [] if x.get("sid") == sid]
+            if mine:
+                ttk.Label(box, text="Assigned this session: " + "; ".join(
+                    f"{x['title']} ({HOMEWORK_STATUS.get(x['status'], x['status']).lower()})" for x in mine),
+                          wraplength=px(740), justify="left").pack(anchor="w", pady=(px(6), 0))
+
+        def suggest_for(self, client, sid):
+            code, job_cfg, cat = client.get("code", ""), dict(cfg), self.worksheet_catalog()
+            d = vault.load_session(sid)
+            day = d["meta"].get("session_date", "")
+
+            def done(found):
+                dd = vault.load_session(sid)
+                rv = dict(dd.get("review") or {})
+                rv["worksheets"] = found
+                dd["review"] = rv
+                vault.save_session(dd, sid)
+                self._focus_next = (sid, "review")
+                if self.client_id == client["id"] and not self.wizard:
+                    self.open_client(client["id"], select=f"day:{day}")
+                self.set_status(f"{code}: " + (f"{len(found)} worksheet suggestion(s)." if found else
+                                               "nothing in your library fits this session."))
+            self.run_bg(lambda p: suggest_worksheets(job_cfg, vault.load_client(client["id"]), d, cat, p), done,
+                        label=f"choosing worksheets for {code}", owner=("review", sid), patient=code)
+
+        def assign_homework(self, client, sid, day, title=None, worksheet=""):
+            if title is None:
+                title = simpledialog.askstring(APP_NAME, "What's the homework? (e.g. “Walk after work 3 times”)",
+                                               parent=root)
+                if not title or not title.strip():
+                    return
+            c = vault.load_client(client["id"])
+            c.setdefault("homework", []).append(homework_entry(title, day, sid, worksheet))
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self._focus_next = (sid, "review")
+            if self.client_id == client["id"] and not self.wizard:
+                self.open_client(client["id"], select=f"day:{day}")
+            self.set_status(f"{client.get('code', '')}: homework assigned — “{title.strip()[:50]}”.")
+
+        def set_homework(self, client, hid, status=None, remove=False):
+            c = vault.load_client(client["id"])
+            hw = c.get("homework") or []
+            if remove:
+                hw = [x for x in hw if x["id"] != hid]
+            else:
+                for x in hw:
+                    if x["id"] == hid:
+                        x["status"] = status
+                        x["checked"] = date.today().isoformat()
+            c["homework"] = hw
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self._insight_tab = "homework"
+            if self.client_id == client["id"] and not self.wizard:
+                self.open_client(client["id"], select="insights")
+
+        def _ins_homework(self, fr, client, sessions):
+            sc, box = scrollable(fr)
+            sc.pack(fill="both", expand=True)
+            client = vault.load_client(client["id"])
+            row = Flow(box, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="Homework and worksheets", style="Strong.TLabel"))
+            last_day = max((d["meta"].get("session_date") or "" for _, d in sessions), default=date.today().isoformat())
+            last_sid = next((sid for sid, d in sessions if d["meta"].get("session_date") == last_day), "")
+            row.add(ttk.Button(row, text="＋  Assign homework…",
+                               command=lambda: self.assign_homework(client, last_sid, last_day or date.today().isoformat())),
+                    gap=px(16))
+            hw = client.get("homework") or []
+            if not hw:
+                ttk.Label(box, text="Nothing assigned yet. Assign homework from a session's “Session review” tab "
+                                    "(with worksheet suggestions from your library) or here. Open homework goes into the "
+                                    "pre-session brief and the next note's context, so it gets followed up.",
+                          style="Muted.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(8), 0))
+                return
+            order = sorted(hw, key=lambda x: (x.get("status") != "assigned", x.get("date", "")), reverse=False)
+            for x in order:
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(px(6), 0))
+                top_ = ttk.Frame(card)
+                top_.pack(fill="x")
+                ttk.Label(top_, text=x["title"], style="Strong.TLabel" if x["status"] == "assigned" else "TLabel",
+                          wraplength=px(420), justify="left").pack(side="left")
+                ttk.Button(top_, text="Remove", command=lambda x=x: self.set_homework(client, x["id"], remove=True)).pack(
+                    side="right")
+                st = tk.StringVar(value=HOMEWORK_STATUS.get(x["status"], "Assigned"))
+                cb = ttk.Combobox(top_, textvariable=st, values=list(HOMEWORK_STATUS.values()), state="readonly",
+                                  width=12)
+                cb.pack(side="right", padx=px(6))
+                cb.bind("<<ComboboxSelected>>", lambda e, x=x, st=st: self.set_homework(
+                    client, x["id"], {v: k for k, v in HOMEWORK_STATUS.items()}[st.get()]))
+                info = f"Assigned {fmt_date(x.get('date', ''))}" + (f" · worksheet: {x['worksheet']}" if x.get("worksheet")
+                                                                    else "")
+                if x.get("checked") and x["status"] != "assigned":
+                    info += f" · followed up {fmt_date(x['checked'])}"
+                ttk.Label(card, text=info, style="Muted.TLabel").pack(anchor="w")
+
+        # ======================================================== LETTERS
+        def letter_dialog(self, client):
+            client = vault.load_client(client["id"])
+            sessions = vault.sessions_for(client["id"])
+            code = client.get("code", "")
+            win = new_window(root, f"{code} — letter or document", "820x820")
+            f = ttk.Frame(win, padding=(px(24), px(18)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Letter or document", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Drafted by the local AI from only what you tick below (names hidden while it writes, then "
+                              "filled back in on this computer). Review it before it leaves your hands.",
+                      style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), px(8)))
+            kind_var = tk.StringVar(value="attendance")
+            krow = Flow(f, gap=px(12))
+            krow.pack(fill="x")
+            for k, (nm, _) in LETTER_TYPES.items():
+                krow.add(ttk.Radiobutton(krow, text=nm, value=k, variable=kind_var))
+            grid = ttk.Frame(f)
+            grid.pack(fill="x", pady=(px(10), 0))
+            grid.columnconfigure(1, weight=1)
+            to_var = tk.StringVar()
+            ttk.Label(grid, text="To").grid(row=0, column=0, sticky="w", padx=(0, px(10)))
+            ttk.Entry(grid, textvariable=to_var).grid(row=0, column=1, sticky="ew")
+            ttk.Label(grid, text="e.g. “School counselor, Centereach High School” or “Dr. Lee, psychiatry” (add names to "
+                                 "the patient's names-to-hide list to keep them from the AI)", style="Caption.TLabel",
+                      wraplength=px(640), justify="left").grid(row=1, column=1, sticky="w")
+            ttk.Label(f, text="What it's for", style="Strong.TLabel").pack(anchor="w", pady=(px(8), px(2)))
+            pfr, ptxt = scrolled_text(f, height=3)
+            pfr.pack(fill="x")
+            ttk.Label(f, text="May share (minimum necessary)", style="Strong.TLabel").pack(anchor="w", pady=(px(8), px(2)))
+            pbox = ttk.Frame(f)
+            pbox.pack(fill="x")
+            part_vars = {k: tk.BooleanVar() for k in LETTER_PARTS}
+            for i, (k, label) in enumerate(LETTER_PARTS.items()):
+                ttk.Checkbutton(pbox, text=label, variable=part_vars[k]).grid(row=i // 2, column=i % 2, sticky="w",
+                                                                             padx=(0, px(24)))
+
+            def kind_changed(*_):
+                for k, v in part_vars.items():
+                    v.set(k in LETTER_TYPES[kind_var.get()][1])
+            kind_var.trace_add("write", kind_changed)
+            kind_changed()
+            ttk.Label(f, text="Signature", style="Strong.TLabel").pack(anchor="w", pady=(px(8), px(2)))
+            sfr, stxt = scrolled_text(f, height=3)
+            sfr.pack(fill="x")
+            set_text(stxt, self.settings.get("letter_signature") or "")
+            names_var = tk.BooleanVar(value=True)
+            ttk.Checkbutton(f, text="Fill in the patient's name after writing (done on this computer)",
+                            variable=names_var).pack(anchor="w", pady=(px(8), 0))
+            consent_var = tk.BooleanVar(value=False)
+            consent_cb = ttk.Checkbutton(f, variable=consent_var, text="")
+            consent_cb.pack(anchor="w", pady=(px(4), 0))
+
+            def consent_text(*_):
+                consent_cb.config(text="The patient asked for this letter (it goes to them)" if kind_var.get() == "attendance"
+                                  else "A signed release of information covers sharing this with this recipient")
+            kind_var.trace_add("write", consent_text)
+            consent_text()
+            msg = ttk.Label(f, text="", style="Bad.TLabel", wraplength=px(760), justify="left")
+            msg.pack(anchor="w", pady=(px(6), 0))
+            past = vault.list_reports("letter", client["id"])
+            if past:
+                prow = Flow(f, gap=px(6))
+                prow.pack(fill="x", pady=(px(6), 0))
+                prow.add(ttk.Label(prow, text="Earlier:", style="Muted.TLabel"))
+                for rp in past[:4]:
+                    prow.add(ttk.Button(prow, text=f"{rp.get('title', 'Letter')} · {fmt_date(rp['created'][:10])}",
+                                        command=lambda rp=rp: self.open_report(rp["id"])))
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+            go = ttk.Button(btns, text="Write it", style="Accent.TButton")
+            go.pack(side="right", padx=px(8))
+
+            def run():
+                if not consent_var.get():
+                    return msg.config(text="Confirm consent first: " + consent_cb.cget("text").lower() + ".")
+                parts = [k for k, v in part_vars.items() if v.get()]
+                kind, to, purpose = kind_var.get(), to_var.get(), get_text(ptxt)
+                sig = get_text(stxt).strip()
+                if sig != (self.settings.get("letter_signature") or ""):
+                    self.settings["letter_signature"] = sig
+                    vault.save_settings(self.settings)
+                job_cfg, fill_names = dict(cfg), names_var.get()
+                title = LETTER_TYPES[kind][0]
+
+                def done(text):
+                    rid = vault.save_report({"kind": "letter", "client_id": client["id"], "code": code, "title": title,
+                                             "text": text, "to": to.strip(), "shared": parts,
+                                             "created": datetime.now().isoformat(timespec="seconds")})
+                    if self._alive(win):
+                        win.destroy()
+                    self.set_status(f"{code}: {title.lower()} drafted — review it before sending.")
+                    self.open_report(rid)
+
+                def failed(m):
+                    if self._alive(win):
+                        go.config(state="normal")
+                        msg.config(text="Couldn't write it: " + m)
+                r = self.run_bg(lambda p: generate_letter(job_cfg, client, sessions, kind, to, purpose, parts, sig,
+                                                          fill_names, p),
+                                done, failed, label=f"writing a {title.lower()} for {code}", patient=code)
+                if r:
+                    go.config(state="disabled")
+                    msg.config(text="Writing… it opens when it's ready.", style="Muted.TLabel")
+            go.config(command=run)
+            win._test = {"kind": kind_var, "to": to_var, "purpose": ptxt, "parts": part_vars, "sig": stxt,
+                         "names": names_var, "consent": consent_var, "go": run, "msg": msg}
+            return win
+
+        # ======================================================== LEARNING FROM YOUR EDITS
+        def learn_from_save(self, client, kind, data):
+            """A saved session whose AI draft you changed: remember the change; every few, update the preferences."""
+            draft = data.get("ai_draft") or {}
+            new = False
+            for key in ("note", "overview"):
+                if draft.get(key) and data.get(key):
+                    new |= record_edit(self.settings, client, kind, key, draft[key], data[key])
+            if new:
+                _quiet(vault.save_settings, self.settings)
+                self.maybe_learn()
+
+        def maybe_learn(self, force=False, on_done=None):
+            pending = int(self.settings.get("edits_pending", 0))
+            if not force and pending < LEARN_AFTER:
+                return False
+            if not (self.settings.get("edit_pairs") or self.settings.get("edit_instructions")):
+                return False
+            job_cfg, snap = dict(cfg), dict(self.settings)
+
+            def done(notes):
+                s_ = vault.load_settings() or self.settings
+                if notes.strip():
+                    s_["style_notes"] = notes
+                s_["edits_pending"] = 0
+                s_["style_learned"] = datetime.now().isoformat(timespec="seconds")
+                vault.save_settings(s_)
+                self.settings = s_
+                self.set_status("Updated your writing preferences from your recent edits (Settings → Writing "
+                                "preferences).")
+                if on_done:
+                    on_done()
+            self.run_bg(lambda p: learn_style(job_cfg, snap, p), done, lambda m: None,
+                        label="learning from your edits", quiet=True, pausable=True)
+            return True
+
+        # ======================================================== REVISE WITH AI
+        def revise_dialog(self, client, sid, key, label, day):
+            d = vault.load_session(sid)
+            code = client.get("code", "")
+            win = new_window(root, f"{code} — revise {label.lower()}", "980x820")
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=f"Revise the {label.lower()} with AI", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text=f"{fmt_date(day)} · Tell the local AI what to change. You'll see every change marked "
+                              "before anything is saved, and you can undo it afterwards.", style="Muted.TLabel",
+                      wraplength=px(900), justify="left").pack(anchor="w", pady=(px(2), px(8)))
+            ins_var = tk.StringVar()
+            ent = ttk.Entry(f, textvariable=ins_var)
+            ent.pack(fill="x")
+            quick = Flow(f, gap=px(6))
+            quick.pack(fill="x", pady=(px(6), 0))
+            for q in REVISE_QUICK:
+                quick.add(ttk.Button(quick, text=q, command=lambda q=q: ins_var.set(q)))
+            status = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(900), justify="left")
+            status.pack(anchor="w", pady=(px(6), 0))
+            fr, t = scrolled_text(f, doc=True, height=20, readonly=True)
+            fr.pack(fill="both", expand=True, pady=(px(6), 0))
+            set_text(t, d.get(key, ""))
+            t.tag_configure("add", background=P("good_bg"), foreground=P("good"))
+            t.tag_configure("del", background=P("bad_bg"), foreground=P("bad"), overstrike=True)
+            state = {"new": None}
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+            save_b = ttk.Button(btns, text="Save revision", style="Accent.TButton", state="disabled")
+            save_b.pack(side="right", padx=px(8))
+            go_b = ttk.Button(btns, text="Revise", style="Accent.TButton")
+            go_b.pack(side="right")
+            revs = [r for r in d.get("revisions") or [] if r.get("key") == key]
+            if revs:
+                ttk.Button(btns, text="Undo last revision", command=lambda: undo()).pack(side="left")
+
+            def show_diff(new):
+                t.config(state="normal")
+                t.delete("1.0", "end")
+                for txt, tag in diff_marks(d.get(key, ""), new):
+                    t.insert("end", txt, tag or ())
+                t.config(state="disabled")
+
+            def go():
+                ins = ins_var.get().strip()
+                if not ins:
+                    return status.config(text="Type what to change (or pick one of the buttons).", style="Bad.TLabel")
+                job_cfg = dict(cfg)
+                record_instruction(self.settings, client_hider(client)(ins))
+                _quiet(vault.save_settings, self.settings)
+
+                def done(new):
+                    if not self._alive(win):
+                        return
+                    state["new"] = new
+                    show_diff(new)
+                    go_b.config(state="normal", text="Revise again")
+                    save_b.config(state="normal")
+                    status.config(text="Green = added, red = removed. Save it, revise again, or close to keep the "
+                                       "original.", style="Muted.TLabel")
+
+                def failed(m):
+                    if self._alive(win):
+                        go_b.config(state="normal")
+                        status.config(text="Couldn't revise it: " + m, style="Bad.TLabel")
+                r = self.run_bg(lambda p: revise_document(job_cfg, client, label, d.get(key, ""), ins, p), done, failed,
+                                label=f"revising {code}'s {label.lower()}", patient=code)
+                if r:
+                    go_b.config(state="disabled")
+                    status.config(text="Revising…", style="Muted.TLabel")
+
+            def save():
+                if state["new"] is None:
+                    return
+                dd = vault.load_session(sid)
+                dd.setdefault("revisions", []).append({"key": key, "before": dd.get(key, ""), "after": state["new"],
+                                                       "instruction": ins_var.get().strip()[:300],
+                                                       "date": datetime.now().isoformat(timespec="seconds")})
+                dd["revisions"] = dd["revisions"][-5:]
+                dd[key] = state["new"]
+                dd["meta"]["updated"] = datetime.now().isoformat(timespec="seconds")
+                if key == "note":
+                    dd.pop("goals_check", None)
+                vault.save_session(dd, sid)
+                win.destroy()
+                self._focus_next = (sid, key)
+                self.open_client(client["id"], select=f"day:{day}")
+                self.set_status(f"{code}: {label.lower()} revised and saved (Undo is in the same window).")
+
+            def undo():
+                dd = vault.load_session(sid)
+                rv = [r for r in dd.get("revisions") or [] if r.get("key") == key]
+                if not rv or not messagebox.askyesno(APP_NAME, f"Put the {label.lower()} back the way it was before "
+                                                               f"the last revision ({rv[-1]['instruction'][:60]})?",
+                                                     parent=win):
+                    return
+                dd[key] = rv[-1]["before"]
+                dd["revisions"] = [r for r in dd["revisions"] if r is not rv[-1]]
+                dd["meta"]["updated"] = datetime.now().isoformat(timespec="seconds")
+                vault.save_session(dd, sid)
+                win.destroy()
+                self._focus_next = (sid, key)
+                self.open_client(client["id"], select=f"day:{day}")
+                self.set_status(f"{code}: last revision undone.")
+            go_b.config(command=go)
+            save_b.config(command=save)
+            ent.bind("<Return>", lambda e: go())
+            ent.focus_set()
+            win._test = {"ins": ins_var, "go": go, "save": save, "text": t, "state": state, "undo": undo,
+                         "status": status}
+            return win
+
+        def draw_heat(self, parent, cols, rows, fmt=lambda v: ""):
+            """A grid: a row per item, a column per session, shaded by value (fills the width it's given)."""
+            row_h, left, top = px(24), px(170), px(22)
+            h = top + row_h * len(rows) + px(6)
+            c = register(tk.Canvas(parent, height=h, highlightthickness=0, borderwidth=0), "canvas")
+            c.configure(background=P("surface"))
+            hi = max([v for _, vals in rows for v in vals] + [1e-9])
+
+            def mix(frac):
+                a, b = P("surface2"), P("accent")
+                ca = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+                cb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+                return "#" + "".join(f"{int(x + (y - x) * frac):02x}" for x, y in zip(ca, cb))
+
+            def draw(w):
+                c.delete("all")
+                n = max(len(cols), 1)
+                cw = (w - left - px(12)) / n
+                for j, day in enumerate(cols):
+                    if n <= 12 or j % max(1, n // 8) == 0 or j == n - 1:
+                        c.create_text(left + cw * (j + 0.5), top - px(6), text=fmt_date(day)[5:] or "?",
+                                      fill=P("muted"), font=F["caption"])
+                for i, (name, vals) in enumerate(rows):
+                    y = top + i * row_h
+                    c.create_text(left - px(8), y + row_h / 2, text=name, anchor="e", fill=P("text"), font=F["caption"])
+                    for j, v in enumerate(vals):
+                        frac = min(1.0, v / hi) if v else 0.0
+                        c.create_rectangle(left + cw * j + 1, y + 2, left + cw * (j + 1) - 1, y + row_h - 2,
+                                           outline="", fill=mix(0.15 + 0.85 * frac) if v else P("surface2"))
+                        if v and cw > px(26):
+                            c.create_text(left + cw * (j + 0.5), y + row_h / 2, text=fmt(v),
+                                          fill=P("on_accent") if frac > 0.6 else P("text"), font=F["caption"])
+            c.bind("<Configure>", lambda e: draw(max(e.width, px(320))))
+            return c
+
+        def _ins_themes(self, fr, client, sessions):
+            sc, box = scrollable(fr)
+            sc.pack(fill="both", expand=True)
+            counselor, _ = self._counselor_patient()
+            th = session_themes(client, sessions, counselor)
+            ttk.Label(box, text="What the patient talks about, session by session", style="Strong.TLabel").pack(anchor="w")
+            ttk.Label(box, text="Counted on this computer from what the patient said in recorded sessions (or the note "
+                                "when there's no recording) — no AI. Darker = talked about more in that session. Names on "
+                                "the hide list are left out.", style="Caption.TLabel", wraplength=px(720),
+                      justify="left").pack(anchor="w", pady=(px(2), 0))
+            if not th["columns"]:
+                ttk.Label(box, text="No sessions to count yet.", style="Muted.TLabel").pack(anchor="w", pady=(px(8), 0))
+                return
+            cols = th["columns"][-16:]
+            k = len(th["columns"]) - len(cols)
+            days = [d for d, _ in cols]
+            if th["themes"]:
+                ttk.Label(box, text="Themes", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(4)))
+                self.draw_heat(box, days, [(t, rates[k:]) for t, rates, _ in th["themes"][:10]]).pack(
+                    fill="x", padx=(0, px(8)))
+                top3 = ", ".join(t.lower() for t, _, _ in th["themes"][:3])
+                ttk.Label(box, text=f"Most often: {top3}." + (f"  (Latest {len(cols)} sessions shown.)" if k else ""),
+                          style="Muted.TLabel").pack(anchor="w", pady=(px(4), 0))
+            if th["words"]:
+                ttk.Label(box, text="Words the patient uses most", style="Strong.TLabel").pack(anchor="w", pady=(px(14), px(4)))
+                self.draw_heat(box, days, [(f"{w}  ·  {sum(cnts)}×", cnts[k:]) for w, cnts, _ in th["words"]],
+                               fmt=lambda v: str(int(v))).pack(fill="x", padx=(0, px(8)))
+
+        # ======================================================== FOLLOW-UPS
+        def followups_refresh(self, client, sessions=None):
+            """Pick up contact notes' "Follow-up:" items; returns the fresh client."""
+            c = vault.load_client(client["id"])
+            if followups_sync(c, sessions if sessions is not None else vault.sessions_for(c["id"])):
+                vault.save_client(c)
+            return c
+
+        def set_followup(self, client, fid, done=None, remove=False, reopen=True):
+            c = vault.load_client(client["id"])
+            fus = c.get("followups") or []
+            if remove:
+                fus = [x for x in fus if x["id"] != fid]
+            else:
+                for x in fus:
+                    if x["id"] == fid:
+                        x["done"] = bool(done)
+                        x["done_at"] = date.today().isoformat() if done else ""
+            c["followups"] = fus
+            vault.save_client(c)
+            self._sig = vault.signature()
+            if reopen and self.client_id == client["id"] and not self.wizard:
+                self._insight_tab = "followups"
+                self.open_client(client["id"], select="insights")
+
+        def add_followup(self, client, text, day=None, sid=""):
+            c = vault.load_client(client["id"])
+            c.setdefault("followups", []).append({"id": uuid.uuid4().hex[:12], "text": text.strip()[:240], "sid": sid,
+                                                  "date": day or date.today().isoformat(), "source": "added by you",
+                                                  "done": False, "added": datetime.now().isoformat(timespec="seconds")})
+            vault.save_client(c)
+
+        def _ins_followups(self, fr, client, sessions):
+            sc, box = scrollable(fr)
+            sc.pack(fill="both", expand=True)
+            client = self.followups_refresh(client, sessions)
+            todo = followups_todo(sessions)
+            row = Flow(box, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="What you (or others) agreed to do", style="Strong.TLabel"))
+
+            def add():
+                t_ = simpledialog.askstring(APP_NAME, "Follow-up to remember:", parent=root)
+                if t_ and t_.strip():
+                    self.add_followup(client, t_)
+                    self._insight_tab = "followups"
+                    self.open_client(client["id"], select="insights")
+            row.add(ttk.Button(row, text="＋  Add…", command=add), gap=px(16))
+            fb = row.add(ttk.Button(row, text=f"Find follow-ups in {len(todo)} session{'s' if len(todo) != 1 else ''}"
+                                    if todo else "All sessions checked", style="Accent.TButton" if todo else "TButton",
+                                    command=lambda: self.find_followups(client)))
+            if not todo:
+                fb.config(state="disabled")
+            ttk.Label(box, text="Contact notes' “Follow-up:” lists are added by themselves; “Find follow-ups” has the local "
+                                "AI read sessions for things you said you'd do (names hidden). Tick them off as you go.",
+                      style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
+            self.progress_panel(box, owner=("followups", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
+            fus = client.get("followups") or []
+            open_ = sorted((x for x in fus if not x.get("done")), key=lambda x: x.get("date") or "")
+            done = sorted((x for x in fus if x.get("done")), key=lambda x: x.get("done_at") or "", reverse=True)
+            if not fus:
+                ttk.Label(box, text="Nothing to follow up yet.", style="Muted.TLabel").pack(anchor="w", pady=(px(8), 0))
+            for x in open_ + done[:10]:
+                r_ = ttk.Frame(box)
+                r_.pack(fill="x", pady=px(2))
+                v = tk.BooleanVar(value=bool(x.get("done")))
+                ttk.Checkbutton(r_, variable=v, text=x["text"],
+                                command=lambda x=x, v=v: self.set_followup(client, x["id"], v.get())).pack(side="left")
+                ttk.Button(r_, text="✕", width=3, command=lambda x=x: self.set_followup(client, x["id"], remove=True)).pack(
+                    side="right")
+                ttk.Label(r_, text=f"{fmt_date(x.get('date', ''))} · {x.get('source', '')}"
+                                   + (f" · done {fmt_date(x['done_at'])}" if x.get("done") and x.get("done_at") else ""),
+                          style="Muted.TLabel").pack(side="right", padx=px(8))
+
+        def find_followups(self, client):
+            client = vault.load_client(client["id"])
+            todo = followups_todo(vault.sessions_for(client["id"]))
+            if not todo:
+                return
+            code, job_cfg = client.get("code", ""), dict(cfg)
+
+            def job(p):
+                steps = _Steps(p, [(f"Finding follow-ups in the {fmt_date(d['meta'].get('session_date'))} session", 300,
+                                    len(src) + 1200) for _, d, src, _ in todo])
+                found = []
+                for i, (sid, d, src, key) in enumerate(todo):
+                    items = find_followups(job_cfg, client, d, src, steps, i)
+                    dd = vault.load_session(sid)
+                    dd["followups_scanned"] = key
+                    vault.save_session(dd, sid)
+                    found.append((sid, d["meta"].get("session_date", ""), items))
+                p("Done.", 100)
+                return found
+
+            def done(found):
+                c = vault.load_client(client["id"])
+                fus = c.setdefault("followups", [])
+                have = {(x.get("sid"), fu_norm(x["text"])) for x in fus}
+                n = 0
+                for sid, day, items in found:
+                    for it in items:
+                        if (sid, fu_norm(it)) not in have:
+                            fus.append({"id": uuid.uuid4().hex[:12], "text": it, "sid": sid, "date": day,
+                                        "source": "found in session", "done": False,
+                                        "added": datetime.now().isoformat(timespec="seconds")})
+                            have.add((sid, fu_norm(it)))
+                            n += 1
+                vault.save_client(c)
+                self._sig = vault.signature()
+                self._insight_tab = "followups"
+                if self.client_id == client["id"] and not self.wizard:
+                    self.open_client(client["id"], select="insights")
+                self.set_status(f"{code}: {n} follow-up{'s' if n != 1 else ''} found.")
+            r = self.run_bg(job, done, label=f"finding follow-ups for {code}", owner=("followups", client["id"]),
+                            patient=code, pausable=True)
+            if r and self.client_id == client["id"] and not self.wizard:
+                self._insight_tab = "followups"
+                self.open_client(client["id"], select="insights")
+
+        # ======================================================== CASELOAD DASHBOARD
+        def dashboard_data(self):
+            pairs, light = [], vault.light_sessions()
+            for c in self.clients:
+                if c.get("archived"):
+                    continue
+                try:
+                    full = vault.load_client(c["id"])
+                    sessions = light.get(c["id"], [])
+                    contacts = [(sid, d) for sid, d in sessions if d["meta"].get("kind") == "parent"]
+                    if contacts and followups_sync(full, [(sid, vault.load_session(sid)) for sid, _ in contacts]):
+                        vault.save_client(full)
+                    pairs.append((full, sessions))
+                except Exception:
+                    continue
+            return caseload(pairs)
+
+        def _dashboard(self, f):
+            hour = datetime.now().hour
+            greet = "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+            top_ = ttk.Frame(f)
+            top_.pack(fill="x")
+            ttk.Label(top_, text=greet, style="Hero.TLabel").pack(side="left")
+            bar = Flow(top_, align="right", gap=px(8))
+            bar.pack(side="right", fill="x", expand=True)
+            bar.add(ttk.Button(bar, text="📋  Supervision prep", command=self.supervision_prep))
+            bar.add(ttk.Button(bar, text="🎙  Queue recordings", command=lambda: self.open_queue()))
+            bar.add(ttk.Button(bar, text="＋  New patient", style="Accent.TButton", command=self.new_client))
+            data = self.dashboard_data()
+            n_pat = sum(1 for c in self.clients if not c.get("archived"))
+            total = sum(len(v) for k, v in data.items())
+            ttk.Label(f, text=f"Your caseload · {n_pat} active patient{'s' if n_pat != 1 else ''}"
+                              + (" · everything's up to date" if not total else ""), style="Muted.TLabel").pack(
+                anchor="w", pady=(px(2), px(12)))
+            if not self.setup_ok:
+                card = ttk.Frame(f, style="Card.TFrame", padding=(px(16), px(10)))
+                card.pack(fill="x", pady=(0, px(10)))
+                ttk.Label(card, text="Some pieces of the setup are missing.", style="Warn.TLabel").pack(side="left")
+                ttk.Button(card, text="Open Settings", command=self.open_setup).pack(side="right")
+            tiles = Flow(f, gap=px(10))
+            tiles.pack(fill="x")
+            for key, title, tone in DASH_SECTIONS:
+                n = len(data[key])
+                if not n:
+                    continue
+                t_ = tiles.add(ttk.Frame(tiles, style="Card.TFrame", padding=(px(14), px(8))))
+                ttk.Label(t_, text=str(n), style="Hero.TLabel").pack(anchor="w")
+                ttk.Label(t_, text=title, style="Bad.TLabel" if tone == "Bad" else "Muted.TLabel").pack(anchor="w")
+            sc, box = scrollable(f)
+            sc.pack(fill="both", expand=True, pady=(px(12), 0))
+            for key, title, tone in DASH_SECTIONS:
+                rows = data[key]
+                if not rows:
+                    continue
+                ttk.Label(box, text=f"{title} ({len(rows)})", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(2)))
+                for r in rows[:12]:
+                    r_ = ttk.Frame(box)
+                    r_.pack(fill="x", pady=px(1))
+                    if key == "followups":
+                        v = tk.BooleanVar(value=False)
+                        ttk.Checkbutton(r_, variable=v, command=lambda r=r: (
+                            self.set_followup(r["client"], r["fid"], True, reopen=False), self.show_home())).pack(side="left")
+                    ttk.Label(r_, text=r["client"].get("code", ""), style="Strong.TLabel", width=8).pack(side="left")
+                    ttk.Label(r_, text=r["text"], style="Bad.TLabel" if tone == "Bad" else "TLabel",
+                              wraplength=px(620), justify="left").pack(side="left", padx=(px(6), 0))
+                    ttk.Button(r_, text="Open", command=lambda r=r: self.open_client(r["client"]["id"],
+                                                                                    select=r["select"])).pack(side="right")
+                    if r["when"]:
+                        ttk.Label(r_, text=fmt_date(r["when"]), style="Muted.TLabel").pack(side="right", padx=px(8))
+                if len(rows) > 12:
+                    ttk.Label(box, text=f"…and {len(rows) - 12} more", style="Muted.TLabel").pack(anchor="w")
+            if not total:
+                ttk.Label(box, text="Nothing needs your attention right now. Drafts to review, plan reviews, risk, score "
+                                    "changes, follow-ups and homework show up here as they come in.",
+                          style="Muted.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(10), 0))
+            f._dash = data
 
         # ========================================================== WIZARD
         def start_wizard(self, client, sid=None, data=None):
@@ -8058,6 +14062,9 @@ def run_gui():
                 "audio_name": m.get("audio_name", ""),
                 "kind": m.get("kind") or ("progress" if sessions else "intake"),
                 "source": m.get("source", ""),
+                "ai_draft": d.get("ai_draft"),
+                "contact_method": m.get("contact_method", ""), "contact_with": m.get("contact_with", ""),
+                "contact_who": m.get("contact_who", ""),
                 "task": None, "ready": None, "error": None, "discarded": False,
             }
             if sid and d.get("transcript") and not d.get("lines"):
@@ -8136,7 +14143,7 @@ def run_gui():
                                                 state="readonly", width=34))
                 on_info = on_row.add(ttk.Label(on_row, text="", style="Muted.TLabel", wraplength=px(520),
                                                justify="left"))
-                want = w.get("run_on", cfg.get("remote_target") or "")
+                want = w.get("run_on", "")              # this computer unless picked for this session
                 on_var.set(next((k for k, v in on_ids.items() if v == want), next(iter(on_ids))))
 
                 def show_on(_=None):
@@ -8194,11 +14201,53 @@ def run_gui():
             details.add(ttk.Label(details, text="Session date"))
             details.add(date_field(details, date_var), gap=px(4))
             details.add(ttk.Label(details, text="Session #"), gap=px(18))
-            details.add(ttk.Entry(details, textvariable=num_var, width=6), gap=px(4))
+            num_en = ttk.Entry(details, textvariable=num_var, width=6)
+            details.add(num_en, gap=px(4))
             kind_var = tk.StringVar(value=w["kind"])
             details.add(ttk.Label(details, text="Type:"), gap=px(18))
             details.add(ttk.Radiobutton(details, text="Progress note", value="progress", variable=kind_var))
             details.add(ttk.Radiobutton(details, text="Intake (Initial Exam)", value="intake", variable=kind_var))
+            details.add(ttk.Radiobutton(details, text="External convo", value="parent", variable=kind_var))
+            with_names = dict(CONTACT_WITH)
+            with_keys = {v: k for k, v in CONTACT_WITH}
+            init_with = w.get("contact_with") or w["client"].get("external_with") or "parent"
+            with_var = tk.StringVar(value=with_names.get(init_with, with_names["parent"]))
+            with_lbl = ttk.Label(details, text="With:")
+            with_cb = ttk.Combobox(details, textvariable=with_var, state="readonly", width=30,
+                                   values=[n for _, n in CONTACT_WITH])
+            who_var = tk.StringVar(value=w.get("contact_who", ""))
+            who_lbl = ttk.Label(details, text="Role:")
+            who_en = ttk.Entry(details, textvariable=who_var, width=16)
+            details.add(with_lbl, gap=px(18))
+            details.add(with_cb, gap=px(4))
+            details.add(who_lbl, gap=px(12))
+            details.add(who_en, gap=px(4))
+            how_var = tk.StringVar(value=w.get("contact_method") or "In person (recorded)")
+            how_lbl = ttk.Label(details, text="How:")
+            how_cb = ttk.Combobox(details, textvariable=how_var, state="readonly", width=20,
+                                  values=["In person (recorded)", "Phone call (recorded)", "Video call (recorded)"])
+            details.add(how_lbl, gap=px(18))
+            details.add(how_cb, gap=px(4))
+            saved_num = {"v": num_var.get()}
+
+            def kind_changed(*_):
+                # a conversation with a parent isn't a numbered therapy session
+                if kind_var.get() == "parent":
+                    if num_var.get():
+                        saved_num["v"] = num_var.get()
+                    num_var.set("")
+                    num_en.config(state="disabled")
+                else:
+                    num_en.config(state="normal")
+                    if not num_var.get() and saved_num["v"]:
+                        num_var.set(saved_num["v"])
+                for wdg in (with_lbl, with_cb, how_lbl, how_cb):   # only matter for a contact outside sessions
+                    details.show(wdg, kind_var.get() == "parent")
+                for wdg in (who_lbl, who_en):
+                    details.show(wdg, kind_var.get() == "parent" and with_keys.get(with_var.get()) == "other")
+            kind_var.trace_add("write", kind_changed)
+            with_var.trace_add("write", kind_changed)
+            kind_changed()
 
             ttk.Label(f, text="Anything the recording won't capture? (optional)", style="H2.TLabel").grid(
                 row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
@@ -8215,6 +14264,9 @@ def run_gui():
                 w["audio"] = audio_var.get()
                 w["date"], w["number"] = date_var.get().strip(), num_var.get().strip()
                 w["kind"] = kind_var.get()
+                w["contact_method"] = how_var.get() if w["kind"] == "parent" else ""
+                w["contact_with"] = with_keys.get(with_var.get(), "parent") if w["kind"] == "parent" else ""
+                w["contact_who"] = who_var.get().strip()[:60] if w["contact_with"] == "other" else ""
                 w["observations"] = get_text(obs).strip()
                 if w["pasted"]:
                     w["transcript"] = get_text(paste_txt).strip()
@@ -8253,7 +14305,9 @@ def run_gui():
             it = {"seq": Q["seq"], "path": w["audio"], "audio_name": os.path.basename(w["audio"]),
                   "client_id": w["client"]["id"], "date": w["date"], "number": w["number"],
                   "kind": w["kind"], "observations": w.get("observations", ""), "status": "waiting", "error": "",
-                  "number_manual": bool(str(w["number"]).strip()), "kind_manual": True}
+                  "number_manual": bool(str(w["number"]).strip()), "kind_manual": True,
+                  "contact_method": w.get("contact_method", ""),
+                  "contact_with": w.get("contact_with", ""), "contact_who": w.get("contact_who", "")}
             Q["items"].append(it)
             if not it["number_manual"]:
                 self.queue_renumber()
@@ -8261,8 +14315,6 @@ def run_gui():
             if not self.remote_start([it], target, host, root, write=True):
                 Q["items"].remove(it)
                 return
-            cfg["remote_target"] = target
-            save_config(cfg)
             name = it.get("remote_name") or self._host_name(target)
             code, cid = w["client"].get("code", ""), w["client"]["id"]
             w["dirty"] = False
@@ -8473,7 +14525,7 @@ def run_gui():
                 nav.add(ttk.Button(nav, text="↶  Undo rewrite", command=undo))
             nav.add(ttk.Button(nav, text=f"Copy {labels[0].lower()}",
                                command=lambda: self.copy(get_text(note), labels[0])), gap=px(24))
-            if w["kind"] != "intake":
+            if w["kind"] == "progress":                     # the interventions lists are a progress-note thing
                 nav.add(self.note_copy_menu(nav, lambda: get_text(note)))
             nav.add(ttk.Button(nav, text=f"Copy {labels[1].lower()}",
                                command=lambda: self.copy(get_text(ov), labels[1])))
@@ -8500,7 +14552,8 @@ def run_gui():
                       or hide("\n".join(plan_goals((current_plan(client) or {}).get("text", "")))).strip()
                       or "(not provided)",
                       "observations": hide(observations) or "(not provided)",
-                      "background": hide(client.get("background", "")).strip() or "(not provided)"}
+                      "background": hide(client.get("background", "")).strip() or "(not provided)",
+                      "style_notes": self.settings.get("style_notes", "")}
             return code, hide, context, used, values
 
         def start_generation(self, instructions="", which=("first", "second")):
@@ -8510,7 +14563,13 @@ def run_gui():
             code, hide, context, used, values = self._gen_inputs(client, w["sid"], w["date"], w["number"],
                                                                  w["observations"])
             transcript, job_cfg = hide(w["transcript"]), dict(cfg)
+            if w["kind"] == "parent":
+                values["contact_method"] = w.get("contact_method") or "In person (recorded)"
+                values.update(contact_with=w.get("contact_with") or "parent", contact_who=w.get("contact_who", ""))
             instructions = hide(instructions)
+            if instructions.strip():
+                record_instruction(self.settings, instructions)
+                _quiet(vault.save_settings, self.settings)
             had_drafts = bool(w["note"] or w["overview"])
             kind, reference = w["kind"], self.settings.get("reference") or BUILTIN_REFERENCE
 
@@ -8524,6 +14583,7 @@ def run_gui():
                     w["note"] = res[0]
                 if res[1] is not None:
                     w["overview"] = res[1]
+                w["ai_draft"] = {"note": w["note"], "overview": w["overview"]}   # to learn from your edits
                 w["context_used"] = used
                 w["dirty"] = True
                 w["step"] = 3
@@ -8551,7 +14611,7 @@ def run_gui():
             if self.run_bg(lambda p: generate_documents(job_cfg, values, transcript, context, p,
                                                         kind=kind, reference=reference,
                                                         instructions=instructions, which=which), done, failed,
-                           label=f"writing notes for {code}", owner=("wizard", id(w)), patient=code):
+                           label=f"writing notes for {code}", owner=("wizard", id(w)), patient=code, pausable=True):
                 w["task"], w["error"] = "generate", None
                 w["collect"] = None
                 self.show(self._wizard_page)
@@ -8698,11 +14758,27 @@ def run_gui():
                              "audio_name": os.path.basename(w["audio"]) if w["audio"] else w.get("audio_name", ""),
                              "created": w["created"] or datetime.now().isoformat(timespec="seconds"),
                              "updated": datetime.now().isoformat(timespec="seconds"),
-                             "kind": w["kind"], "source": w.get("source", "")},
+                             "kind": w["kind"], "source": w.get("source", ""),
+                             "contact_method": w.get("contact_method", "") if w["kind"] == "parent" else "",
+                             **({"contact_with": w.get("contact_with") or "parent", "contact_who": w.get("contact_who", "")}
+                                if w["kind"] == "parent" else {})},
                     "observations": w["observations"], "transcript": w["transcript"],
                     "note": w["note"], "overview": w["overview"], "context_used": w["context_used"]}
             if w.get("lines"):
                 data.update(lines=w["lines"], roles=w["roles"], diarized=w["diarized"], aligned=w["aligned"])
+            old = {}
+            if w["sid"]:
+                try:
+                    old = vault.load_session(w["sid"])
+                except Exception:
+                    old = {}
+            for k in SESSION_EXTRA_KEYS:                # the review, risk/goals checks… stay with the session
+                if k in old and k not in data:
+                    data[k] = old[k]
+            if old and (old.get("note") or "") != (data.get("note") or ""):
+                data.pop("goals_check", None)           # the note changed: check its goals again
+            if w.get("ai_draft") or old.get("ai_draft"):
+                data["ai_draft"] = w.get("ai_draft") or old.get("ai_draft")
             try:
                 sid = vault.save_session(data, w["sid"])
                 for osid, od in (vault.sessions_for(client["id"]) if shift else []):
@@ -8713,8 +14789,10 @@ def run_gui():
             except Exception as e:
                 return messagebox.showerror(APP_NAME, f"Couldn't save: {e}")
             w["dirty"] = False
+            self.learn_from_save(client, w["kind"], data)
             msg = "Session saved to the encrypted vault."
             audio = w["audio"]
+            checkpoint_clear(audio)
             if cfg.get("delete_audio") and audio and os.path.isfile(audio):
                 if messagebox.askyesno(APP_NAME, f"Saved. Permanently delete the original recording?\n\n"
                                                  f"{audio}\n\nIt will be overwritten and removed. This "
@@ -8737,12 +14815,109 @@ def run_gui():
         # =========================================================== QUEUE
         # Several recordings, labelled up front, processed one after another while you're away:
         # transcribe → label speakers (best guess) → write the notes → save, marked "needs review".
-        QUEUE_KIND = {"Progress note": "progress", "Intake": "intake"}
+        # the queue's Type: a session kind, or a contact outside sessions and who it was with
+        QUEUE_KIND = {"Progress note": "progress", "Intake": "intake", "Patient contact": "parent:patient",
+                      "Parent convo": "parent:parent", "Collateral contact": "parent:other"}
+        QUEUE_KIND_NAME = {v: k for k, v in QUEUE_KIND.items()}
+
+        @staticmethod
+        def queue_type(it):
+            return f"parent:{contact_with(it)}" if it.get("kind") == "parent" else it.get("kind", "progress")
+
+        @staticmethod
+        def queue_set_type(it, t):
+            kind, _, with_ = t.partition(":")
+            it["kind"] = kind
+            if kind == "parent":
+                it["contact_with"] = with_ or "parent"
 
         def _q(self):
             if not hasattr(self, "queue"):
                 self.queue = {"items": [], "running": False, "stop": False, "write": True, "seq": 0}
             return self.queue
+
+        # ---- the queue is kept between runs of the app (encrypted, on this computer), until it's cleared
+        def _queue_snapshot(self):
+            Q = self._q()
+            items = []
+            for it in Q["items"]:
+                if it.get("remote_to") or it.get("remote_from"):
+                    continue                     # handed-over recordings are rebuilt from the shared folder
+                keep = {k: v for k, v in it.items() if not k.startswith("_")}
+                try:
+                    json.dumps(keep)
+                except (TypeError, ValueError):
+                    keep = json.loads(json.dumps(keep, default=lambda o: None))
+                items.append(keep)
+            return {"v": 1, "items": items, "seq": Q["seq"], "write": Q.get("write", True),
+                    "manual": bool(Q.get("manual"))}
+
+        def queue_persist(self, now=False):
+            """Write the queue if it changed (in the background; now=True: right away, e.g. when closing)."""
+            if vault.fernet is None:
+                return
+            snap = self._queue_snapshot()
+            key = json.dumps(snap, sort_keys=True)
+            if key == getattr(self, "_q_saved", None):
+                return
+            self._q_saved = key
+            token = vault.fernet.encrypt(key.encode("utf-8"))
+
+            def write():
+                with self._q_lock:
+                    if getattr(self, "_q_written", None) is token:
+                        return
+                    os.makedirs(os.path.dirname(QUEUE_FILE), exist_ok=True)
+                    vault._atomic_write(QUEUE_FILE, token)
+                    self._q_written = token
+            if now:
+                write()
+            else:
+                threading.Thread(target=lambda: _quiet(write), daemon=True).start()
+
+        def queue_persist_tick(self):
+            try:
+                self.queue_persist()
+            finally:
+                root.after(3_000, self.queue_persist_tick)
+
+        def queue_restore(self):
+            """Put back what was in the queue when the app was last closed. A recording that was being worked
+            on goes back to waiting: its transcription carries on from its last finished piece, and one that was
+            already transcribed goes straight to writing its notes."""
+            self._q_lock = threading.Lock()
+            try:
+                with open(QUEUE_FILE, "rb") as f:
+                    snap = json.loads(vault.fernet.decrypt(f.read()))
+            except FileNotFoundError:
+                return
+            except Exception:                     # unreadable (another vault?): leave the file alone
+                return
+            Q = self._q()
+            have = {it["seq"] for it in Q["items"]}
+            back, resumed = 0, 0
+            for it in snap.get("items") or []:
+                if it.get("seq") in have:
+                    continue
+                if it.get("status") in ("transcribing", "writing", "sent"):
+                    it["status"], it["error"] = "waiting", ""
+                    resumed += 1
+                if it.get("audio_secs") is None:
+                    it.pop("audio_secs", None)
+                Q["items"].append(it)
+                back += 1
+            Q["seq"] = max([Q["seq"], snap.get("seq") or 0] + [it["seq"] for it in Q["items"]])
+            Q["write"] = snap.get("write", Q.get("write", True))
+            Q["manual"] = bool(snap.get("manual")) or Q.get("manual", False)
+            self._q_saved = json.dumps(self._queue_snapshot(), sort_keys=True)
+            left = sum(1 for it in Q["items"] if it["status"] in ("waiting", "failed"))
+            if back:
+                self.queue_probe_lengths()
+                self.update_queue_button()
+                if left:
+                    self.set_status(f"The recording queue was kept from last time: {left} recording(s) still to do"
+                                    + (" — the one that was interrupted carries on from where it stopped" if resumed
+                                       else "") + ". Open the queue and press Start.")
 
         def queue_counts(self):
             items = self._q()["items"]
@@ -8788,9 +14963,14 @@ def run_gui():
                     except ValueError:
                         pass
                 n = max(nums) if nums else 0
-                for i, it in enumerate(sorted(its, key=lambda x: (x["date"], x["seq"]))):
+                i = 0
+                for it in sorted(its, key=lambda x: (x["date"], x["seq"])):
+                    if it.get("kind") == "parent":          # parent conversations aren't numbered sessions
+                        it["number"] = ""
+                        continue
                     if not it.get("kind_manual"):
                         it["kind"] = "intake" if (not existing and i == 0) else "progress"
+                    i += 1
                     if it.get("number_manual"):
                         try:
                             n = max(n, int(it["number"]))
@@ -8815,8 +14995,9 @@ def run_gui():
             f.pack(fill="both", expand=True)
             ttk.Label(f, text="Recording queue", style="Title.TLabel").pack(anchor="w")
             ttk.Label(f, text="Add several recordings, check the patient, date, type and session # for each, then "
-                              "press Start and leave the computer. Each one is transcribed and its notes are written, "
-                              "oldest first so every note builds on the ones before it. Results are saved as drafts "
+                              "press Start and leave the computer. Each one is transcribed and its notes are written, top to "
+                              "bottom — oldest first unless you drag rows (or use ▲ ▼) to change the order. "
+                              "Results are saved as drafts "
                               "marked “needs review” — speaker labels are a best guess, so check them before anything "
                               "goes in TheraNest.", style="Muted.TLabel", wraplength=px(1000),
                       justify="left").pack(anchor="w", pady=(px(2), px(10)))
@@ -8828,7 +15009,9 @@ def run_gui():
                                   ("num", "Session #", 90), ("kind", "Type", 130), ("status", "Status", 260)):
                 tv.heading(c, text=title, anchor="w")
                 tv.column(c, width=px(wdt), minwidth=px(70), stretch=(c in ("file", "status")), anchor="w")
-            tv_box.pack(fill="both", expand=True, pady=(px(8), px(8)))
+            tv_box.pack(fill="both", expand=True, pady=(px(8), px(2)))
+            order_note = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(1000), justify="left")
+            order_note.pack(anchor="w", pady=(0, px(6)))
 
             ed = ttk.LabelFrame(f, text="Selected recording(s)", padding=px(10))
             pin_bottom(ed)
@@ -8850,7 +15033,7 @@ def run_gui():
             d_en = d_fld.entry
             n_en = field("Session #", lambda pr: ttk.Entry(pr, textvariable=n_var, width=6))
             k_cb = field("Type", lambda pr: ttk.Combobox(pr, textvariable=k_var, values=list(self.QUEUE_KIND),
-                                                         state="readonly", width=14))
+                                                         state="readonly", width=17))
             ttk.Label(ed, text="Notes the recording won't capture (optional)").grid(
                 row=1, column=0, columnspan=8, sticky="w", pady=(px(8), 0))
             o_var = tk.StringVar()
@@ -8908,6 +15091,7 @@ def run_gui():
             ttk.Button(acts, text="Close", command=win.withdraw).pack(side="right")
             stop_btn = ttk.Button(acts, text="Stop after this one", command=lambda: self.queue_stop())
             halt_btn = ttk.Button(acts, text="■  Stop now", command=lambda: self.queue_halt())
+            q_pause_btn = ttk.Button(acts, text="⏸  Pause", command=self.toggle_pause)
             start_btn = ttk.Button(acts, text="▶  Start queue", style="Accent.TButton",
                                    command=lambda: self.queue_start())
             start_btn.pack(side="right", padx=px(8))
@@ -8922,6 +15106,19 @@ def run_gui():
             def row(it):
                 c = self._client_by_id(it["client_id"])
                 st = STATUS.get(it["status"], it["status"]).replace("{h}", it.get("remote_name") or "other computer")
+                pt = self.paused_task
+                if pt and pt["owner"] == ("queue",) and it["status"] in ("transcribing", "writing"):
+                    st = "⏸ Paused — " + st.rstrip("…").lower()
+                elif it["status"] in ("transcribing", "writing"):
+                    left = self.queue_running_left(it)
+                    if left is not None:
+                        notes = it["status"] == "transcribing" and it.get("write", Q["write"])
+                        st = (st.rstrip("…") + f" {self._last_pct or 0:.0f}% · " + fmt_left(left)
+                              + (" incl. notes" if notes else ""))
+                elif it["status"] == "waiting" and not it.get("remote_to"):
+                    est = self.queue_item_estimate(it)
+                    if est:
+                        st += f" (about {fmt_left(est)[1:].replace(' left', '')})"
                 if it["status"] in ("rtranscribing", "rwriting"):
                     if isinstance(it.get("rpct"), (int, float)):
                         st = st.rstrip("…") + f" {it['rpct']:.0f}%"
@@ -8944,7 +15141,7 @@ def run_gui():
                 if it.get("remote_from"):
                     name = f"From {it['remote_from']}: {name}"
                 return (name, c.get("code", "?") if c else "— choose —", fmt_date(it["date"]),
-                        it["number"], "Intake" if it["kind"] == "intake" else "Progress note", st)
+                        it["number"], self.QUEUE_KIND_NAME.get(self.queue_type(it), "Progress note"), st)
 
             def selected():
                 ids = set(tv.selection())
@@ -8961,7 +15158,7 @@ def run_gui():
                 keep = list(keep if keep is not None else tv.selection())
                 loading["on"] = True                      # rebuilding the list isn't a user selection
                 tv.delete(*tv.get_children())
-                for it in sorted(Q["items"], key=lambda x: (x["date"], x["seq"])):
+                for it in sorted(Q["items"], key=self.queue_order_key()):
                     tv.insert("", "end", iid=str(it["seq"]), values=row(it))
                 keep = [k for k in keep if tv.exists(k)]
                 if keep:
@@ -8974,8 +15171,18 @@ def run_gui():
                 waiting = sum(1 for it in Q["items"] if it["status"] in ("waiting", "failed")
                               and not it.get("remote_from"))
                 summary.config(text=(f"{total} recording{'s' if total != 1 else ''} · {done} finished"
-                                     + (" · running" if Q["running"] else "")) if total else
+                                     + (" · running" if Q["running"] else "")
+                                     + (" · your order" if Q.get("manual") else " · oldest first")) if total else
                                "No recordings yet — click “Add recordings…”.")
+                left, known = self.queue_total_left()
+                if left > 30:
+                    summary.config(text=summary.cget("text") + (" · about " if known else " · at least ")
+                                   + fmt_left(left)[1:].replace(" left", "") + " to go")
+                self.queue_probe_lengths()
+                warn = self.queue_order_warnings()
+                order_note.config(text=("⚠ " + "; ".join(warn[:3]) + ("…" if len(warn) > 3 else "") + ".")
+                                  if warn else "")
+                sort_btn.config(state="normal" if Q.get("manual") else "disabled")
                 if Q["running"]:
                     start_btn.pack_forget()
                     halt_btn.pack(side="right", padx=px(8))
@@ -8987,6 +15194,7 @@ def run_gui():
                     halt_btn.pack_forget()
                     start_btn.pack(side="right", padx=px(8))
                     start_btn.config(state="normal" if waiting else "disabled")
+                self.refresh_pause()
                 load_editor()
 
             # The editor remembers WHICH recordings it's showing. Edits always go to those, and are
@@ -9009,8 +15217,9 @@ def run_gui():
                 for it in its:
                     if p_var.get() in codes and codes[p_var.get()] != it["client_id"]:
                         it["client_id"], it["number_manual"], changed = codes[p_var.get()], False, True
-                    if k_var.get() in self.QUEUE_KIND and self.QUEUE_KIND[k_var.get()] != it["kind"]:
-                        it["kind"], it["kind_manual"], changed = self.QUEUE_KIND[k_var.get()], True, True
+                    if k_var.get() in self.QUEUE_KIND and self.QUEUE_KIND[k_var.get()] != self.queue_type(it):
+                        self.queue_set_type(it, self.QUEUE_KIND[k_var.get()])
+                        it["kind_manual"], changed = True, True
                 if len(editing["ids"]) == 1 and len(its) == 1:
                     it = its[0]
                     dv = d_var.get().strip()
@@ -9046,9 +15255,9 @@ def run_gui():
                 if its:
                     c = self._client_by_id(its[0]["client_id"])
                     same_p = len({it["client_id"] for it in its}) == 1
-                    same_k = len({it["kind"] for it in its}) == 1
+                    same_k = len({self.queue_type(it) for it in its}) == 1
                     p_var.set(c.get("code", "") if (c and same_p) else "")
-                    k_var.set(("Intake" if its[0]["kind"] == "intake" else "Progress note") if same_k else "")
+                    k_var.set(self.QUEUE_KIND_NAME.get(self.queue_type(its[0]), "Progress note") if same_k else "")
                     d_var.set(its[0]["date"] if one else "")
                     n_var.set(its[0]["number"] if one else "")
                     o_var.set(its[0].get("observations", "") if one else "")
@@ -9108,7 +15317,14 @@ def run_gui():
                                   "already finished is kept.)", parent=win):
                     return
                 self.remote_cancel_items(pending)
+                for it in its:
+                    if it.get("remote_from") and it.get("remote_job") and it["status"] not in REMOTE_FINAL:
+                        self.remote_audio_done(it)             # removed here: the sender hears it was cancelled,
+                        self.remote_mark(it, "cancelled")      # and a restart won't pick it up again
                 ids = {str(it["seq"]) for it in its}
+                for it in its:
+                    if not it.get("remote_to"):
+                        checkpoint_clear(it.get("path"))
                 Q["items"] = [it for it in Q["items"] if str(it["seq"]) not in ids]
                 self.queue_renumber()
                 refresh(())
@@ -9118,10 +15334,96 @@ def run_gui():
                 refresh(())
             ttk.Button(bar, text="＋  Add recordings…", style="Accent.TButton", command=add).pack(side="left")
             ttk.Button(bar, text="Remove", command=remove).pack(side="left", padx=px(8))
+
+            def run_here():
+                its = [it for it in selected() if it.get("remote_to") and it["status"] not in REMOTE_FINAL]
+                if not its:
+                    return messagebox.showinfo(APP_NAME, "Select a recording that was sent to your other "
+                                                         "computer, then click this to run it here instead.",
+                                               parent=win)
+                self.remote_run_here(its, win)
+            ttk.Button(bar, text="Run here instead", command=run_here).pack(side="left")
             ttk.Button(bar, text="Clear finished", command=clear_done).pack(side="left")
+
+            def reorder(seqs, keep):
+                self.queue_set_order(seqs)
+                refresh(keep)
+
+            def nudge(step):                               # ▲ / ▼ : move the selected rows one place
+                sel = list(tv.selection())
+                if not sel:
+                    return
+                rows = list(tv.get_children())
+                idx = sorted(rows.index(i) for i in sel)
+                if (step < 0 and idx[0] == 0) or (step > 0 and idx[-1] == len(rows) - 1):
+                    return
+                for i in (idx if step < 0 else reversed(idx)):
+                    rows[i], rows[i + step] = rows[i + step], rows[i]
+                reorder(rows, sel)
+            ttk.Button(bar, text="▲", width=3, command=lambda: nudge(-1)).pack(side="left", padx=(px(14), 0))
+            ttk.Button(bar, text="▼", width=3, command=lambda: nudge(1)).pack(side="left", padx=(px(4), 0))
+
+            def sort_by_date():
+                Q["manual"] = False
+                for it in Q["items"]:
+                    it.pop("order", None)
+                refresh()
+            sort_btn = ttk.Button(bar, text="Sort by date", command=sort_by_date)
+            sort_btn.pack(side="left", padx=px(8))
+
+            # drag rows to reorder: press on a row, move a little, drop where it should go
+            drag = {"rows": None, "y": 0, "moved": False}
+
+            def drag_start(e):
+                iid = tv.identify_row(e.y)
+                if not iid or tv.identify_region(e.x, e.y) != "cell":
+                    drag["rows"] = None
+                    return
+                sel = tv.selection()
+                drag.update(rows=list(sel) if iid in sel else [iid], y=e.y, moved=False)
+
+            def drag_move(e):
+                if not drag["rows"] or (not drag["moved"] and abs(e.y - drag["y"]) < px(6)):
+                    return
+                if not drag["moved"]:
+                    drag["moved"] = True
+                    tv.selection_set(drag["rows"])
+                    tv.config(cursor="sb_v_double_arrow")
+                target = tv.identify_row(e.y)
+                if not target or target in drag["rows"]:
+                    return
+                rows = [r for r in tv.get_children() if r not in drag["rows"]]
+                at = rows.index(target) + (1 if e.y > drag["y"] else 0)
+                for n, r in enumerate(drag["rows"]):
+                    tv.move(r, "", at + n)
+                drag["y"] = e.y
+                return "break"
+
+            def drag_end(_e):
+                tv.config(cursor="")
+                if drag["rows"] and drag["moved"]:
+                    reorder(list(tv.get_children()), drag["rows"])
+                drag["rows"] = None
+            def tick():                                    # keep the time-left figures moving
+                if not self._alive(win):
+                    return
+                if Q["running"] and not drag["rows"]:
+                    for it in Q["items"]:
+                        if tv.exists(str(it["seq"])):
+                            tv.item(str(it["seq"]), values=row(it))
+                    left, known = self.queue_total_left()
+                    base = summary.cget("text").split(" · about ")[0].split(" · at least ")[0]
+                    summary.config(text=base + ((" · about " if known else " · at least ")
+                                                + fmt_left(left)[1:].replace(" left", "") + " to go" if left > 30 else ""))
+                win.after(2000, tick)
+            win.after(2000, tick)
+            tv.bind("<ButtonPress-1>", drag_start, add="+")
+            tv.bind("<B1-Motion>", drag_move, add="+")
+            tv.bind("<ButtonRelease-1>", drag_end, add="+")
             self.queue_win = {"win": win, "refresh": refresh, "tv": tv, "add": add, "apply": apply,
                               "vars": (p_var, d_var, n_var, k_var, o_var), "write": write_var,
-                              "hosts": fill_hosts, "run": (run_var, run_ids, pick_host),
+                              "hosts": fill_hosts, "run": (run_var, run_ids, pick_host), "nudge": nudge,
+                              "sort": sort_by_date, "order_note": order_note, "pause_btn": q_pause_btn,
                               "rows": lambda: [tv.item(str(it["seq"]), values=row(it)) for it in Q["items"]
                                                if tv.exists(str(it["seq"]))]}
             win.protocol("WM_DELETE_WINDOW", win.withdraw)
@@ -9241,6 +15543,94 @@ def run_gui():
                 self.open_client(self.client_id)
             root.bell()
 
+        def queue_probe_lengths(self):
+            """Read the length of recordings added to the queue (FFmpeg, in the background)."""
+            todo = [it for it in self._q()["items"] if "audio_secs" not in it and not it.get("remote_to")
+                    and it["status"] in ("waiting", "failed")]
+            if not todo or getattr(self, "_probing", False):
+                return
+            self._probing = True
+            for it in todo:
+                it["audio_secs"] = None                    # being read
+
+            def work():
+                try:
+                    for it in todo:
+                        it["audio_secs"] = audio_seconds(it.get("path"))
+                finally:
+                    self._probing = False
+                    self.msgs.put(("call", self.queue_refresh))
+            threading.Thread(target=work, daemon=True).start()
+
+        def queue_item_estimate(self, it):
+            """Seconds this recording should take on this computer, start to finish (None if unknown)."""
+            secs = it.get("audio_secs")
+            if not secs:
+                return None
+            total = estimate_tx_secs(cfg.get("whisper_model") or "large-v3-turbo",
+                                     bool(self.settings.get("hf_token")), secs)
+            if it.get("write", self._q()["write"]):
+                total += estimate_write_secs(it.get("kind", "progress"), secs / 60 * CHARS_PER_AUDIO_MIN)
+            return total
+
+        def queue_running_left(self, it):
+            """Time left for the recording being processed here: this step's live estimate, plus writing
+            its notes if it's still being transcribed."""
+            live = getattr(self, "_eta_live", None)
+            if not live or self.task_owner != ("queue",):
+                return None
+            left = max(0.0, live[0] - (time.time() - live[1]))
+            if it["status"] == "transcribing" and it.get("write", self._q()["write"]):
+                secs = it.get("audio_secs") or typical_audio_secs()
+                left += estimate_write_secs(it.get("kind", "progress"), secs / 60 * CHARS_PER_AUDIO_MIN)
+            return left
+
+        def queue_total_left(self):
+            Q, total, known = self._q(), 0.0, True
+            for it in Q["items"]:
+                if it.get("remote_to"):                    # being processed on the other computer
+                    continue
+                if it["status"] in ("transcribing", "writing") and not self.paused_task:
+                    left = self.queue_running_left(it)
+                    total += left or 0.0
+                    known &= left is not None
+                elif it["status"] == "waiting" and not it.get("remote_to"):
+                    est = self.queue_item_estimate(it)
+                    total += est or 0.0
+                    known &= est is not None
+            return total, known
+
+        def queue_order_key(self):
+            """The order recordings are shown AND processed in. Oldest session first (each note can then
+            build on the earlier ones) until you drag or ▲▼ the list; from then on, exactly your order.
+            Recordings added after a manual reorder go to the bottom, in the order they were added."""
+            Q = self._q()
+            if Q.get("manual"):
+                return lambda x: (x["order"] if x.get("order") is not None else 1e9 + x["seq"],)
+            return lambda x: (x["date"], x["seq"])
+
+        def queue_set_order(self, seqs):
+            """Switch to manual order, as given (a list of seq numbers, top first)."""
+            Q = self._q()
+            pos = {int(sq): i for i, sq in enumerate(seqs)}
+            for it in Q["items"]:
+                it["order"] = pos.get(it["seq"], 1e9 + it["seq"])
+            Q["manual"] = True
+
+        def queue_order_warnings(self):
+            """Plain-language notes where the order makes a patient's later session run before an earlier one."""
+            Q, out, seen = self._q(), [], {}
+            for it in sorted((x for x in Q["items"] if x["status"] in ("waiting", "failed")
+                              and not x.get("remote_to") and not x.get("remote_from")), key=self.queue_order_key()):
+                prev = seen.get(it["client_id"])
+                if prev and it["date"] and prev["date"] and it["date"] < prev["date"]:
+                    c = self._client_by_id(it["client_id"]) or {}
+                    out.append(f"{c.get('code', '?')}: the {fmt_date(prev['date'])} session is set to run before "
+                               f"the {fmt_date(it['date'])} one, so its note won't build on it")
+                if not prev or (it["date"] or "") > (prev["date"] or ""):
+                    seen[it["client_id"]] = it
+            return out
+
         def queue_next(self):
             Q = self._q()
             if not Q["running"]:
@@ -9250,15 +15640,17 @@ def run_gui():
             waiting = sorted((it for it in Q["items"] if it["status"] == "waiting"
                               and not it.get("remote_to")                      # sent elsewhere: not ours to run
                               and (not Q.get("auto") or it.get("remote_from"))),  # auto-run: only handed-over jobs
-                             key=lambda x: (x["date"], x["seq"]))
+                             key=self.queue_order_key())          # top to bottom, as the list shows
             if not waiting:
                 return self.queue_finish()
-            if self.busy:                                  # something else grabbed the worker: try again shortly
+            if self.busy or self.paused_task:              # busy, or a recording is paused: try again shortly
                 return root.after(5000, self.queue_next)
             it = waiting[0]
             if it.get("remote_from") and remote_cancelled(remote_root(cfg), it["remote_job"]):
                 self.remote_drop_incoming(it, "cancelled")
                 return root.after(100, self.queue_next)
+            if it.get("lines") and it.get("transcript"):     # transcribed before an interruption: write its notes
+                return self.queue_write(it) if it.get("write", Q["write"]) else self.queue_save(it)
             self.queue_transcribe(it)
 
         def _queue_label(self, verb):
@@ -9323,6 +15715,10 @@ def run_gui():
                 client = vault.load_client(it["client_id"])
                 code, hide, context, used, values = self._gen_inputs(client, None, it["date"], it["number"],
                                                                      it.get("observations", ""))
+                if it.get("contact_method"):
+                    values["contact_method"] = it["contact_method"]
+                if it.get("kind") == "parent":
+                    values.update(contact_with=contact_with(it), contact_who=it.get("contact_who", ""))
             except Exception as e:
                 it["notes_error"] = friendly_error(e)
                 return self.queue_save(it)
@@ -9349,7 +15745,7 @@ def run_gui():
                                           reference=reference)
             if self.run_bg(gen, done, failed,
                            label=self._queue_label(f"writing notes for {code}"), quiet=True,
-                           owner=("queue",), patient=code):
+                           owner=("queue",), patient=code, pausable=True):
                 it["status"] = "writing"
                 self.remote_mark(it, "writing")
                 self.remote_live(it, "writing", live)
@@ -9365,6 +15761,9 @@ def run_gui():
                              "duration": it.get("duration", 0.0),
                              "audio_name": it.get("audio_name") or os.path.basename(it["path"]),
                              "created": now, "updated": now, "kind": it["kind"], "source": "queue",
+                             "contact_method": it.get("contact_method", ""),
+                             **({"contact_with": contact_with(it), "contact_who": it.get("contact_who", "")}
+                                if it.get("kind") == "parent" else {}),
                              "needs_review": True,
                              "review_reason": ("speaker labels were guessed automatically"
                                                + ("; the notes couldn't be written: " + it["notes_error"][:200]
@@ -9373,10 +15772,13 @@ def run_gui():
                     "note": it.get("note", ""), "overview": it.get("overview", ""),
                     "context_used": it.get("context_used", []),
                     "lines": it["lines"], "roles": it["roles"], "diarized": it["diarized"], "aligned": it["aligned"]}
+            if it.get("note"):
+                data["ai_draft"] = {"note": it.get("note", ""), "overview": it.get("overview", "")}
             if it.get("remote_from"):
                 data["meta"]["processed_on"] = platform.node() or "the other computer"
             try:
                 it["sid"] = vault.save_session(data)
+                checkpoint_clear(it.get("path"))         # saved: the partial transcription isn't needed
                 self.refresh_clients(self.client_id)    # sidebar shows "⚠ to review"; also resets _sig
                 it["status"] = "done" if it.get("write", self._q()["write"]) else "transcribed"
                 self.remote_mark(it, it["status"], sid=it["sid"], notes_error=it.get("notes_error", ""))
@@ -9512,6 +15914,9 @@ def run_gui():
                             # a recording from the other computer that's being worked on right now
                             "running": next((it["remote_job"] for it in Q["items"] if it.get("remote_from")
                                              and it["status"] in ("transcribing", "writing")), None),
+                            # ...and ones received here that are still waiting their turn
+                            "waiting_in": [it["remote_job"] for it in Q["items"] if it.get("remote_from")
+                                           and it.get("remote_job") and it["status"] == "waiting"],
                             "info": {"accepting": bool(cfg.get("remote_accept", True)),
                                      "can_transcribe": bool(platform_info()["supported"]) and (
                                          engine_installed() if time.time() - R["beat"] > REMOTE_BEAT_SECS
@@ -9578,11 +15983,22 @@ def run_gui():
                         snap["taken"].add(j["id"])
                         res.setdefault("ackd", {})[j["id"]] = "started"
                         res["incoming"].append((j, path))
-                    elif j.get("from") == me and (snap["rebuild"] or j["id"] in snap["out"]):
-                        if snap["rebuild"] and j["id"] not in snap["out"]:
+                    elif j.get("from") == me:
+                        if remote_cancelled(rr, j["id"]):
+                            # Called off from here: never shown again. Its files are removed once the other
+                            # computer has stopped it (or never took it, or has been gone for hours) — not
+                            # before, or a computer that's mid-way through it wouldn't know to stop.
+                            st = remote_status(vault, rr, j["id"])
+                            age = remote_calloff_age(rr, j["id"])
+                            if ((st is None and age > 120) or (st and st.get("status") in REMOTE_FINAL)
+                                    or age > REMOTE_CALLOFF_SECS):
+                                remote_cleanup(rr, j["id"])
+                                res.setdefault("cleaned", []).append(j["id"])
+                        elif snap["rebuild"] and j["id"] not in snap["out"]:
                             res["mine"].append(j)           # sent before the app was last closed
                 if snap.get("running") and remote_cancelled(rr, snap["running"]):
                     res["kill"] = snap["running"]
+                res["drop"] = [jid for jid in snap.get("waiting_in", ()) if remote_cancelled(rr, jid)]
                 if snap.get("update_due"):
                     try:
                         res["app"] = app_update_check(vault, data_root(cfg), skip=snap.get("installed"))
@@ -9602,6 +16018,14 @@ def run_gui():
             R["busy"] = False
             if res.get("ackd"):
                 R.setdefault("ackd", {}).update(res["ackd"])
+            for jid in res.get("cleaned", ()):
+                R["out"].pop(jid, None)
+            for jid in res.get("drop", ()):
+                it = next((x for x in self._q()["items"] if x.get("remote_job") == jid and x.get("remote_from")
+                           and x["status"] == "waiting"), None)
+                if it is not None:
+                    self.remote_drop_incoming(it, "cancelled")
+                    self.set_status(f"A recording from {it['remote_from']} was called off there — removed here.")
             if snap.get("update_due"):
                 R["upd_at"] = time.time()
             if res.get("app", {}).get("update"):
@@ -9690,14 +16114,16 @@ def run_gui():
                 return (f" (live progress needs the newer version on {where} — restart Session Scribe "
                         "there; it was updated automatically)")
             out = ""
-            if it.get("rtime") and it.get("rsince"):
+            if isinstance(it.get("reta"), (int, float)):
+                out = " · " + fmt_left(it["reta"] - (time.time() - it.get("rseen", time.time())))
+            elif it.get("rtime") and it.get("rsince"):
                 secs = max(0, int(it["rtime"]) - int(it["rsince"]))
                 if secs >= 20:
                     out = f" ({secs // 60}:{secs % 60:02d} on this step)"
             quiet = time.time() - it.get("rseen", time.time())
             if quiet > 150:
-                out += (f" — no update from {where} for {int(quiet // 60)} min; check that Session Scribe is "
-                        "still open there and Google Drive is syncing")
+                out += (f" — no update from {where} for {int(quiet // 60)} min. Check that Session Scribe is "
+                        "open there and Google Drive is syncing, or use “Run here instead” in the queue")
             return out
 
         # ---- sender side
@@ -9730,7 +16156,9 @@ def run_gui():
                     job = {"id": uuid.uuid4().hex, "from": me, "from_name": platform.node() or "the other computer",
                            "to": target, "created": datetime.now().isoformat(timespec="seconds"),
                            "client_id": it["client_id"], "date": it["date"], "number": it["number"],
-                           "kind": it["kind"], "observations": it.get("observations", ""), "write": it["write"]}
+                           "kind": it["kind"], "observations": it.get("observations", ""), "write": it["write"],
+                           "contact_method": it.get("contact_method", ""),
+                           "contact_with": it.get("contact_with", ""), "contact_who": it.get("contact_who", "")}
                     try:
                         job = remote_send(vault, rr, job, it["path"])
                         self.msgs.put(("call", lambda it=it, job=job: self._remote_sent(it, job)))
@@ -9760,6 +16188,8 @@ def run_gui():
             it = {"seq": Q["seq"], "path": job.get("audio_name") or "recording", "audio_name": job.get("audio_name"),
                   "client_id": job.get("client_id"), "date": job.get("date", ""), "number": job.get("number", ""),
                   "kind": job.get("kind", "progress"), "observations": job.get("observations", ""),
+                  "contact_method": job.get("contact_method", ""),
+                  "contact_with": job.get("contact_with", ""), "contact_who": job.get("contact_who", ""),
                   "status": "sent", "error": "", "remote_to": job.get("to"), "remote_job": job["id"],
                   "remote_name": self._host_name(job.get("to")), "write": job.get("write", True),
                   "number_manual": True, "kind_manual": True}
@@ -9784,6 +16214,7 @@ def run_gui():
                 it["rseen"] = time.time()                    # when WE last saw something new (our clock)
             it["rsince"] = (st or {}).get("step_since")      # when its current step began
             it["rbuild"] = (st or {}).get("build")           # its Session Scribe version (old ones send none)
+            it["reta"] = (st or {}).get("eta")               # its own estimate of the time left
             if stage == "queued":
                 it["status"] = "rqueued"               # received there, not yet started (see rreason)
             elif stage in ("transcribing", "writing"):
@@ -9879,6 +16310,42 @@ def run_gui():
             card.lift()
             root.after(15_000, lambda: self._alive(card) and card.destroy())
 
+        def remote_run_here(self, its, win=None):
+            """Pull recordings back from the other computer (calling them off there) and run them on this
+            one. The handed-over entries are detached: if the other computer confirms the call-off later,
+            that lands on the old entry and only tidies the shared folder; it can't touch the new run."""
+            Q, R = self._q(), self._rem()
+            gone = [it for it in its if not os.path.isfile(it["path"])]
+            if gone:
+                messagebox.showinfo(APP_NAME, f"{len(gone)} of these can't run here: the original recording "
+                                              f"({os.path.basename(gone[0]['path'])}) isn't on this computer "
+                                              "anymore. They stay with the other computer.", parent=win)
+            its = [it for it in its if it not in gone]
+            if not its:
+                return
+            self.remote_cancel_items(its)
+            for old in its:
+                Q["seq"] += 1
+                new = {k: old.get(k) for k in ("path", "audio_name", "client_id", "date", "number", "kind",
+                                                "observations", "write", "number_manual", "kind_manual")
+                       if old.get(k) is not None}
+                new.update(seq=Q["seq"], status="waiting", error="")
+                Q["items"][Q["items"].index(old)] = new
+            cfg["remote_target"] = ""                      # the queue runs here now
+            _quiet(save_config, cfg)
+            qw = getattr(self, "queue_win", None)
+            if qw and self._alive(qw["win"]) and qw.get("hosts"):
+                qw["hosts"]()
+            self.queue_refresh()
+            if Q["running"]:
+                Q["auto"] = False                          # a queue started for incoming jobs: include these too
+                self.set_status(f"{len(its)} recording(s) taken back — they'll run here next.")
+                return
+            if self.busy:
+                self.set_status(f"{len(its)} recording(s) taken back — they'll run here when "
+                                f"{self.task_label or 'the current task'} finishes.")
+            self.queue_start()
+
         def remote_cancel_items(self, its):
             rr = remote_root(cfg)
             for it in its:
@@ -9890,6 +16357,7 @@ def run_gui():
                     self._rem()["out"].pop(jid, None)
                 else:
                     remote_cancel(rr, jid)                 # the other computer stops it and confirms
+                    remote_drop_audio(rr, jid)             # it already has its own copy; ours isn't needed
 
         # ---- worker side
         def remote_take(self, job, path):
@@ -9904,6 +16372,8 @@ def run_gui():
             it = {"seq": Q["seq"], "path": path, "audio_name": job.get("audio_name") or "recording",
                   "client_id": job.get("client_id"), "date": job.get("date", ""), "number": job.get("number", ""),
                   "kind": job.get("kind", "progress"), "observations": job.get("observations", ""),
+                  "contact_method": job.get("contact_method", ""),
+                  "contact_with": job.get("contact_with", ""), "contact_who": job.get("contact_who", ""),
                   "status": "waiting", "error": "", "write": bool(job.get("write", True)),
                   "number_manual": True, "kind_manual": True,    # the sender already numbered it
                   "remote_job": job["id"], "remote_from": job.get("from_name") or "your other computer"}
@@ -9917,6 +16387,91 @@ def run_gui():
                 root.after(300, self.queue_next)
             else:
                 self.queue_refresh()
+
+        def test_engine(self, parent=None):
+            """Settings: transcribe a few seconds of a generated tone (no patient data) through the very
+            same worker the queue uses, and say plainly whether the speech engine works on this computer
+            and how long each part took."""
+            import math
+            import struct
+            import wave
+            path = os.path.join(LOCAL_DIR, "engine-test.wav")
+            try:
+                os.makedirs(LOCAL_DIR, exist_ok=True)
+                with wave.open(path, "wb") as w:            # 4 s, 16 kHz mono: a soft 440 Hz tone
+                    w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+                    w.writeframes(b"".join(struct.pack("<h", int(1500 * math.sin(2 * math.pi * 440 * i / 16000)))
+                                           for i in range(16000 * 4)))
+            except OSError as e:
+                return messagebox.showerror(APP_NAME, f"Couldn't create the test sound: {e}", parent=parent)
+            marks, job_cfg = {}, dict(cfg)
+
+            def job(progress):
+                marks["start"] = time.time()
+
+                def prog(t, pct=None):
+                    base = _TICK_RE.sub("", t or "")
+                    for key, word in (("model", "Loading the speech model"), ("read", "Reading the recording"),
+                                      ("tx", "Transcribing")):
+                        if base.startswith(word) and key not in marks:
+                            marks[key], marks[key + "_text"] = time.time(), base
+                    progress(t, pct)
+                transcribe(path, job_cfg, "", prog)         # no speaker step: this only checks the engine
+                marks["end"] = time.time()
+
+            def secs(a, b):
+                return f"{marks[b] - marks[a]:.0f} s" if a in marks and b in marks else "?"
+
+            def done(_):
+                _quiet(os.remove, path)
+                where = "graphics card" if "graphics card" in marks.get("model_text", "") else "processor"
+                messagebox.showinfo(APP_NAME, "The speech engine works on this computer.\n\n"
+                                    f"Starting the engine: {secs('start', 'model')}\n"
+                                    f"Loading the speech model ({job_cfg.get('whisper_model') or 'large-v3-turbo'}, "
+                                    f"on the {where}): {secs('model', 'read')}\n"
+                                    f"Whole test: {secs('start', 'end')}\n\n"
+                                    "Real recordings take longer, but this is how long the loading part takes "
+                                    "every time.", parent=parent if self._alive(parent) else None)
+                self.set_status("Speech engine test passed.")
+
+            def failed(msg):
+                _quiet(os.remove, path)
+                messagebox.showerror(APP_NAME, "The speech engine did NOT work on this computer.\n\n" + msg +
+                                     "\n\nThe technical details are under Settings → “Transcription log”.",
+                                     parent=parent if self._alive(parent) else None)
+            r = self.run_bg(job, done, failed, label="testing the speech engine", owner=("engine-test",))
+            if r == "queued":
+                messagebox.showinfo(APP_NAME, "Something is already using the speech engine on this computer:\n\n"
+                                    f"    {self.task_label or 'another task'}\n\n"
+                                    "The test will start by itself as soon as that finishes. If that task looks "
+                                    "stuck, stop it first (■ on the status bar or in the queue).",
+                                    parent=parent if self._alive(parent) else None)
+
+        def show_worker_log(self, parent=None):
+            """Settings: the technical log of the last two transcriptions on this computer. It stays on this
+            computer, and the recording's file name is blanked out of it."""
+            text = worker_log_text() or "No transcription has run on this computer since this version was installed."
+            w = new_window(parent or root, "Transcription log", "820x560")
+            outer = ttk.Frame(w, padding=px(14))
+            outer.pack(fill="both", expand=True)
+            ttk.Label(outer, text="Technical details from the last transcriptions on this computer. It never leaves "
+                                  "this computer; recording file names are replaced with <recording>.",
+                      style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(0, px(8)))
+            box = register(tk.Text(outer, wrap="none", relief="flat", borderwidth=0, highlightthickness=1,
+                                   font=F["mono"], padx=px(10), pady=px(8)), "log")
+            box.insert("1.0", text)
+            box.config(state="disabled")
+            box.see("end")
+            box.pack(fill="both", expand=True)
+            row = ttk.Frame(outer)
+            row.pack(fill="x", pady=(px(8), 0))
+
+            def copy():
+                root.clipboard_clear()
+                root.clipboard_append(text)
+                self.set_status("Transcription log copied.")
+            ttk.Button(row, text="Copy", command=copy).pack(side="left")
+            ttk.Button(row, text="Close", command=w.destroy).pack(side="right")
 
         def remote_mark(self, it, status, **extra):
             """Worker: tell the sender how its recording is doing (encrypted status file)."""
@@ -9942,13 +16497,8 @@ def run_gui():
                 tok = holder.get("tok")
                 return tok is None or not tok.is_set()
 
-            def beat(text, pct, secs):
-                # a long step with nothing new to report (e.g. the model loading): show it's alive here too
-                if secs >= 15 and self.busy and self.task_owner == ("queue",):
-                    m, s = divmod(int(secs), 60)
-                    self.msgs.put(("status", f"{text.rstrip('…')}… ({m}:{s:02d})", pct, holder.get("tok")))
             holder["pub"] = it["_pub"] = RemoteProgressPublisher(vault, remote_root(cfg), it["remote_job"],
-                                                                 stage, alive=alive, on_beat=beat)
+                                                                 stage, alive=alive)
 
         def remote_audio_done(self, it):
             """Worker: the recording has been transcribed (or failed) — delete both copies of it."""
@@ -9992,6 +16542,8 @@ def run_gui():
                                  style="Strong.TLabel"))
             all_btn = pc_top.add(ttk.Button(pc_top, text="Set up everything for this computer",
                                             style="Accent.TButton"))
+            pc_top.add(ttk.Button(pc_top, text="Test the speech engine", command=lambda: self.test_engine(win)))
+            pc_top.add(ttk.Button(pc_top, text="Transcription log", command=lambda: self.show_worker_log(win)))
             pc_note = ttk.Label(pc, text="", style="Muted.TLabel", wraplength=px(760), justify="left")
             pc_note.pack(anchor="w", pady=(px(4), 0))
 
@@ -10172,6 +16724,129 @@ def run_gui():
                 sync_lbl.config(text="Checking both computers' files…", style="Muted.TLabel")
                 self.sync_now(show_sync)
             sync_btn.config(command=do_sync)
+
+            # ---- phone: the iPhone page reads the vault from Drive; this computer answers what needs it
+            ph = ttk.LabelFrame(outer, text="Phone", padding=px(10))
+            ph.pack(fill="x", pady=(px(10), 0))
+            phone_var = tk.BooleanVar(value=bool(cfg.get("phone_relay")))
+
+            def save_phone():
+                cfg["phone_relay"] = phone_var.get()
+                save_config(cfg)
+                self._ph["last"], self._ph["isig"] = None, None       # publish right away
+                show_phone()
+            ttk.Checkbutton(ph, text="Phone access: let my phone ask questions and run the queue on this computer, "
+                                     "and keep the phone's patient list current", variable=phone_var,
+                            command=save_phone).pack(anchor="w")
+            ttk.Label(ph, text="The phone reads and edits notes straight from your Google Drive, encrypted, even when "
+                               "this computer is off. It sends questions and queue commands through the same folder, "
+                               "encrypted with your vault key. Nothing is stored on the phone.",
+                      style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), px(6)))
+            phrow = Flow(ph, gap=px(8))
+            phrow.pack(fill="x")
+            phrow.add(ttk.Button(phrow, text="Make the phone page…", command=lambda: self.phone_page_dialog(win)))
+            phone_info = ttk.Label(ph, text="", style="Muted.TLabel", wraplength=px(760), justify="left")
+            phone_info.pack(anchor="w", pady=(px(6), 0))
+            phone_devs = ttk.Frame(ph)
+            phone_devs.pack(fill="x", pady=(px(4), 0))
+
+            def remove_phone(d):
+                if not messagebox.askyesno(APP_NAME, f"Turn off Face ID unlock for “{d['name']}”? That phone will need "
+                                                     "your vault password next time.", parent=win):
+                    return
+                try:
+                    os.remove(d["path"])
+                except OSError as e:
+                    return messagebox.showerror(APP_NAME, f"Couldn't remove it: {e}", parent=win)
+                phone_log(f"Face ID unlock removed for {d['name'][:40]}")
+                show_phone()
+
+            def show_phone():
+                if not phone_info.winfo_exists():
+                    return
+                url = cfg.get("phone_page_url") or ""
+                lines = [("Phone page: " + url) if url else "Phone page: not made yet — click “Make the phone page…”."]
+                if phone_var.get():
+                    lines.append("This computer answers the phone while Session Scribe is open (locked is fine).")
+                log = phone_log_tail(5)
+                if log:
+                    lines.append("Recent phone requests:\n" + "\n".join("   " + ln for ln in log))
+                phone_info.config(text="\n".join(lines))
+                for w_ in phone_devs.winfo_children():
+                    w_.destroy()
+                devs = phone_devices(cfg)
+                if devs:
+                    ttk.Label(phone_devs, text="Phones with Face ID + PIN unlock:", style="Strong.TLabel").pack(anchor="w")
+                for d in devs:
+                    r_ = ttk.Frame(phone_devs)
+                    r_.pack(fill="x", pady=(px(2), 0))
+                    ttk.Label(r_, text=f"• {d['name']}  ·  set up {fmt_date(d['created'][:10])}").pack(side="left")
+                    ttk.Button(r_, text="Remove", command=lambda d=d: remove_phone(d)).pack(side="right")
+            show_phone()
+
+            # ---- writing preferences learned from your edits
+            wp = ttk.LabelFrame(outer, text="Writing preferences (learned from your edits)", padding=px(10))
+            wp.pack(fill="x", pady=(px(10), 0))
+            ttk.Label(wp, text="When you change an AI draft before saving it, Session Scribe remembers the change "
+                               "(encrypted, names hidden). Every few edits the local AI updates this list, and every "
+                               "new draft follows it. Edit it yourself any time.", style="Muted.TLabel",
+                      wraplength=px(760), justify="left").pack(anchor="w")
+            wpf, wp_txt = scrolled_text(wp, height=6)
+            wpf.pack(fill="x", pady=(px(6), 0))
+            set_text(wp_txt, self.settings.get("style_notes", ""))
+            wp_row = Flow(wp, gap=px(8))
+            wp_row.pack(fill="x", pady=(px(6), 0))
+            wp_info = ttk.Label(wp, text="", style="Muted.TLabel")
+
+            def wp_status():
+                n_p, n_e = int(self.settings.get("edits_pending", 0)), len(self.settings.get("edit_pairs") or [])
+                wp_info.config(text=f"{n_e} edited draft{'s' if n_e != 1 else ''} remembered; {n_p} new since the last "
+                                    "update" + (f" (updated {fmt_date(self.settings['style_learned'][:10])})"
+                                                if self.settings.get("style_learned") else "") + ".")
+
+            def wp_save():
+                self.settings["style_notes"] = get_text(wp_txt).strip()
+                vault.save_settings(self.settings)
+                wp_info.config(text="Saved.")
+
+            def wp_learn():
+                if not self.maybe_learn(force=True, on_done=lambda: wpf.winfo_exists() and (
+                        set_text(wp_txt, self.settings.get("style_notes", "")), wp_status())):
+                    wp_info.config(text="Nothing to learn from yet — edit a few AI drafts before saving them.")
+                else:
+                    wp_info.config(text="Learning… (the list updates when it's done)")
+
+            def wp_clear():
+                if messagebox.askyesno(APP_NAME, "Forget the remembered edits and clear this list?", parent=win):
+                    for k in ("style_notes", "edit_pairs", "edit_instructions", "edits_pending", "style_learned"):
+                        self.settings.pop(k, None)
+                    vault.save_settings(self.settings)
+                    set_text(wp_txt, "")
+                    wp_status()
+            wp_row.add(ttk.Button(wp_row, text="Save", command=wp_save))
+            wp_row.add(ttk.Button(wp_row, text="Learn from my edits now", command=wp_learn))
+            wp_row.add(ttk.Button(wp_row, text="Forget and clear", command=wp_clear))
+            wp_info.pack(anchor="w", pady=(px(4), 0))
+            wp_status()
+
+            # ---- worksheet library (your own handouts, in the shared data folder)
+            wl = ttk.LabelFrame(outer, text="Worksheet library", padding=px(10))
+            wl.pack(fill="x", pady=(px(10), 0))
+            wl_info = ttk.Label(wl, text="", style="Muted.TLabel", wraplength=px(760), justify="left")
+            wl_info.pack(anchor="w")
+            wl_row = Flow(wl, gap=px(8))
+            wl_row.pack(fill="x", pady=(px(6), 0))
+
+            def show_library():
+                if wl_info.winfo_exists():
+                    n = len(self.worksheet_catalog())
+                    wl_info.config(text=f"{n} worksheet{'s' if n != 1 else ''} in your library ({worksheet_root(cfg)}). "
+                                        "Add your own handouts (PDF, Word or text); after a session, “Suggest worksheets” "
+                                        "on its Session review tab picks ones that fit. Handouts only — no patient "
+                                        "information goes in this folder.")
+            wl_row.add(ttk.Button(wl_row, text="Add worksheets…", command=lambda: (self.worksheets_add(win), show_library())))
+            wl_row.add(ttk.Button(wl_row, text="Open folder", command=self.open_worksheet_folder))
+            show_library()
 
             prefs = ttk.LabelFrame(outer, text="Preferences", padding=10)
             sv = {k: tk.StringVar(value=str(cfg[k])) for k in
@@ -10691,11 +17366,317 @@ def run_gui():
                     win.after(700, lambda: win.winfo_exists() and run_all())
 
         # ========================================================== LOCKING
+        # ------------------------------------------------------ phone (through the shared Drive folder)
+        def phone_init(self):
+            self._ph = {"q": queue.Queue(), "last": None, "at": 0.0, "isig": None, "iat": 0.0, "done": set(),
+                        "scanning": False, "tidied": 0.0, "ready": False}
+            threading.Thread(target=self._phone_worker, daemon=True).start()
+            root.after(3000, self.phone_tick)
+
+        def _phone_worker(self):
+            """Drive reads and writes for the phone happen here, one at a time, never on the window's thread."""
+            while True:
+                fn = self._ph["q"].get()
+                try:
+                    fn()
+                except Exception:          # noqa: BLE001 — a failed write is retried on the next tick
+                    pass
+
+        def _ph_do(self, fn):
+            self._ph["q"].put(fn)
+
+        def phone_on(self):
+            return bool(cfg.get("phone_relay")) and vault.fernet is not None and bool(cfg.get("data_dir"))
+
+        def phone_tick(self):
+            try:
+                if self.phone_on():
+                    if not self._ph["ready"]:
+                        self._ph_do(lambda: (phone_prepare(cfg), self._ph.__setitem__("ready", True)))
+                    now = time.time()
+                    st = self.phone_status()
+                    key = json.dumps(st, sort_keys=True, default=str)
+                    if key != self._ph["last"] or now - self._ph["at"] > 40:
+                        self._ph["last"], self._ph["at"] = key, now
+                        path = os.path.join(phone_root(cfg), f"status-{this_computer()}.enc")
+                        self._ph_do(lambda st=dict(st, time=now): phone_write(vault, path, st))
+                    sig = getattr(self, "_sig", None)
+                    if sig != self._ph["isig"] or now - self._ph["iat"] > 600:
+                        self._ph["isig"], self._ph["iat"] = sig, now
+                        clients = [{"id": c["id"], "code": c.get("code", "")} for c in self.all_clients]
+                        self._ph_do(lambda: self._phone_publish_index(clients))
+                    if not self._ph["scanning"]:
+                        self._ph["scanning"] = True
+                        self._ph_do(self._phone_scan)
+            finally:
+                root.after(4000, self.phone_tick)
+
+        def phone_status(self):
+            """What the phone's Queue tab shows for this computer (encrypted before it's written)."""
+            Q = self._q()
+            items = []
+            for it in sorted(Q["items"], key=self.queue_order_key()):
+                c = self._client_by_id(it.get("client_id")) or {}
+                left = None
+                try:
+                    if it["status"] in ("transcribing", "writing"):
+                        left = self.queue_running_left(it)
+                    elif it["status"] == "waiting" and not it.get("remote_to"):
+                        left = self.queue_item_estimate(it)
+                except Exception:          # noqa: BLE001
+                    left = None
+                items.append({"seq": it["seq"], "code": c.get("code", "?"), "date": it.get("date", ""),
+                              "kind": it.get("kind", ""), "number": it.get("number", ""), "status": it["status"],
+                              "error": (it.get("error") or "")[:200], "left": round(left) if left else None,
+                              "remote": bool(it.get("remote_to") or it.get("remote_from"))})
+            try:
+                total, known = self.queue_total_left()
+            except Exception:              # noqa: BLE001
+                total, known = 0, False
+            live = getattr(self, "_eta_live", None)
+            left = max(0.0, live[0] - (time.time() - live[1])) if live and self.busy else None
+            pt = self.paused_task
+            return {"v": 1, "computer": this_computer(), "name": platform.node() or this_computer(), "build": APP_BUILD,
+                    "locked": bool(self.locked), "lm_ready": isinstance(self.lm_status, list) and bool(self.lm_status),
+                    "busy": bool(self.busy), "task": self.task_label or "",
+                    "status": (self.status.cget("text") if self.busy or pt else ""),
+                    "pct": round(self._last_pct, 1) if self.busy and getattr(self, "_last_pct", None) is not None else None,
+                    "left": round(left) if left is not None else None,
+                    "paused": bool(pt), "can_pause": bool(self.can_pause()),
+                    "queue": {"running": bool(Q["running"]), "stop": bool(Q["stop"]), "items": items,
+                              "left": round(total) if known and total else None}}
+
+        def _phone_publish_index(self, clients):
+            idx = vault.session_index()
+            with vault._ilock:
+                sizes = {sid: st[1] for sid, (st, _) in vault._idx.items()}
+            phone_write(vault, os.path.join(phone_root(cfg), f"index-{this_computer()}.enc"),
+                        {"v": 1, "computer": this_computer(), "time": time.time(), "clients": clients,
+                         "sessions": {sid: {"m": {k: v for k, v in m.items() if k != "_x"}, "z": sizes.get(sid)}
+                                      for sid, m in idx.items()}})
+
+        def _phone_scan(self):
+            """(worker thread) New requests from the phone for this computer."""
+            from cryptography.fernet import InvalidToken
+            try:
+                base = phone_root(cfg)
+                rq = os.path.join(base, "requests")
+                try:
+                    names = os.listdir(rq)
+                except OSError:
+                    return
+                for fn in names:
+                    if not fn.endswith(".enc"):
+                        continue
+                    rid, path = fn[:-4], os.path.join(rq, fn)
+                    if rid in self._ph["done"]:
+                        continue
+                    try:
+                        with open(path, "rb") as f:
+                            token = f.read()
+                        req = json.loads(vault.fernet.decrypt(token, ttl=PHONE_REQ_TTL))
+                    except (OSError, ValueError):
+                        continue                                   # still arriving
+                    except InvalidToken:
+                        try:                                       # too old (or not from this vault)
+                            if time.time() - os.path.getmtime(path) > PHONE_REQ_TTL:
+                                os.remove(path)
+                        except OSError:
+                            pass
+                        continue
+                    if req.get("to") != this_computer() or req.get("id") != rid:
+                        continue                                   # for the other computer
+                    self._ph["done"].add(rid)
+                    _quiet(os.remove, path)
+                    self.msgs.put(("call", lambda req=req: self._phone_handle(req)))
+                if time.time() - self._ph["tidied"] > 600:
+                    self._ph["tidied"] = time.time()
+                    rp = os.path.join(base, "replies")
+                    for fn in os.listdir(rp) if os.path.isdir(rp) else []:
+                        p = os.path.join(rp, fn)
+                        try:
+                            if time.time() - os.path.getmtime(p) > PHONE_REPLY_KEEP:
+                                os.remove(p)
+                        except OSError:
+                            pass
+            finally:
+                self._ph["scanning"] = False
+
+        def _phone_reply(self, rid, **reply):
+            path = os.path.join(phone_root(cfg), "replies", f"{rid}.enc")
+            data = dict(reply, id=rid, computer=this_computer(), time=time.time())
+            self._ph_do(lambda: phone_write(vault, path, data))
+
+        def _phone_handle(self, req):
+            rid, kind = req["id"], req.get("type")
+            phone_log(f"{kind}{(' ' + str(req.get('action'))) if req.get('action') else ''} from "
+                      f"{str(req.get('device') or 'phone')[:40]}")
+            try:
+                if kind == "ping":
+                    return self._phone_reply(rid, state="done", text="ok")
+                if kind == "ask":
+                    return self._phone_ask(req)
+                if kind == "queue":
+                    ok, text = self._phone_queue(req.get("action"), req.get("seq"))
+                    self._phone_reply(rid, state="done" if ok else "error", text=text)
+                    self._ph["last"] = None                         # show the change on the phone right away
+                    return
+                self._phone_reply(rid, state="error", text="This computer's Session Scribe is too old for that — "
+                                                           "update it.")
+            except Exception as e:         # noqa: BLE001
+                self._phone_reply(rid, state="error", text="Couldn't do that: " + friendly_error(e)[:200])
+
+        def _phone_ask(self, req):
+            rid = req["id"]
+            client = self._client_by_id(req.get("cid"))
+            if client is None:
+                self.refresh_clients()
+                client = self._client_by_id(req.get("cid"))
+            if client is None:
+                return self._phone_reply(rid, state="error", text="That patient hasn't reached this computer yet "
+                                                                  "(Google Drive is still syncing). Try again shortly.")
+            if not (isinstance(self.lm_status, list) and self.lm_status):
+                return self._phone_reply(rid, state="error", text=f"LM Studio isn't running on "
+                                                                  f"{platform.node() or 'this computer'}.")
+            question = str(req.get("question") or "").strip()[:4000]
+            if not question:
+                return self._phone_reply(rid, state="error", text="The question was empty.")
+            live = {"at": 0.0}
+
+            def text(t):
+                if time.time() - live["at"] >= 2.0:
+                    live["at"] = time.time()
+                    self._phone_reply(rid, state="working", text=t)
+            self._phone_reply(rid, state="working", text="")
+            self._ask_send(client, req.get("chat_id"), question, hooks={
+                "text": text,
+                "waiting": lambda t: self._phone_reply(rid, state="waiting", text=t),
+                "done": lambda answer, chat_id: self._phone_reply(rid, state="done", text=answer, chat_id=chat_id),
+                "failed": lambda msg: self._phone_reply(rid, state="error", text=msg)})
+
+        def _phone_queue(self, action, seq):
+            """A queue command from the phone. Never opens a dialog (nobody may be at the computer):
+            anything that would need one is answered with what to do instead."""
+            Q = self._q()
+            if action == "pause":
+                if not self.can_pause():
+                    return False, "Nothing that can be paused is running."
+                self.pause_task(why="Paused from your phone. Resume it from the phone or here.")
+                return True, "Paused."
+            if action == "resume":
+                if not self.paused_task:
+                    return False, "Nothing is paused."
+                self.resume_task()
+                return True, "Resumed."
+            if action == "stop":
+                if not Q["running"]:
+                    return False, "The queue isn't running."
+                self.queue_stop()
+                return True, "The queue will stop after the recording in progress."
+            if action == "start":
+                if Q["running"]:
+                    return False, "The queue is already running."
+                todo = [it for it in Q["items"] if it["status"] in ("waiting", "failed") and not it.get("remote_from")]
+                if not todo:
+                    return False, "Nothing is waiting in the queue."
+                if any(not self._client_by_id(it["client_id"]) for it in todo):
+                    return False, "A recording in the queue has no patient chosen — choose it on the computer."
+                gone = [it for it in todo if not os.path.isfile(it["path"])]
+                if gone:
+                    return False, "A recording in the queue can't be found on the computer anymore."
+                if cfg.get("remote_target"):
+                    return False, "The queue is set to send recordings to your other computer — start it on the computer."
+                if not engine_installed():
+                    return False, "The speech engine isn't set up on this computer."
+                if Q["write"] and not (isinstance(self.lm_status, list) and self.lm_status):
+                    return False, "LM Studio isn't running, so the notes couldn't be written. Start LM Studio first."
+                if self.busy:
+                    return False, f"Another task is running ({self.task_label}). Start the queue when it finishes."
+                self.queue_start()
+                return (True, "Queue started.") if Q["running"] else (False, "The queue didn't start.")
+            if action in ("up", "down"):
+                order = sorted(Q["items"], key=self.queue_order_key())
+                movable = [it for it in order if it["status"] in ("waiting", "failed")
+                           and not it.get("remote_to") and not it.get("remote_from")]
+                it = next((x for x in movable if x["seq"] == seq), None)
+                if it is None:
+                    return False, "That recording can't be moved now."
+                i = movable.index(it)
+                j = i - 1 if action == "up" else i + 1
+                if not 0 <= j < len(movable):
+                    return False, "It's already at the " + ("top." if action == "up" else "bottom.")
+                a, b = order.index(movable[i]), order.index(movable[j])
+                order[a], order[b] = order[b], order[a]
+                self.queue_set_order([x["seq"] for x in order])
+                self.queue_refresh()
+                return True, "Moved " + action + "."
+            return False, "Unknown queue command."
+
+        def phone_page_dialog(self, parent):
+            """Make the phone page (index.html) to put on your own web address (e.g. GitHub Pages)."""
+            win = new_window(parent, "Make the phone page", "760x640")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(24), px(18)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Make the phone page", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="The phone page is one file (index.html) with no patient information in it. Put it at a web "
+                              "address only you control — for example a free GitHub Pages site with two-step sign-in "
+                              "turned on — then open that address in Safari on your iPhone and choose Share → Add to "
+                              "Home Screen.\n\n"
+                              "1. Choose the address first (e.g. https://yourname.github.io/scribe/).\n"
+                              "2. In Google Cloud Console (signed in with the Workspace account that holds your Session "
+                              "Scribe folder): create a project, turn on the Google Drive API, set the OAuth consent screen "
+                              "to Internal, and create an OAuth client ID of type “Web application”. Add the address's "
+                              "origin (https://yourname.github.io) under Authorized JavaScript origins, and the full "
+                              "address under Authorized redirect URIs.\n"
+                              "3. Paste both below, save index.html, and upload it to that address.\n"
+                              "4. Turn on Phone access in Settings (on one or both computers).",
+                      style="Muted.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(4), px(10)))
+            url_var = tk.StringVar(value=cfg.get("phone_page_url") or "")
+            cid_var = tk.StringVar(value=cfg.get("phone_client_id") or "")
+            ttk.Label(f, text="Phone page address", style="Strong.TLabel").pack(anchor="w")
+            ttk.Entry(f, textvariable=url_var).pack(fill="x", pady=(px(2), px(8)))
+            ttk.Label(f, text="Google sign-in client ID (ends in .apps.googleusercontent.com)", style="Strong.TLabel").pack(anchor="w")
+            ttk.Entry(f, textvariable=cid_var).pack(fill="x", pady=(px(2), px(8)))
+            msg = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(700), justify="left")
+            msg.pack(anchor="w")
+
+            def save():
+                url, cid = url_var.get().strip(), cid_var.get().strip()
+                if not phone_page_url_ok(url):
+                    return msg.config(text="The address must start with https:// (for example "
+                                           "https://yourname.github.io/scribe/).", style="Bad.TLabel")
+                if not re.match(r"^[0-9]+-[A-Za-z0-9_]+\.apps\.googleusercontent\.com$", cid):
+                    return msg.config(text="That doesn't look like a Google client ID (it ends in "
+                                           ".apps.googleusercontent.com).", style="Bad.TLabel")
+                if not url.endswith("/") and not url.lower().endswith(".html"):
+                    url += "/"
+                path = filedialog.asksaveasfilename(parent=win, title="Save the phone page", initialfile="index.html",
+                                                    defaultextension=".html", filetypes=[("Web page", "*.html")])
+                if not path:
+                    return
+                try:
+                    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                        fh.write(make_phone_page(cid, url))
+                except OSError as e:
+                    return msg.config(text=f"Couldn't save it: {e}", style="Bad.TLabel")
+                cfg["phone_page_url"], cfg["phone_client_id"] = url, cid
+                save_config(cfg)
+                msg.config(text=f"Saved {os.path.basename(path)}. Upload it so it opens at {url} — then open that "
+                                "address on your iPhone. Make the page again after Session Scribe updates, to get "
+                                "the newest phone version.", style="Good.TLabel")
+            bar = ttk.Frame(f)
+            bar.pack(fill="x", pady=(px(12), 0))
+            ttk.Button(bar, text="Save index.html…", style="Accent.TButton", command=save).pack(side="left")
+            ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+
         def lock(self):
             if self.locked:
                 return
             self.locked = True
             self.clear_clipboard()
+            vault.save_local_index()
+            vault.forget_plaintext()                  # nothing decrypted stays in memory while locked
             if self._alive(getattr(self, "_toast", None)):
                 self._toast.destroy()                  # it can name a patient
             if self.setup_win is not None:
@@ -10768,11 +17749,20 @@ def run_gui():
             if unsaved and not messagebox.askyesno(
                     APP_NAME, f"The {unsaved[0]['client'].get('code', '')} session isn't saved. Quit anyway?"):
                 return
+            _quiet(self.queue_persist, True)           # what's in the queue is there again next time
             self.cancel_task(None, "Closing.")        # stop the transcription process / LM Studio request too
             self.clear_clipboard()
+            wipe_open_copies()                         # readable copies made by "Open"
+            _quiet(vault.save_local_index)
             root.destroy()
 
     def start():
+        # Each launch starts with "Process on: this computer". Sending work to the other computer is
+        # chosen each time, never inherited — so a closed or stuck computer can't silently swallow jobs.
+        if cfg.get("remote_target"):
+            cfg["remote_target"] = ""
+            _quiet(save_config, cfg)
+        wipe_open_copies()                             # left over if the app was killed last time
         root._app = App()
 
     # ------------------------------------------------------- data folder
