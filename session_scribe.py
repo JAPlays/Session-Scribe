@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.8"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.9"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13083,6 +13083,9 @@ def run_gui():
             ttk.Label(name_row, text=client.get("code", ""), style="Title.TLabel").pack(side="left")
             if client.get("archived"):
                 ttk.Label(name_row, text="🗄  Archived", style="ChipWarn.TLabel").pack(side="left", padx=px(10))
+            if client.get("termination"):
+                ttk.Label(name_row, text=f"Terminated {fmt_date(client['termination'].get('date', ''))}",
+                          style="ChipMuted.TLabel").pack(side="left", padx=px(6))
             days = group_by_date(sessions)
             last = days[-1][0] if days else ""
             ttk.Label(titles, text=f"{len(days)} session{'s' if len(days) != 1 else ''}"
@@ -13240,6 +13243,12 @@ def run_gui():
                 items.append(("insights", None))
                 flags = self.insight_flags(client, sessions)
                 lb.insert("end", "📈  Progress & risk" + (f"  · {flags}" if flags else ""))
+                items.append(("assess", None))
+                n_as = len(client.get("measures") or []) + len(client.get("assessments") or [])
+                lb.insert("end", "🧾  Assessments" + (f"  · {n_as}" if n_as else ""))
+                items.append(("term", None))
+                term = client.get("termination")
+                lb.insert("end", "📄  Termination" + (f"  · {fmt_date(term.get('date', ''))}" if term else ""))
                 for day, records in (reversed(days) if newest_first() else days):
                     items.append(("day", day))
                     n_docs = len(day_docs(records))
@@ -13268,8 +13277,12 @@ def run_gui():
                         self._render_day(viewer, client, val["day"], dict(days)[val["day"]],
                                          focus=(val["sid"], val["key"]), query=q)
                     return
-                self.view_select = kind if kind in ("case", "plan", "ask", "insights") else f"day:{val}"
-                if kind == "ask":
+                self.view_select = kind if kind in ("case", "plan", "ask", "insights", "assess", "term") else f"day:{val}"
+                if kind == "assess":
+                    self._render_assessments(viewer, client, sessions)
+                elif kind == "term":
+                    self._render_termination(viewer, client, sessions)
+                elif kind == "ask":
                     self._render_ask(viewer, client, sessions)
                 elif kind == "insights":
                     self._render_insights(viewer, client, sessions)
@@ -13331,6 +13344,12 @@ def run_gui():
             f._search = {"var": q_var, "run": do_search, "list": lb, "items": items, "state": state}
             fill_list()
 
+            if not sessions and select in ("assess", "term"):
+                idx = next(i for i, it in enumerate(items) if it[0] == select)
+                lb.selection_set(idx)
+                lb.see(idx)
+                render(idx)
+                return
             if not sessions:
                 for w in viewer.winfo_children():
                     w.destroy()
@@ -13349,6 +13368,8 @@ def run_gui():
                 if isinstance(select, str) and select.startswith("insights:"):
                     self._insight_tab = select[9:]
                 idx = 3
+            elif select in ("assess", "term"):
+                idx = next(i for i, it in enumerate(items) if it[0] == select)
             elif select == "case" or (select is None and client.get("case_overview")):
                 idx = 0
             elif select:
@@ -14375,7 +14396,8 @@ def run_gui():
 
         parent_comm = external_comm                     # (its earlier name)
 
-        FILE_KINDS = {"registration": "Registration form", "parent": "External communication", "other": "Other"}
+        FILE_KINDS = {"registration": "Registration form", "parent": "External communication",
+                      "assessment": "Assessment", "termination": "Termination form", "other": "Other"}
         FILE_TYPES = [("Documents", "*.pdf *.docx *.doc *.txt *.md *.rtf *.png *.jpg *.jpeg *.gif *.heic *.tif *.tiff"),
                       ("All files", "*.*")]
 
@@ -14548,6 +14570,420 @@ def run_gui():
             self.files_win = {"win": win, "add": add, "view": view, "remove": remove, "tv": tv, "refresh": refresh}
             if kind:
                 win.after(100, lambda: add(kind))
+
+        # ---------------------------------------------------------------- files shown from a tab
+        def vault_file_view(self, e, parent=None):
+            """Show a stored file's text inside Session Scribe (read in memory, no readable copy on disk);
+            files without text (scans, images) open as a temporary copy instead."""
+            try:
+                data = vault.load_file(e["id"])
+            except Exception as ex:
+                return messagebox.showerror(APP_NAME, friendly_error(ex), parent=parent)
+            ext = os.path.splitext(e.get("name", ""))[1].lower()
+            text = None
+            if ext in (".txt", ".md", ".rtf"):
+                text = data.decode("utf-8", errors="replace")
+            elif ext in (".docx", ".pdf"):
+                text = text_from_bytes(data, ext)
+            if not (text or "").strip():
+                return self.vault_file_open(e, parent)
+            vw = new_window(parent or root, e.get("name", "File"), "760x640")
+            vf = ttk.Frame(vw, padding=px(14))
+            vf.pack(fill="both", expand=True)
+            tb = register(tk.Text(vf, wrap="word", relief="flat", borderwidth=0, highlightthickness=1,
+                                  font=F["body"], padx=px(12), pady=px(10)), "doc")
+            tb.insert("1.0", text.strip())
+            tb.config(state="disabled")
+            tb.pack(fill="both", expand=True)
+            return vw
+
+        def vault_file_open(self, e, parent=None):
+            """Open a stored file in its usual program, as a temporary copy wiped when Session Scribe closes."""
+            try:
+                data = vault.load_file(e["id"])
+                os.makedirs(OPEN_DIR, exist_ok=True)
+                path = os.path.join(OPEN_DIR, e["id"][:8] + "_" + re.sub(r'[\\/:*?"<>|]', "_", e.get("name", "file")))
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                open_path(path)
+            except Exception as ex:
+                return messagebox.showerror(APP_NAME, f"Couldn't open it: {friendly_error(ex)}", parent=parent)
+            self.set_status(f"Opened a temporary copy of {e.get('name', 'the file')} — wiped when Session Scribe closes.")
+
+        def _file_entry(self, client, fid):
+            return next((x for x in client.get("files") or [] if x.get("id") == fid), None) if fid else None
+
+        def _file_buttons(self, row, client, fid):
+            e = self._file_entry(client, fid)
+            if not e:
+                return
+            row.add(ttk.Label(row, text=f"📎  {e['name']}", style="Caption.TLabel"), gap=px(12))
+            row.add(ttk.Button(row, text="View", command=lambda: self.vault_file_view(e)), gap=px(6))
+            row.add(ttk.Button(row, text="Open", command=lambda: self.vault_file_open(e)), gap=px(4))
+
+        # ---------------------------------------------------------------- Assessments tab
+        ASSESSMENT_NAMES = ["PCL-5 (PTSD)", "C-SSRS (Columbia suicide severity)", "ACE questionnaire",
+                            "AUDIT (alcohol)", "DAST-10 (drugs)", "BDI-II (Beck Depression)", "BAI (Beck Anxiety)",
+                            "MDQ (mood disorder)", "ASRS (adult ADHD)", "EPDS (postnatal depression)",
+                            "SCARED (child anxiety)", "Vanderbilt (ADHD)", "Intake questionnaire",
+                            "PHQ-9", "GAD-7"]
+
+        def _render_assessments(self, v, client, sessions):
+            client = vault.load_client(client["id"])
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Assessments", style="H2.TLabel"))
+            head.add(ttk.Button(head, text="＋  Add assessment…", style="Accent.TButton",
+                                command=lambda: self.assessment_dialog(client)), gap=px(16))
+            head.add(ttk.Button(head, text="＋  PHQ-9 / GAD-7",
+                                command=lambda: self.measure_dialog(client, select="assess")))
+            regs = [x for x in client.get("files") or [] if x.get("kind") == "registration"]
+            if regs:
+                head.add(ttk.Button(head, text="Read scores from registration form",
+                                    command=lambda: self.read_measures_from_file(client, regs[-1])))
+            ttk.Label(v, text="Every assessment this patient has taken, newest first, with its result, notes and "
+                              "completed form. PHQ-9 and GAD-7 are also charted under Progress & risk.",
+                      style="Muted.TLabel", wraplength=px(520), justify="left").pack(anchor="w", pady=(px(2), 0))
+            self.progress_panel(v, owner=("measures", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
+            sc, box = scrollable(v)
+            sc.pack(fill="both", expand=True, pady=(px(8), 0))
+            rows = [("m", m["date"], m) for m in client.get("measures") or []] + \
+                   [("a", a.get("date", ""), a) for a in client.get("assessments") or []]
+            if not rows:
+                ttk.Label(box, text="No assessments yet. Use “Add assessment…” for any questionnaire or screening "
+                                    "(with its result and the completed form, if you have it), or “PHQ-9 / GAD-7 "
+                                    "score…” for those two.", style="Muted.TLabel", wraplength=px(680),
+                          justify="left").pack(anchor="w", pady=(px(6), 0))
+                return
+            for kind, day, x in sorted(rows, key=lambda r: (r[1], r[2].get("added", "")), reverse=True):
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(0, px(6)), padx=(0, px(8)))
+
+                def line(text, style="TLabel", pady=(px(2), 0)):
+                    ttk.Label(card, text=text, style=style, wraplength=px(500), justify="left").pack(anchor="w", pady=pady)
+                acts = Flow(card, gap=px(6))
+                if kind == "m":
+                    band = measure_band(x["kind"], x["total"])
+                    line(f"{fmt_date(x['date'])}   {x['kind']}", "Strong.TLabel", 0)
+                    line(f"{x['total']}" + (f"  ({band})" if band else "") + f"   · {x.get('source', 'manual')}")
+                    if x.get("items"):
+                        line("Answers: " + " ".join(map(str, x["items"])), "Caption.TLabel")
+                    if x.get("kind") == "PHQ-9" and x.get("items") and x["items"][8] > 0:
+                        line(f"⚠  Item 9 answered {x['items'][8]} — follow up and document a risk assessment.",
+                             "Bad.TLabel")
+                    acts.add(ttk.Button(acts, text="Remove",
+                                        command=lambda m=x: self.measure_remove(client, m["id"], select="assess")))
+                else:
+                    line(f"{fmt_date(x.get('date', ''))}   {x.get('name', 'Assessment')}", "Strong.TLabel", 0)
+                    if x.get("score"):
+                        line(x["score"])
+                    if x.get("notes"):
+                        line(x["notes"], "Muted.TLabel", (px(4), 0))
+                    self._file_buttons(acts, client, x.get("file_id"))
+                    acts.add(ttk.Button(acts, text="Edit…", command=lambda a=x: self.assessment_dialog(client, a)),
+                             gap=px(12))
+                    acts.add(ttk.Button(acts, text="Remove", command=lambda a=x: self.assessment_remove(client, a)))
+                acts.pack(fill="x", pady=(px(6), 0))
+            box.realize_all()
+
+        def assessment_save(self, cid, entry):
+            """Add or update one assessment (matched by id) on a fresh copy of the patient."""
+            c = vault.load_client(cid)
+            lst = c.setdefault("assessments", [])
+            for i, a in enumerate(lst):
+                if a.get("id") == entry["id"]:
+                    lst[i] = entry
+                    break
+            else:
+                lst.append(entry)
+            vault.save_client(c)
+            self._sig = vault.signature()
+
+        def assessment_remove(self, client, a):
+            msg = f"Remove the {a.get('name', 'assessment')} from {fmt_date(a.get('date', ''))}?"
+            if a.get("file_id"):
+                msg += "\n\nIts attached form is deleted from the vault too (on both computers)."
+            if not messagebox.askyesno(APP_NAME, msg):
+                return
+            if a.get("file_id"):
+                _quiet(self.patient_file_remove, client["id"], a["file_id"])
+            c = vault.load_client(client["id"])
+            c["assessments"] = [x for x in c.get("assessments") or [] if x.get("id") != a.get("id")]
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.open_client(client["id"], select="assess")
+
+        def assessment_dialog(self, client, existing=None):
+            cid = client["id"]
+            ex = dict(existing or {})
+            win = new_window(root, f"{client.get('code', '')} — {'edit' if existing else 'add'} assessment", "680x620")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Edit assessment" if existing else "Add an assessment", style="Title.TLabel").pack(anchor="w")
+            grid = ttk.Frame(f)
+            grid.pack(fill="x", pady=(px(10), 0))
+            grid.columnconfigure(1, weight=1)
+            name_var = tk.StringVar(value=ex.get("name", ""))
+            day_var = tk.StringVar(value=ex.get("date") or date.today().isoformat())
+            score_var = tk.StringVar(value=ex.get("score", ""))
+            ttk.Label(grid, text="Assessment").grid(row=0, column=0, sticky="w", pady=px(3))
+            name_cb = ttk.Combobox(grid, textvariable=name_var, values=self.ASSESSMENT_NAMES)
+            name_cb.grid(row=0, column=1, sticky="ew", padx=(px(10), 0))
+            ttk.Label(grid, text="Completed on").grid(row=1, column=0, sticky="w", pady=px(3))
+            date_field(grid, day_var).grid(row=1, column=1, sticky="w", padx=(px(10), 0))
+            ttk.Label(grid, text="Score / result").grid(row=2, column=0, sticky="w", pady=px(3))
+            ttk.Entry(grid, textvariable=score_var).grid(row=2, column=1, sticky="ew", padx=(px(10), 0))
+            ttk.Label(f, text="e.g. “42 — probable PTSD”, “Positive screen”, “ACE score 4”.", style="Caption.TLabel").pack(
+                anchor="w", pady=(px(2), 0))
+            ttk.Label(f, text="Notes", style="Strong.TLabel").pack(anchor="w", pady=(px(10), px(2)))
+            nfr, notes = scrolled_text(f, height=6)
+            nfr.pack(fill="both", expand=True)
+            set_text(notes, ex.get("notes", ""))
+            frow = Flow(f, gap=px(8))
+            frow.pack(fill="x", pady=(px(10), 0))
+            picked = {"path": None, "drop": False}
+            cur = self._file_entry(vault.load_client(cid), ex.get("file_id"))
+            file_lbl = ttk.Label(frow, text=f"📎  {cur['name']}" if cur else "No form attached", style="Muted.TLabel")
+
+            def pick():
+                path = filedialog.askopenfilename(parent=win, title="Choose the completed assessment",
+                                                  filetypes=self.FILE_TYPES)
+                if path:
+                    picked.update(path=path, drop=False)
+                    file_lbl.config(text=f"📎  {os.path.basename(path)} (added when you save)")
+            frow.add(ttk.Button(frow, text="Attach the completed form…", command=pick))
+            if cur:
+                frow.add(ttk.Button(frow, text="Remove form", command=lambda: (
+                    picked.update(path=None, drop=True), file_lbl.config(text="Form removed when you save"))))
+            frow.add(file_lbl, gap=px(10))
+            msg = ttk.Label(f, text="", style="Bad.TLabel", wraplength=px(620), justify="left")
+            msg.pack(anchor="w", pady=(px(6), 0))
+
+            def save():
+                name, day = name_var.get().strip(), day_var.get().strip()
+                if not name:
+                    return msg.config(text="Enter which assessment it was.")
+                if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+                    return msg.config(text="Enter the date it was completed.")
+                if name in MEASURES and not existing:
+                    win.destroy()                       # these two have their own form (answers, bands, trend)
+                    return self.measure_dialog(client, select="assess", kind=name)
+                file_id = ex.get("file_id", "")
+                try:
+                    if picked["path"]:
+                        e = self.patient_file_add(cid, picked["path"], "assessment", note=name)
+                        if file_id:
+                            _quiet(self.patient_file_remove, cid, file_id)
+                        file_id = e["id"]
+                    elif picked["drop"] and file_id:
+                        self.patient_file_remove(cid, file_id)
+                        file_id = ""
+                except Exception as err:
+                    return msg.config(text=f"Couldn't add that file: {friendly_error(err)}")
+                now = datetime.now().isoformat(timespec="seconds")
+                entry = {"id": ex.get("id") or uuid.uuid4().hex[:12], "name": name, "date": day,
+                         "score": score_var.get().strip(), "notes": get_text(notes).strip(), "file_id": file_id,
+                         "added": ex.get("added") or now, "updated": now}
+                self.assessment_save(cid, entry)
+                win.destroy()
+                self.set_status(f"{client.get('code', '')}: {name} saved.")
+                if self.client_id == cid and not self.wizard:
+                    self.open_client(cid, select="assess")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            self._assess_win = {"win": win, "name": name_var, "date": day_var, "score": score_var, "notes": notes,
+                                "pick": picked, "save": save}
+
+        # ---------------------------------------------------------------- Termination tab
+        TERMINATION_REASONS = [
+            "Lack of Progress Despite Treatment", "Patient Non-Compliance",
+            "Lack of Communication from Patient to Continue or Resume Treatment", "Patient has Unpaid Balance",
+            "Inappropriate Behavior", "Conflict of Interest", "Patient's Request To Terminate Treatment",
+            "Patient's Request To Pause Treatment", "Need for a Higher Level of Care", "Insurance Issues",
+            "Dual Relationships", "Geographical Considerations", "Outside the Scope of Practice", "Other (see below)"]
+
+        @staticmethod
+        def termination_letter(t):
+            """The practice's termination letter, filled in (the same wording as its form)."""
+            reasons = "\n".join(f"• {r}" for r in t.get("reasons") or [])
+            other = (t.get("other") or "").strip()
+            return (
+                "TERMINATION LETTER\n\n"
+                f"Date: {fmt_date(t.get('date', ''))}\n"
+                f"{t.get('patient_name', '').strip()}\n\n"
+                "We are writing to inform you that as of the date of this letter, we will be concluding our therapeutic "
+                "relationship. This decision has been taken after careful consideration and is based on reasons "
+                "included.\n\n"
+                "We are aware that ending therapy can be a challenging process and we are committed to making this "
+                "transition as smooth as possible for you. Psychology Today (psychologytoday.com) can provide listings "
+                "of therapists in our area that meet both in-person and virtually. You can filter by your insurance plan "
+                "to find a therapist that meets your needs.\n\n"
+                "The reason(s) for termination from South Shore Counseling and Psychological Services:\n"
+                f"{reasons}\n"
+                + (f"\nAdditional reason(s):\n{other}\n" if other else "")
+                + "\nIf you have any questions, please do not hesitate to reach out to our office.\n\n"
+                  "We wish you the very best going forward.\n\n"
+                  f"{t.get('therapist', '').strip()}\n")
+
+        def _render_termination(self, v, client, sessions):
+            client = vault.load_client(client["id"])
+            t = client.get("termination")
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Termination", style="H2.TLabel"))
+            if not t:
+                head.add(ttk.Button(head, text="Fill out termination letter…", style="Accent.TButton",
+                                    command=lambda: self.termination_dialog(client)), gap=px(16))
+                ttk.Label(v, text="Record the end of treatment with this patient: the date, the reasons and the "
+                                  "practice's termination letter, plus the completed form you submit to the practice "
+                                  "(kept encrypted with the rest of the patient's record). Nothing here is sent to "
+                                  "the AI.", style="Muted.TLabel", wraplength=px(680), justify="left").pack(
+                    anchor="w", pady=(px(4), 0))
+                return
+            text = self.termination_letter(t)
+            head.add(ttk.Button(head, text="Copy letter", style="Accent.TButton",
+                                command=lambda: self.copy(text, "Termination letter")), gap=px(16))
+            head.add(ttk.Button(head, text="Edit…", command=lambda: self.termination_dialog(client)))
+            head.add(ttk.Button(head, text="Remove…", command=lambda: self.termination_remove(client)))
+            info = Flow(v, gap=px(8))
+            info.pack(fill="x", pady=(px(6), 0))
+            info.add(ttk.Label(info, text=f"Terminated {fmt_date(t.get('date', ''))}", style="ChipWarn.TLabel"))
+            info.add(ttk.Label(info, text=f"by {t.get('therapist', '')}", style="Muted.TLabel"), gap=px(10))
+            self._file_buttons(info, client, t.get("file_id"))
+            if client.get("archived"):
+                info.add(ttk.Label(info, text="🗄  Archived", style="ChipMuted.TLabel"), gap=px(12))
+            fr, tb = scrolled_text(v, readonly=True, doc=True, tools=False)
+            fr.pack(fill="both", expand=True, pady=(px(8), 0))
+            set_text(tb, text)
+
+        def termination_remove(self, client):
+            c = vault.load_client(client["id"])
+            t = c.get("termination") or {}
+            if not messagebox.askyesno(APP_NAME, "Remove this patient's termination record?"
+                                       + ("\n\nThe attached form is deleted from the vault too (on both computers)."
+                                          if t.get("file_id") else "")):
+                return
+            if t.get("file_id"):
+                _quiet(self.patient_file_remove, client["id"], t["file_id"])
+                c = vault.load_client(client["id"])
+            c.pop("termination", None)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.refresh_clients(client["id"])
+            self.open_client(client["id"], select="term")
+
+        def termination_dialog(self, client):
+            cid = client["id"]
+            client = vault.load_client(cid)
+            ex = dict(client.get("termination") or {})
+            win = new_window(root, f"{client.get('code', '')} — termination letter", "760x820")
+            win.grab_set()
+            outer, f = scrollable(win, padding=(px(22), px(16)))
+            outer.pack(fill="both", expand=True)
+            ttk.Label(f, text="Termination letter", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="The same fields as the practice's form. Saved encrypted in this patient's record; "
+                              "nothing here goes to the AI.", style="Muted.TLabel", wraplength=px(680),
+                      justify="left").pack(anchor="w", pady=(px(2), px(8)))
+            grid = ttk.Frame(f)
+            grid.pack(fill="x")
+            grid.columnconfigure(1, weight=1)
+            names = client_name_map(client)
+            guess = next((n for n, ph in names if ph.lower() == "[patient]"), names[0][0] if names else "")
+            day_var = tk.StringVar(value=ex.get("date") or date.today().isoformat())
+            name_var = tk.StringVar(value=ex.get("patient_name") or guess)
+            ther_var = tk.StringVar(value=ex.get("therapist") or self.settings.get("therapist_name", ""))
+            ttk.Label(grid, text="Date *").grid(row=0, column=0, sticky="w", pady=px(3))
+            date_field(grid, day_var).grid(row=0, column=1, sticky="w", padx=(px(10), 0))
+            ttk.Label(grid, text="Patient name *").grid(row=1, column=0, sticky="w", pady=px(3))
+            ttk.Entry(grid, textvariable=name_var).grid(row=1, column=1, sticky="ew", padx=(px(10), 0))
+            ttk.Label(f, text="Reason(s) for termination *", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(2)))
+            rbox = ttk.Frame(f)
+            rbox.pack(fill="x")
+            rvars = {}
+            have = set(ex.get("reasons") or [])
+            for i, r in enumerate(self.TERMINATION_REASONS):
+                rvars[r] = tk.BooleanVar(value=r in have)
+                ttk.Checkbutton(rbox, text=r, variable=rvars[r]).grid(row=i, column=0, sticky="w", pady=px(1))
+            ttk.Label(f, text="Additional reason(s)", style="Strong.TLabel").pack(anchor="w", pady=(px(10), px(2)))
+            ofr, other = scrolled_text(f, height=4)
+            ofr.pack(fill="x")
+            set_text(other, ex.get("other", ""))
+            ttk.Label(f, text="Therapist name and credentials *", style="Strong.TLabel").pack(anchor="w", pady=(px(10), px(2)))
+            ttk.Entry(f, textvariable=ther_var).pack(fill="x")
+            frow = Flow(f, gap=px(8))
+            frow.pack(fill="x", pady=(px(12), 0))
+            picked = {"path": None, "drop": False}
+            cur = self._file_entry(client, ex.get("file_id"))
+            file_lbl = ttk.Label(frow, text=f"📎  {cur['name']}" if cur else "No completed form attached",
+                                 style="Muted.TLabel")
+
+            def pick():
+                path = filedialog.askopenfilename(parent=win, title="Choose the completed termination form",
+                                                  filetypes=self.FILE_TYPES)
+                if path:
+                    picked.update(path=path, drop=False)
+                    file_lbl.config(text=f"📎  {os.path.basename(path)} (added when you save)")
+            frow.add(ttk.Button(frow, text="Attach the completed form (PDF)…", command=pick))
+            if cur:
+                frow.add(ttk.Button(frow, text="Remove form", command=lambda: (
+                    picked.update(path=None, drop=True), file_lbl.config(text="Form removed when you save"))))
+            frow.add(file_lbl, gap=px(10))
+            arch_var = tk.BooleanVar(value=False)
+            if not client.get("archived"):
+                ttk.Checkbutton(f, text="Also archive this patient (they leave the patient list and the Home dashboard; "
+                                        "Patient ▸ Restore brings them back)", variable=arch_var).pack(
+                    anchor="w", pady=(px(10), 0))
+            msg = ttk.Label(f, text="", style="Bad.TLabel", wraplength=px(680), justify="left")
+            msg.pack(anchor="w", pady=(px(6), 0))
+
+            def save():
+                day = day_var.get().strip()
+                reasons = [r for r in self.TERMINATION_REASONS if rvars[r].get()]
+                if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+                    return msg.config(text="Enter the date of the letter.")
+                if not name_var.get().strip():
+                    return msg.config(text="Enter the patient's name.")
+                if not reasons:
+                    return msg.config(text="Tick at least one reason.")
+                if not ther_var.get().strip():
+                    return msg.config(text="Enter your name and credentials.")
+                file_id = ex.get("file_id", "")
+                try:
+                    if picked["path"]:
+                        e = self.patient_file_add(cid, picked["path"], "termination", note="Termination form")
+                        if file_id:
+                            _quiet(self.patient_file_remove, cid, file_id)
+                        file_id = e["id"]
+                    elif picked["drop"] and file_id:
+                        self.patient_file_remove(cid, file_id)
+                        file_id = ""
+                except Exception as err:
+                    return msg.config(text=f"Couldn't add that file: {friendly_error(err)}")
+                now = datetime.now().isoformat(timespec="seconds")
+                c = vault.load_client(cid)
+                c["termination"] = {"date": day, "patient_name": name_var.get().strip(), "reasons": reasons,
+                                    "other": get_text(other).strip(), "therapist": ther_var.get().strip(),
+                                    "file_id": file_id, "added": ex.get("added") or now, "updated": now}
+                if arch_var.get():
+                    c["archived"] = True
+                vault.save_client(c)
+                if ther_var.get().strip() != self.settings.get("therapist_name", ""):
+                    self.settings["therapist_name"] = ther_var.get().strip()     # filled in next time
+                    _quiet(vault.save_settings, self.settings)
+                self._sig = vault.signature()
+                win.destroy()
+                self.refresh_clients(cid)
+                self.set_status(f"{client.get('code', '')}: termination saved"
+                                + (" and patient archived." if arch_var.get() else "."))
+                if not self.wizard:
+                    self.open_client(cid, select="term")
+            btns = pin_bottom(ttk.Frame(win, padding=(px(22), 0, px(22), px(14))), pady=(px(6), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            self._term_win = {"win": win, "date": day_var, "name": name_var, "therapist": ther_var, "reasons": rvars,
+                              "other": other, "pick": picked, "archive": arch_var, "save": save}
 
         def edit_client(self, client):
             if self.client_dialog(client):
@@ -15823,31 +16259,33 @@ def run_gui():
                     side="left")
                 ttk.Button(r_, text="Remove", command=lambda m=m: self.measure_remove(client, m["id"])).pack(side="right")
 
-        def measure_remove(self, client, mid):
+        def measure_remove(self, client, mid, select="insights"):
             if not messagebox.askyesno(APP_NAME, "Remove this score?"):
                 return
             c = vault.load_client(client["id"])
             c["measures"] = [m for m in c.get("measures") or [] if m["id"] != mid]
             vault.save_client(c)
+            self._sig = vault.signature()
             self._insight_tab = "scores"
-            self.open_client(client["id"], select="insights")
+            self.open_client(client["id"], select=select)
 
-        def measures_add(self, client, entries):
+        def measures_add(self, client, entries, select="insights"):
             c = vault.load_client(client["id"])
             c.setdefault("measures", []).extend(entries)
             vault.save_client(c)
             self._sig = vault.signature()
             self._insight_tab = "scores"
             if self.client_id == client["id"] and not self.wizard:
-                self.open_client(client["id"], select="insights")
+                self.open_client(client["id"], select=select)
 
-        def measure_dialog(self, client):
+        def measure_dialog(self, client, select="insights", kind="PHQ-9"):
             win = new_window(root, f"{client.get('code', '')} — add a score", "720x720")
             win.grab_set()
             f = ttk.Frame(win, padding=(px(22), px(16)))
             f.pack(fill="both", expand=True)
             ttk.Label(f, text="Add a score", style="Title.TLabel").pack(anchor="w")
-            kind_var, day_var = tk.StringVar(value="PHQ-9"), tk.StringVar(value=date.today().isoformat())
+            kind_var = tk.StringVar(value=kind if kind in MEASURES else "PHQ-9")
+            day_var = tk.StringVar(value=date.today().isoformat())
             top_ = Flow(f, gap=px(10))
             top_.pack(fill="x", pady=(px(8), 0))
             for k in MEASURES:
@@ -15913,7 +16351,7 @@ def run_gui():
                 except ValueError as ex:
                     return msg.config(text=str(ex))
                 win.destroy()
-                self.measures_add(client, [e])
+                self.measures_add(client, [e], select=select)
                 self.set_status(f"{client.get('code', '')}: {e['kind']} {e['total']} saved.")
             btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")

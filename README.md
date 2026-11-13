@@ -19,6 +19,10 @@ at the top of the file. Every build is a commit in this repository, so the histo
   computer through the shared data folder, encrypted.
 - **Patients.** Each patient has a case overview, treatment plan, Ask-AI chat about their record, and
   day-by-day sessions. The local AI reads patients' names (they never leave the computer), which keeps notes clear about who said what; Settings or a patient's profile can hide them instead.
+- **Assessments & termination.** Each patient has an Assessments tab (PHQ-9/GAD-7 scores plus any
+  other questionnaire, with its result, notes and the completed form) and a Termination tab (the
+  practice's termination letter: date, reasons, therapist, and the submitted form). Both stay out
+  of the AI's reach.
 - **Progress & risk.** Risk timeline and safety-plan flags, scores, treatment-goal coverage, homework,
   follow-ups and recurring themes. **↻ Refresh &lt;patient code&gt;** brings that one patient's checks and
   case overview up to date in one go.
