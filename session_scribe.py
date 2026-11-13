@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.17"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.18"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -11496,13 +11496,17 @@ try {
   Add-Type -AssemblyName System.Runtime.WindowsRuntime
   $null = [Windows.Security.Credentials.KeyCredentialManager, Windows.Security.Credentials, ContentType = WindowsRuntime]
   $null = [Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType = WindowsRuntime]
+  $null = [Windows.Security.Cryptography.CryptographicBuffer, Windows.Security.Cryptography, ContentType = WindowsRuntime]
   $m = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }
   $opT = ($m | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
   $actT = ($m | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
   function Await($op, [Type]$t) { $k = $opT.MakeGenericMethod($t).Invoke($null, @($op)); $k.Wait() | Out-Null; $k.Result }
   $KCM = [Windows.Security.Credentials.KeyCredentialManager]
   $UCV = [Windows.Security.Credentials.UI.UserConsentVerifier]
+  $CB = [Windows.Security.Cryptography.CryptographicBuffer]
   $BUF = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]
+  # buffers Windows hands back arrive as plain COM objects that PowerShell won't pass on; reflection converts them
+  $ENC = $CB.GetMethod("EncodeToBase64String")
   switch ($mode) {
     'available' { "OK:" + (Await ($UCV::CheckAvailabilityAsync()) ([Windows.Security.Credentials.UI.UserConsentVerifierAvailability])) }
     'create' {
@@ -11512,7 +11516,7 @@ try {
       $r = Await ($KCM::OpenAsync($name)) ([Windows.Security.Credentials.KeyCredentialRetrievalResult])
       if ($r.Status -ne 'Success') { "ERR:" + $r.Status } else {
         $s = Await ($r.Credential.RequestSignAsync($BUF::AsBuffer([Convert]::FromBase64String($arg)))) ([Windows.Security.Credentials.KeyCredentialOperationResult])
-        if ($s.Status -ne 'Success') { "ERR:" + $s.Status } else { "OK:" + [Convert]::ToBase64String($BUF::ToArray($s.Result)) } } }
+        if ($s.Status -ne 'Success') { "ERR:" + $s.Status } else { "OK:" + $ENC.Invoke($null, @($s.Result)) } } }
     'verify' { "OK:" + (Await ($UCV::RequestVerificationAsync($arg)) ([Windows.Security.Credentials.UI.UserConsentVerificationResult])) }
     'delete' { $k = $actT.Invoke($null, @($KCM::DeleteAsync($name))); $k.Wait() | Out-Null; "OK:deleted" }
   }
