@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.13"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.14"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2886,6 +2886,20 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
                       "text": text[:4000] + (" …[shortened]" if len(text) > 4000 else ""),
                       "rank": (1000 if focus else 0) + score * 5 + (6 if about_msgs else 0),
                       "recent": cm.get("date", "")})
+    # imported documents (psychological assessments, records…): in when the question names their type or words
+    for doc in client.get("documents") or []:
+        text = doc.get("text") or ""
+        if not text.strip():
+            continue
+        low = text.lower()
+        score = sum(low.count(w) for w in words)
+        named = any(w in (doc.get("type") or "").lower() for w in words if len(w) > 3) or \
+            re.search(r"\b(assessment|evaluation|report|records?|testing|document)\b", question, re.I) is not None
+        focus = bool(want_day and doc.get("date") == want_day)
+        cands.append({"day": doc.get("date", ""), "num": None,
+                      "label": f"{doc.get('type', 'Document')} (imported document)", "key": "doc",
+                      "text": text[:6000] + (" …[shortened]" if len(text) > 6000 else ""),
+                      "rank": (1000 if focus else 0) + score * 5 + (8 if named else 0), "recent": doc.get("date", "")})
     picked = []
     room = budget - used - 4000                       # leave space for the manual + conversation
     notes = sorted([c for c in cands if c["key"] == "note"], key=lambda c: c["recent"], reverse=True)
@@ -2913,6 +2927,9 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
         sources.append(f"{n_ov} overview{'s' if n_ov != 1 else ''}")
     if n_tr:
         sources.append(f"{n_tr} transcript excerpt{'s' if n_tr != 1 else ''}")
+    n_doc = sum(1 for c in picked if c["key"] == "doc")
+    if n_doc:
+        sources.append(f"{n_doc} imported document{'s' if n_doc != 1 else ''}")
     n_cm = sum(1 for c in picked if c["key"] == "comm")
     if n_cm:
         sources.append(f"{n_cm} logged message thread{'s' if n_cm != 1 else ''}")
@@ -8468,6 +8485,7 @@ def plan_material(client, sessions, hide):
     case = (client.get("case_overview") or {}).get("text", "")
     if case:
         blocks.append(f"=== CASE OVERVIEW ===\n{hide(case)}")
+    blocks += documents_blocks(client, hide)
     for day, records in group_by_date([(None, d) for d in sessions]):
         parts = []
         for label, key, _, d in day_docs(records):
@@ -9361,6 +9379,20 @@ def measures_text(client):
 # Proprietary tests (BDI-II, CDI-2, MMPI, WAIS…) can't be reproduced; their scores go in with
 # "Add assessment…" instead.
 # --------------------------------------------------------------------------- #
+DEFAULT_DOC_TYPES = ["Psychological assessment", "Psychiatric evaluation", "Discharge summary",
+                     "School / IEP records", "Medical records", "Letter or correspondence", "Other document"]
+
+
+def documents_blocks(client, hide):
+    """Imported documents (psychological assessments, records…) as material for the AI, oldest first."""
+    out = []
+    for d in sorted(client.get("documents") or [], key=lambda x: x.get("date", "")):
+        if (d.get("text") or "").strip():
+            out.append(f"=== {d.get('type', 'Document').upper()} — {fmt_date(d.get('date', ''))} (imported document"
+                       + (f": {d['title']}" if d.get("title") else "") + f") ===\n{hide(d['text']).strip()}")
+    return out
+
+
 ASSESS_GROUPS = [("child", "Children", "about 7–12"), ("adolescent", "Adolescents", "about 12–17"),
                  ("adult", "Adults", "18 and over")]
 ASSESS_CATEGORIES = ["Depression", "Anxiety, stress & distress", "Trauma & PTSD", "Substance use", "ADHD",
@@ -11212,6 +11244,7 @@ def generate_case_overview(cfg, client, sessions, orientation, progress):
             parts.append(f"{label.upper()}:\n{hide(d[key]).strip()}")
         if parts:
             blocks.append(f"=== {day_title(records)} — {fmt_date(day)} ===\n" + "\n\n".join(parts))
+    blocks = documents_blocks(client, hide) + blocks       # imported reports and records come first, as background
     text = "\n\n".join(blocks)
     max_chars = int(cfg.get("max_chars", 24000))
     if len(text) > max_chars:
@@ -14194,7 +14227,7 @@ def run_gui():
             wmenu.add_command(label="✉  Letter…", command=lambda: self.letter_dialog(client))
             wmenu.add_command(label="＋  External communication…", command=lambda: self.external_comm(client))
             wmenu.add_separator()
-            wmenu.add_command(label="Import past notes…", command=lambda: self.import_dialog(client))
+            wmenu.add_command(label="Import document…", command=lambda: self.import_dialog(client))
             write["menu"] = wmenu
             pbtns.add(write)
             nfiles = len(client.get("files") or [])
@@ -14340,6 +14373,10 @@ def run_gui():
                             {a.get("measure_id") for a in client.get("assessments") or []}]) + \
                     len(client.get("assessments") or [])
                 lb.insert("end", "🧾  Assessments" + (f"  · {n_as}" if n_as else ""))
+                docs = client.get("documents") or []
+                if docs:
+                    items.append(("docs", None))
+                    lb.insert("end", f"📁  Documents  · {len(docs)}")
                 comms = client.get("communications") or []
                 n_legacy = sum(1 for _, d in sessions if d["meta"].get("source") == "messages")
                 if comms or n_legacy:
@@ -14377,9 +14414,11 @@ def run_gui():
                         self._render_day(viewer, client, val["day"], dict(days)[val["day"]],
                                          focus=(val["sid"], val["key"]), query=q)
                     return
-                self.view_select = kind if kind in ("case", "plan", "ask", "insights", "assess", "term", "comms") \
-                    else f"day:{val}"
-                if kind == "comms":
+                self.view_select = kind if kind in ("case", "plan", "ask", "insights", "assess", "term", "comms",
+                                                    "docs") else f"day:{val}"
+                if kind == "docs":
+                    self._render_docs(viewer, client, sessions)
+                elif kind == "comms":
                     self._render_comms(viewer, client, sessions)
                 elif kind == "assess":
                     self._render_assessments(viewer, client, sessions)
@@ -14447,7 +14486,7 @@ def run_gui():
             f._search = {"var": q_var, "run": do_search, "list": lb, "items": items, "state": state}
             fill_list()
 
-            if not sessions and any(it[0] == select for it in items if select in ("assess", "term", "comms")):
+            if not sessions and any(it[0] == select for it in items if select in ("assess", "term", "comms", "docs")):
                 idx = next(i for i, it in enumerate(items) if it[0] == select)
                 lb.selection_set(idx)
                 lb.see(idx)
@@ -14457,7 +14496,7 @@ def run_gui():
                 for w in viewer.winfo_children():
                     w.destroy()
                 ttk.Label(viewer, text="No sessions yet", style="H2.TLabel").pack(anchor="w", pady=(20, 4))
-                ttk.Label(viewer, text="Click ＋ New session to add the first recording, or Write ▸ Import past notes… "
+                ttk.Label(viewer, text="Click ＋ New session to add the first recording, or Write ▸ Import document… "
                                        "to bring in notes you've already written.", wraplength=px(560), justify="left",
                           style="Muted.TLabel").pack(anchor="w")
                 return
@@ -14471,7 +14510,7 @@ def run_gui():
                 if isinstance(select, str) and select.startswith("insights:"):
                     self._insight_tab = select[9:]
                 idx = 3
-            elif select in ("assess", "term", "comms"):
+            elif select in ("assess", "term", "comms", "docs"):
                 idx = next((i for i, it in enumerate(items) if it[0] == select), idx)
             elif select == "case" or (select is None and client.get("case_overview")):
                 idx = 0
@@ -15527,7 +15566,8 @@ def run_gui():
         parent_comm = external_comm                     # (its earlier name)
 
         FILE_KINDS = {"registration": "Registration form", "parent": "External communication",
-                      "assessment": "Assessment", "termination": "Termination form", "other": "Other"}
+                      "assessment": "Assessment", "termination": "Termination form", "document": "Imported document",
+                      "other": "Other"}
         FILE_TYPES = [("Documents", "*.pdf *.docx *.doc *.txt *.md *.rtf *.png *.jpg *.jpeg *.gif *.heic *.tif *.tiff"),
                       ("All files", "*.*")]
 
@@ -16842,6 +16882,103 @@ def run_gui():
             self._bssa_win = {"win": win, "v": v, "save": save}
             return win
 
+        # ---------------------------------------------------------------- imported documents
+        def doc_types(self):
+            """Document types for Import document (Settings ▸ Document types)."""
+            t = self.settings.get("doc_types")
+            return list(DEFAULT_DOC_TYPES if t is None else t)
+
+        def doc_view(self, client, doc):
+            win = new_window(root, f"{client.get('code', '')} — {doc.get('type', 'Document')}", "820x720")
+            f = ttk.Frame(win, padding=px(16))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=doc.get("type", "Document"), style="H2.TLabel").pack(anchor="w")
+            ttk.Label(f, text=fmt_date(doc.get("date", "")) + (f"  ·  {doc['title']}" if doc.get("title") else ""),
+                      style="Muted.TLabel").pack(anchor="w")
+            bar = Flow(f, gap=px(8))
+            bar.pack(fill="x", pady=(px(8), 0))
+            bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(doc.get("text", ""), doc.get("type", ""))))
+            fe = self._file_entry(vault.load_client(client["id"]), doc.get("file_id"))
+            if fe:
+                bar.add(ttk.Button(bar, text="Open original", command=lambda: self.vault_file_open(fe, win)))
+            fr, tb = scrolled_text(f, readonly=True, doc=True, tools=False)
+            fr.pack(fill="both", expand=True, pady=(px(8), 0))
+            set_text(tb, doc.get("text", ""))
+            return win
+
+        def doc_set_type(self, client, doc):
+            types = self.doc_types()
+            if doc.get("type") and doc["type"] not in types:
+                types.append(doc["type"])
+            win = new_window(root, "Change document type", "460x200")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(20), px(16)))
+            f.pack(fill="both", expand=True)
+            var = tk.StringVar(value=doc.get("type", ""))
+            ttk.Label(f, text="Type").pack(anchor="w")
+            ttk.Combobox(f, textvariable=var, values=types, state="readonly", width=32).pack(anchor="w", pady=(px(4), 0))
+
+            def ok():
+                c = vault.load_client(client["id"])
+                for d in c.get("documents") or []:
+                    if d.get("id") == doc.get("id"):
+                        d["type"] = var.get()
+                vault.save_client(c)
+                win.destroy()
+                self.open_client(client["id"], select="docs")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=ok).pack(side="right", padx=px(8))
+
+        def doc_remove(self, client, doc):
+            if not messagebox.askyesno(APP_NAME, f"Remove the {doc.get('type', 'document').lower()} from "
+                                                 f"{fmt_date(doc.get('date', ''))}?"
+                                       + ("\n\nIts original file is deleted from the vault too (on both computers)."
+                                          if doc.get("file_id") else "")):
+                return
+            if doc.get("file_id"):
+                _quiet(self.patient_file_remove, client["id"], doc["file_id"])
+            c = vault.load_client(client["id"])
+            c["documents"] = [d for d in c.get("documents") or [] if d.get("id") != doc.get("id")]
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.open_client(client["id"], select="docs")
+
+        def _render_docs(self, v, client, sessions):
+            client = vault.load_client(client["id"])
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Documents", style="H2.TLabel"))
+            head.add(ttk.Button(head, text="＋  Import document…", style="Accent.TButton",
+                                command=lambda: self.import_dialog(client)), gap=px(16))
+            ttk.Label(v, text="Imported reports and records (psychological assessments, evaluations, school or "
+                              "medical records…). The AI uses them for the case overview, treatment plans and "
+                              "Ask AI.", style="Muted.TLabel", wraplength=px(520), justify="left").pack(
+                anchor="w", pady=(px(2), 0))
+            sc, box = scrollable(v)
+            sc.pack(fill="both", expand=True, pady=(px(8), 0))
+            for doc in sorted(client.get("documents") or [], key=lambda d: (d.get("date", ""), d.get("added", "")),
+                              reverse=True):
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(0, px(6)), padx=(0, px(8)))
+                ttk.Label(card, text=f"{fmt_date(doc.get('date', ''))}   {doc.get('type', 'Document')}",
+                          style="Strong.TLabel").pack(anchor="w")
+                if doc.get("title"):
+                    ttk.Label(card, text=doc["title"], style="Caption.TLabel").pack(anchor="w")
+                prev = " ".join((doc.get("text") or "").split())
+                ttk.Label(card, text=prev[:200] + ("…" if len(prev) > 200 else ""), style="Muted.TLabel",
+                          wraplength=px(500), justify="left").pack(anchor="w", pady=(px(2), 0))
+                acts = Flow(card, gap=px(6))
+                acts.add(ttk.Button(acts, text="View", style="Accent.TButton",
+                                    command=lambda d=doc: self.doc_view(client, d)))
+                fe = self._file_entry(client, doc.get("file_id"))
+                if fe:
+                    acts.add(ttk.Button(acts, text="Open original", command=lambda e=fe: self.vault_file_open(e)))
+                acts.add(ttk.Button(acts, text="Change type…", command=lambda d=doc: self.doc_set_type(client, d)))
+                acts.add(ttk.Button(acts, text="Remove", command=lambda d=doc: self.doc_remove(client, d)), gap=px(12))
+                acts.pack(fill="x", pady=(px(6), 0))
+            box.realize_all()
+
         # ---------------------------------------------------------------- External communication log
         def comm_save(self, cid, entry):
             """Add (or update, by id) one texts/emails entry in the patient's External communication log."""
@@ -17139,16 +17276,16 @@ def run_gui():
         def import_dialog(self, client):
             """Bring in notes written before using the app, so new notes and the case
             overview build on the full history."""
-            win = new_window(root, f"Import past notes — {client['code']}", "1000x700")
+            win = new_window(root, f"Import documents — {client['code']}", "1000x700")
             win.grab_set()
             f = ttk.Frame(win, padding=(px(24), px(20)))
             f.pack(fill="both", expand=True)
-            ttk.Label(f, text="Import past notes", style="Title.TLabel").pack(anchor="w")
-            ttk.Label(f, text="Add files (.txt, .docx, .pdf) or paste notes. TheraNest exports are split "
-                              "automatically: “INITIAL ASSESSMENT AND DIAGNOSTIC IMPRESSION” becomes the intake, "
-                              "“MUTUAL TREATMENT PLAN” a treatment plan (its “Date:”), and each “PROGRESS NOTES” a "
-                              "note (its “Service Date:”); pages of the same document are joined back together. "
-                              "Check each entry's date and type, then import.",
+            ttk.Label(f, text="Import documents", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Add files (.txt, .docx, .pdf) or paste text: past notes, or other documents such as a "
+                              "psychological assessment (choose its Type; add more types in Settings). TheraNest "
+                              "exports are split automatically: “INITIAL ASSESSMENT AND DIAGNOSTIC IMPRESSION” becomes "
+                              "the intake, “MUTUAL TREATMENT PLAN” a treatment plan (its “Date:”), and each “PROGRESS "
+                              "NOTES” a note (its “Service Date:”). Check each entry's date and type, then import.",
                       style="Muted.TLabel", wraplength=px(920), justify="left").pack(anchor="w", pady=(2, 8))
             items = []
             split_var = tk.BooleanVar(value=True)
@@ -17163,7 +17300,7 @@ def run_gui():
                 tv.column(c, width=px(wdt), minwidth=px(min(wdt, 90)), stretch=(c == "preview"), anchor="w")
             tv.pack(fill="x", pady=(8, 6))
 
-            ed = ttk.LabelFrame(f, text="Selected note", padding=8)
+            ed = ttk.LabelFrame(f, text="Selected document", padding=8)
             ed.pack(fill="both", expand=True)
             row = ttk.Frame(ed)
             row.pack(fill="x")
@@ -17174,18 +17311,21 @@ def run_gui():
             ttk.Label(row, text="Session #").pack(side="left")
             ttk.Entry(row, textvariable=n_var, width=6).pack(side="left", padx=(6, 16))
             ttk.Label(row, text="Type").pack(side="left")
-            ttk.Combobox(row, textvariable=k_var, values=["Progress note", "Intake assessment", "Patient contact",
-                                                          "Parent contact", "Collateral contact", "Treatment plan"],
-                         state="readonly", width=18).pack(side="left", padx=6)
-            rm = ttk.Button(row, text="Remove entry")
-            rm.pack(side="right")
-            tfr, txt = scrolled_text(ed, height=8, doc=True)
-            tfr.pack(fill="both", expand=True, pady=(6, 0))
             cur = {"i": None}
             kind_name = {"progress": "Progress note", "intake": "Intake assessment", "plan": "Treatment plan",
                          "parent": "Parent contact", "parent:patient": "Patient contact",
                          "parent:other": "Collateral contact"}
+            for t_ in self.doc_types():                      # your own types (Settings ▸ Document types)
+                if t_ not in kind_name.values():
+                    kind_name["doc:" + t_] = t_
             kind_key = {v: k for k, v in kind_name.items()}
+            ttk.Combobox(row, textvariable=k_var, values=list(kind_name.values()), state="readonly",
+                         width=24).pack(side="left", padx=6)
+            rm = ttk.Button(row, text="Remove entry")
+            rm.pack(side="right")
+            tfr, txt = scrolled_text(ed, height=8, doc=True)
+            tfr.pack(fill="both", expand=True, pady=(6, 0))
+            k_var.trace_add("write", lambda *_: store())
 
             META = re.compile(r"\b(dob|birth date|date|client|patient name|session (start|end) time|duration|"
                               r"provider\(s\)|provider|insurer\(s\)|insurer|place of service|cpt code|case #|"
@@ -17208,7 +17348,8 @@ def run_gui():
                 return (fallback or re.sub(r"\s+", " ", text))[:110]
 
             def row_values(it):
-                return (fmt_date(it["date"]) or "?", it["number"], kind_name[it["kind"]], it["source"], preview(it["text"]))
+                return (fmt_date(it["date"]) or "?", it["number"], kind_name.get(it["kind"], it["kind"].partition(":")[2]),
+                        it["source"], preview(it["text"]))
 
             def store():
                 i = cur["i"]
@@ -17233,15 +17374,16 @@ def run_gui():
                     n_var.set("")
                     k_var.set("")
                     set_text(txt, "")
-                count.config(text=f"{len(items)} note(s) ready to import")
+                count.config(text=f"{len(items)} document(s) ready to import")
 
             def show(i):
-                cur["i"] = i
+                cur["i"] = None                          # (setting the fields mustn't store into the old entry)
                 it = items[i]
                 d_var.set(it["date"])
                 n_var.set(it["number"])
-                k_var.set(kind_name[it["kind"]])
+                k_var.set(kind_name.get(it["kind"], it["kind"].partition(":")[2]))
                 set_text(txt, it["text"])
+                cur["i"] = i
 
             def on_select(_=None):
                 sel = tv.selection()
@@ -17250,27 +17392,31 @@ def run_gui():
                     show(int(sel[0]))
             tv.bind("<<TreeviewSelect>>", on_select)
 
-            def add_texts(pairs):
+            def add_texts(pairs, paths=None):
                 store()
-                for source, text in pairs:
-                    for n in split_notes(text, split_var.get()):
+                for k_, (source, text) in enumerate(pairs):
+                    parts_ = split_notes(text, split_var.get())
+                    for n in parts_:
                         n["source"] = source
+                        if paths and len(parts_) == 1:      # one document from one file: keep the original too
+                            n["path"] = paths[k_]
                         items.append(n)
                 items.sort(key=lambda it: it["date"] or "9999")
                 refresh(len(items) - 1 if items else None)
 
             def add_files():
-                paths = filedialog.askopenfilenames(parent=win, title="Choose past notes", filetypes=[
-                    ("Notes", "*.txt *.md *.docx *.pdf"), ("All files", "*.*")])
-                pairs, errors = [], []
+                paths = filedialog.askopenfilenames(parent=win, title="Choose documents", filetypes=[
+                    ("Documents", "*.txt *.md *.docx *.pdf"), ("All files", "*.*")])
+                pairs, errors, ok_paths = [], [], []
                 for p in paths:
                     try:
                         pairs.append((os.path.basename(p), extract_text(p)))
+                        ok_paths.append(p)
                     except Exception as e:
                         errors.append(f"{os.path.basename(p)}: {e}")
                 if errors:
                     messagebox.showerror(APP_NAME, "Some files couldn't be read:\n\n" + "\n".join(errors), parent=win)
-                add_texts(pairs)
+                add_texts(pairs, ok_paths)
 
             def paste():
                 pw = new_window(win, "Paste notes", "720x500")
@@ -17304,13 +17450,13 @@ def run_gui():
                                     variable=split_var), gap=px(14))
             bottom = ttk.Frame(f)
             bottom.pack(fill="x", pady=(8, 0), side="bottom", before=ed)   # never squeezed off-screen
-            count = ttk.Label(bottom, text="0 note(s) ready to import", style="Muted.TLabel")
+            count = ttk.Label(bottom, text="0 document(s) ready to import", style="Muted.TLabel")
             count.pack(side="left")
 
             def do_import():
                 store()
                 if not items:
-                    return messagebox.showinfo(APP_NAME, "Add some notes first.", parent=win)
+                    return messagebox.showinfo(APP_NAME, "Add some documents first.", parent=win)
                 missing = [i for i, it in enumerate(items) if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", it["date"] or "")]
                 if missing:
                     tv.selection_set(str(missing[0]))
@@ -17321,7 +17467,22 @@ def run_gui():
                 now = datetime.now().isoformat(timespec="seconds")
                 existing_days = {d["meta"].get("session_date") for _, d in vault.sessions_for(client["id"])}
                 plans_in = [it for it in items if it["kind"] == "plan"]
-                notes_in = [it for it in items if it["kind"] != "plan"]
+                docs_in = [it for it in items if it["kind"].startswith("doc:")]
+                notes_in = [it for it in items if it["kind"] != "plan" and not it["kind"].startswith("doc:")]
+                for it in docs_in:    # other documents: the patient's Documents tab (original file kept, encrypted)
+                    fid = ""
+                    if it.get("path") and os.path.isfile(it["path"]):
+                        try:
+                            fid = self.patient_file_add(client["id"], it["path"], "document",
+                                                        note=it["kind"][4:])["id"]
+                        except Exception:
+                            fid = ""
+                    c = vault.load_client(client["id"])
+                    c.setdefault("documents", []).append({
+                        "id": uuid.uuid4().hex[:12], "type": it["kind"][4:], "date": it["date"],
+                        "title": it.get("source") if it.get("source") != "pasted" else "",
+                        "text": it["text"], "file_id": fid, "added": now})
+                    vault.save_client(c)
                 joined = sum(1 for it in notes_in if it["date"] in existing_days)
                 if plans_in:          # treatment plans join the patient's plan history, in date order
                     c = vault.load_client(client["id"])
@@ -17347,8 +17508,9 @@ def run_gui():
                         "context_used": []})
                 n = len(notes_in)
                 win.destroy()
-                self.open_client(client["id"])
+                self.open_client(client["id"], select="docs" if docs_in and not notes_in else None)
                 self.set_status(f"Imported {n} note(s)"
+                                + (f", {len(docs_in)} document(s) (on the Documents tab)" if docs_in else "")
                                 + (f" and {len(plans_in)} treatment plan(s)" if plans_in else "")
                                 + (f"; {joined} joined a date that already had a session "
                                                               "(shown as an extra tab)" if joined else "")
@@ -17356,7 +17518,7 @@ def run_gui():
 
             ttk.Button(bottom, text="Cancel", command=win.destroy).pack(side="right")
             ttk.Button(bottom, text="Import", style="Accent.TButton", command=do_import).pack(side="right", padx=6)
-            win._test = {"add_texts": add_texts, "items": items, "do_import": do_import}
+            win._test = {"add_texts": add_texts, "items": items, "do_import": do_import, "date": d_var, "kind": k_var}
             self._import_win = win
 
         def make_case_overview(self, client):
@@ -22652,6 +22814,58 @@ def run_gui():
                     ttk.Label(r_, text=f"• {d['name']}  ·  set up {fmt_date(d['created'][:10])}").pack(side="left")
                     ttk.Button(r_, text="Remove", command=lambda d=d: remove_phone(d)).pack(side="right")
             show_phone()
+
+            # ---- document types for Write ▸ Import document
+            dt = ttk.LabelFrame(outer, text="Document types (for Write ▸ Import document)", padding=px(10))
+            dt.pack(fill="x", pady=(px(10), 0))
+            ttk.Label(dt, text="Besides progress notes, intakes, contact notes and treatment plans, you can import "
+                               "these kinds of documents. They go on the patient's Documents tab (with the original "
+                               "file, encrypted), and the AI uses them for the case overview, treatment plans and Ask "
+                               "AI. Removing a type here doesn't remove documents already imported.",
+                      style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w")
+            dt_list = ttk.Frame(dt)
+            dt_list.pack(fill="x", pady=(px(6), 0))
+            dt_row = Flow(dt, gap=px(8))
+            dt_row.pack(fill="x", pady=(px(6), 0))
+            dt_var = tk.StringVar()
+            dt_entry = dt_row.add(ttk.Entry(dt_row, textvariable=dt_var, width=34))
+            dt_msg = ttk.Label(dt, text="", style="Muted.TLabel")
+            dt_msg.pack(anchor="w")
+
+            def dt_save(types):
+                self.settings["doc_types"] = types
+                vault.save_settings(self.settings)
+
+            def dt_show():
+                for w_ in dt_list.winfo_children():
+                    w_.destroy()
+                for name in self.doc_types():
+                    r_ = ttk.Frame(dt_list)
+                    r_.pack(fill="x", pady=(px(1), 0))
+                    ttk.Label(r_, text=f"• {name}").pack(side="left")
+                    ttk.Button(r_, text="Remove", command=lambda n=name: dt_remove(n)).pack(side="right")
+
+            def dt_add(*_):
+                name = re.sub(r"\s+", " ", dt_var.get()).strip()[:60]
+                if not name:
+                    return dt_msg.config(text="Type the name of the new document type first.")
+                builtin = ["progress note", "intake assessment", "treatment plan", "patient contact",
+                           "parent contact", "collateral contact"]
+                if name.lower() in builtin + [t.lower() for t in self.doc_types()]:
+                    return dt_msg.config(text=f"“{name}” is already a type.")
+                dt_save(self.doc_types() + [name])
+                dt_var.set("")
+                dt_msg.config(text=f"Added “{name}”.")
+                dt_show()
+
+            def dt_remove(name):
+                dt_save([t for t in self.doc_types() if t != name])
+                dt_msg.config(text=f"Removed “{name}” (documents already imported keep it).")
+                dt_show()
+            dt_row.add(ttk.Button(dt_row, text="＋  Add type", command=dt_add))
+            dt_entry.bind("<Return>", dt_add)
+            dt_show()
+            win._doc_types = {"var": dt_var, "add": dt_add, "remove": dt_remove}
 
             # ---- writing preferences learned from your edits
             wp = ttk.LabelFrame(outer, text="Writing preferences (learned from your edits)", padding=px(10))
