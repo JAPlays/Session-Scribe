@@ -70,6 +70,42 @@ def script(app, root, V, h):
     ss.generate_case_overview(dict(ss.load_config()), V.load_client(cid), [d for _, d in V.sessions_for(cid)], "",
                               lambda *a, **k: None)
     h.ok("the case overview gets it as background", any("FSIQ 104" in p for p in h.PROMPTS[n0:]))
+
+    # .docx files formatted like real reports (tab stops, tables, styled runs): only the words come through
+    import zipfile
+    W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+    body = (
+        '<w:p><w:pPr><w:pBdr><w:left w:val="nil"/></w:pBdr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs>'
+        '<w:spacing w:after="0"/><w:jc w:val="right"/><w:rPr><w:rFonts w:ascii="Spectral"/></w:rPr></w:pPr>'
+        '<w:r><w:rPr><w:b w:val="0"/></w:rPr><w:t xml:space="preserve">Reason for referral: </w:t></w:r>'
+        '<w:r><w:tab/><w:t>attention concerns.</w:t></w:r></w:p>'
+        '<w:tbl><w:tblPr><w:tblW w:w="0"/></w:tblPr><w:tr><w:tc><w:tcPr><w:tcW w:w="100"/></w:tcPr>'
+        '<w:p><w:r><w:t>WAIS-IV FSIQ</w:t></w:r></w:p></w:tc><w:tc><w:tcPr/><w:p><w:r><w:t>104</w:t></w:r></w:p>'
+        '</w:tc></w:tr></w:tbl>'
+        '<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Diagnosis: ADHD &amp; anxiety</w:t></w:r></w:p>')
+    dx = os.path.join(tmp, "Report.docx")
+    with zipfile.ZipFile(dx, "w") as z:
+        z.writestr("word/document.xml", f'<?xml version="1.0"?><w:document {W}><w:body>{body}</w:body></w:document>')
+    text = ss.extract_text(dx)
+    h.ok("a formatted .docx gives only its words", "<w:" not in text and "Reason for referral: attention concerns."
+         in text and "WAIS-IV FSIQ" in text and "104" in text and "Diagnosis: ADHD & anxiety" in text, text)
+
+    # a document imported before the fix (XML in its text) is repaired from its kept original
+    fid = app.patient_file_add(cid, dx, "document", note="Psychological assessment")["id"]
+    c = V.load_client(cid)
+    c["documents"].append({"id": "bad1", "type": "Psychological assessment", "date": "2024-01-01", "title": "Report.docx",
+                           "text": 'Reason<w:pPr><w:spacing w:after="0"/></w:pPr> junk', "file_id": fid, "added": "x"})
+    V.save_client(c)
+    V.save_session({"meta": {"client_id": cid, "session_date": "2024-02-01", "session_number": "", "kind": "progress",
+                             "source": "imported", "created": "x"},
+                    "note": 'Old note<w:rPr><w:b w:val="0"/></w:rPr> text', "transcript": ""})
+    app.open_client(cid, select="docs"); h.pump(root, 1)
+    c = V.load_client(cid)
+    fixed = next(d for d in c["documents"] if d["id"] == "bad1")
+    h.ok("opening the patient re-reads the damaged document from its original", "<w:" not in fixed["text"]
+         and "Diagnosis: ADHD & anxiety" in fixed["text"], fixed["text"][:200])
+    old = next(d for _, d in V.sessions_for(cid) if d["meta"].get("session_date") == "2024-02-01")
+    h.ok("…and strips the XML out of an imported note", old["note"] == "Old note text", old["note"])
     h.ok("no errors", not errors, errors[-1:] if errors else "")
 
 

@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.14"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.15"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2888,7 +2888,7 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
                       "recent": cm.get("date", "")})
     # imported documents (psychological assessments, records…): in when the question names their type or words
     for doc in client.get("documents") or []:
-        text = doc.get("text") or ""
+        text = strip_word_xml(doc.get("text") or "")
         if not text.strip():
             continue
         low = text.lower()
@@ -5345,7 +5345,10 @@ def extract_text(path, src=None):
             # page breaks become form feeds, so multi-page documents can be reassembled
             p = re.sub(r"<w:br[^>]*w:type=\"page\"[^>]*/>|<w:lastRenderedPageBreak/>", "<w:t>\f</w:t>", p)
             p = re.sub(r"<w:br[^>]*/>", "\n", p)
-            paras.append(html.unescape("".join(re.findall(r"<w:t[^>]*>(.*?)</w:t>", p, flags=re.S))))
+            # only <w:t> itself — "<w:t[^>]*>" also matched <w:tabs>, <w:tc>, <w:tbl>…, pulling the paragraph's
+            # formatting XML into the text
+            runs = re.findall(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>", p, flags=re.S)
+            paras.append(html.unescape(re.sub(r"<[^>]+>", "", "".join(runs))))
         return _normalize("\n".join(paras))
     if ext == ".pdf":
         try:
@@ -5365,6 +5368,14 @@ def extract_text(path, src=None):
         return _normalize(src.read().decode("utf-8", errors="replace"))
     with open(path, encoding="utf-8", errors="replace") as f:
         return _normalize(f.read())
+
+
+def strip_word_xml(text):
+    """Text imported before the .docx fix could carry Word formatting XML (<w:pPr>…); keep only the words."""
+    if "<w:" not in (text or ""):
+        return text or ""
+    import html
+    return _normalize(html.unescape(re.sub(r"<[^>]+>", "", text)))
 
 
 def _normalize(text):
@@ -9389,7 +9400,8 @@ def documents_blocks(client, hide):
     for d in sorted(client.get("documents") or [], key=lambda x: x.get("date", "")):
         if (d.get("text") or "").strip():
             out.append(f"=== {d.get('type', 'Document').upper()} — {fmt_date(d.get('date', ''))} (imported document"
-                       + (f": {d['title']}" if d.get("title") else "") + f") ===\n{hide(d['text']).strip()}")
+                       + (f": {d['title']}" if d.get("title") else "") + f") ===\n"
+                       + hide(strip_word_xml(d["text"])).strip())
     return out
 
 
@@ -14194,6 +14206,9 @@ def run_gui():
                 sessions = vault.sessions_for(cid)          # oldest first
                 if followups_sync(client, sessions):        # contact notes' "Follow-up:" lists → the checklist
                     _quiet(vault.save_client, client)
+                if self.repair_word_xml(client, sessions):  # imports read before the .docx fix
+                    client = vault.load_client(cid)
+                    sessions = vault.sessions_for(cid)
                 self._sig = vault.signature()              # what's on screen is current
             self.show(lambda f: self._client_page(f, client, sessions, select))
 
@@ -16883,6 +16898,37 @@ def run_gui():
             return win
 
         # ---------------------------------------------------------------- imported documents
+        def repair_word_xml(self, client, sessions):
+            """Documents and notes imported from .docx before the fix could contain Word's formatting XML.
+            Re-read documents from their kept original; strip the XML from anything else. True if it changed
+            something."""
+            changed = False
+            docs = client.get("documents") or []
+            for d in docs:
+                if "<w:" not in (d.get("text") or ""):
+                    continue
+                new = ""
+                fe = self._file_entry(client, d.get("file_id"))
+                if fe and fe.get("name", "").lower().endswith(".docx"):
+                    try:
+                        new = text_from_bytes(vault.load_file(fe["id"]), ".docx").strip()
+                    except Exception:
+                        new = ""
+                d["text"] = new or strip_word_xml(d["text"]).strip()
+                changed = True
+            if changed:
+                vault.save_client(client)
+            for sid, data in sessions:
+                if data.get("meta", {}).get("source") == "imported" and "<w:" in (data.get("note") or ""):
+                    try:
+                        full = vault.load_session(sid)
+                        full["note"] = strip_word_xml(full.get("note", "")).strip()
+                        vault.save_session(full, sid)
+                        changed = True
+                    except Exception:
+                        pass
+            return changed
+
         def doc_types(self):
             """Document types for Import document (Settings ▸ Document types)."""
             t = self.settings.get("doc_types")
