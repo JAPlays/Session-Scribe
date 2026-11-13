@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.9"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.10"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7313,12 +7313,70 @@ _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d
 _URL_RE = re.compile(r"\bhttps?://\S+|\bwww\.\S+", re.I)
 
 
+_SPELLED_PHONE_RE = re.compile(r"(?<!\d)(?<!\d )(?:\d ){9,10}\d(?! ?\d)")       # "6 3 1 4 5 6 1 2 3 4" (screen-reader text)
+
+
 def scrub_contact_details(text):
     """Email addresses, phone numbers and links -> placeholders (messages often carry them in signatures
     and headers, and the patient's names-to-hide list doesn't cover them)."""
     text = _EMAIL_RE.sub("[EMAIL]", text or "")
     text = _URL_RE.sub("[LINK]", text)
+    text = _SPELLED_PHONE_RE.sub("[PHONE]", text)
     return _PHONE_RE.sub("[PHONE]", text)
+
+
+_INVISIBLE_RE = re.compile("[​-‏‪-‮⁦-⁩﻿]")
+_WEEKDAYS = "Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday"
+_MSG_FROM_RE = re.compile(
+    r"^Message from (?P<who>[^,]+), (?P<body>.*), (?:" + _WEEKDAYS + r"), (?P<mon>[A-Za-z]+) (?P<day>\d{1,2}),? "
+    r"(?P<year>\d{4}),? (?P<time>\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?)\.?$", re.S)
+_MSG_STAMP_RE = re.compile(r"^.{0,40}?\s*•\s*\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?$")   # "(631) 456-1234 • 1:15 PM"
+_MONTHS = {m: i for i, m in enumerate(("january", "february", "march", "april", "may", "june", "july", "august",
+                                       "september", "october", "november", "december"), 1)}
+
+
+def tidy_message_thread(text, other="Patient"):
+    """Text messages copied from a phone or messages web app, as plain one-line-per-message text.
+
+    Handles the screen-reader form some apps copy ("* Message from 6 3 1 …, <text>, Friday, November 13
+    2026, 1:08 PM." followed by the same text again, and "(631) 456-1234 • 1:15 PM" lines): each message
+    becomes "[2026-11-13 1:08 PM] Patient: <text>", the repeated copy and the number/time lines are
+    dropped, and the sender's number never appears. Lines it doesn't recognize are kept as they are."""
+    out, dup = [], ""
+    norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()
+    for raw in _INVISIBLE_RE.sub("", text or "").replace("\r\n", "\n").split("\n"):
+        line = re.sub(r"^\s*[*•·-]\s*", "", raw).strip() if re.match(r"^\s*[*•·]", raw) else raw.strip()
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        m = _MSG_FROM_RE.match(line)
+        if m:
+            who = m.group("who").strip()
+            if re.fullmatch(r"[\d\s+().-]+", who):
+                who = other                          # a phone number: the person on the other end
+            elif who.lower() in ("you", "me", "myself"):
+                who = "Counselor"
+            mon = _MONTHS.get(m.group("mon").lower())
+            when = (f"{int(m.group('year')):04d}-{mon:02d}-{int(m.group('day')):02d} " if mon else "") + \
+                re.sub(r"\s+", " ", m.group("time")).upper().replace(".", "")
+            body = m.group("body").strip()
+            out.append(f"[{when}] {who}: {body}")
+            dup = norm(body)
+            continue
+        if _MSG_STAMP_RE.match(line):
+            continue                                 # the sender/time header the app shows above a message
+        if dup and norm(line) and norm(line) in dup:
+            continue                                 # the message's text again, right after its description
+        dup = ""
+        out.append(line)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+def looks_like_message_export(text):
+    return bool(re.search(r"(?m)^\W*Message from .+, (?:" + _WEEKDAYS + r"), ", _INVISIBLE_RE.sub("", text or "")))
 
 
 def read_messages_file(path):
@@ -14350,6 +14408,11 @@ def run_gui():
                 w_, who_ = contact_choice()
                 remember_choice()
                 party = contact_party(w_, who_)
+                if method == "Text messages" or looks_like_message_export(text):
+                    # one line per message, without the copy app's repeats and the sender's phone number
+                    other = "Patient" if w_ == "patient" else ((who_ or "").strip().capitalize() or
+                                                               ("Contact" if w_ == "other" else "Parent"))
+                    text = tidy_message_thread(text, other=other) or text
                 values.update(contact_method=method, contact_with=w_, contact_who=who_, source_kind=(
                     f"the text messages between the Counselor and {party}, copied by the clinician (oldest first)"
                     if method == "Text messages" else
