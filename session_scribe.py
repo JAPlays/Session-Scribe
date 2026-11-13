@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.11"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.12"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2824,6 +2824,9 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
     if client.get("background"):
         prof.append("Background: " + client["background"])
     add("PATIENT PROFILE", "\n".join(prof))
+    meas = measures_text(client)
+    if meas:
+        add("QUESTIONNAIRE AND ASSESSMENT RESULTS (latest)", meas)
     plan = current_plan(client)
     if plan:
         add(f"CURRENT TREATMENT PLAN (v{plan.get('version', '')}, {str(plan.get('created', ''))[:10]})",
@@ -9344,9 +9347,993 @@ def measures_text(client):
         if t["item9"]:
             line += f"; item 9 (thoughts of being better off dead or self-harm) answered {l_['items'][8]}"
         out.append(line + ".")
+    more = assessments_text(client)                   # the other questionnaires taken here (latest of each)
+    if more:
+        out.append(more)
     return "\n".join(out)
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Assessment library: questionnaires the patient takes on this computer (full screen), scored here.
+# Only free / public-domain instruments, worded as on their official forms (sources in each "credit").
+# Proprietary tests (BDI-II, CDI-2, MMPI, WAIS…) can't be reproduced; their scores go in with
+# "Add assessment…" instead.
+# --------------------------------------------------------------------------- #
+ASSESS_GROUPS = [("child", "Children", "about 7–12"), ("adolescent", "Adolescents", "about 12–17"),
+                 ("adult", "Adults", "18 and over")]
+ASSESS_CATEGORIES = ["Depression", "Anxiety, stress & distress", "Trauma & PTSD", "Substance use", "ADHD",
+                     "Behavior & functioning", "Suicide risk & safety"]
+
+_FREQ4 = [(0, "Not at all"), (1, "Several days"), (2, "More than half the days"), (3, "Nearly every day")]
+_DIFFICULT = [(0, "Not difficult at all"), (1, "Somewhat difficult"), (2, "Very difficult"), (3, "Extremely difficult")]
+_YN = [(1, "Yes"), (0, "No")]
+_BOTHER5 = [(0, "Not at all"), (1, "A little bit"), (2, "Moderately"), (3, "Quite a bit"), (4, "Extremely")]
+_OFTEN5 = [(0, "Never"), (1, "Rarely"), (2, "Sometimes"), (3, "Often"), (4, "Very often")]
+_NSO3 = [(0, "Never"), (1, "Sometimes"), (2, "Often")]
+
+
+def _q(qid, text, opts=None, **kw):
+    """One question: kind 'choice' (opts = [(score, label)]), 'number' (lo/hi) or 'text' (optional, unscored)."""
+    d = {"id": str(qid), "text": text, "kind": kw.pop("kind", "choice" if opts is not None else "number")}
+    if opts is not None:
+        d["opts"] = opts
+    d.update(kw)
+    return d
+
+
+def _band(v, bands):
+    """bands = [(lowest score, label)] ascending; the label for v."""
+    out = bands[0][1]
+    for lo, name in bands:
+        if v >= lo:
+            out = name
+    return out
+
+
+def _val(a, qid, default=0):
+    v = (a or {}).get(str(qid))
+    return default if v is None or v == "" else v
+
+
+def _label_of(inst, qid, value):
+    q = next((x for x in inst["items"] if x["id"] == str(qid)), None)
+    if not q or q["kind"] != "choice":
+        return "" if value is None else str(value)
+    return next((lbl for sc, lbl in q["opts"] if sc == value), str(value))
+
+
+def assessment_visible(inst, answers):
+    """The questions this patient is asked, in order (follows the instrument's skip rules)."""
+    return [q for q in inst["items"] if not q.get("show") or q["show"](answers or {})]
+
+
+# ---- scoring -----------------------------------------------------------------------------------------------
+_PHQ_BANDS = [(0, "minimal"), (5, "mild"), (10, "moderate"), (15, "moderately severe"), (20, "severe")]
+
+
+def _score_phq(a, adolescent=False):
+    total = sum(int(_val(a, i)) for i in range(1, 10))
+    band = _band(total, _PHQ_BANDS)
+    flags, lines = [], [f"{total} of 27: {band} depressive symptoms."]
+    if total >= 10:
+        lines.append("10 or more: possible major depression — confirm with a clinical interview.")
+    if int(_val(a, 9)) > 0:
+        flags.append(f"Item 9 (thoughts of being better off dead or of hurting yourself) answered "
+                     f"“{_FREQ4[int(_val(a, 9))][1]}”. Assess suicide risk today (ASQ or C-SSRS, then a brief "
+                     "suicide safety assessment).")
+    if adolescent:
+        if int(_val(a, "month", 0)) == 1:
+            flags.append("Answered YES: serious thoughts about ending their life in the past month.")
+        if int(_val(a, "ever", 0)) == 1:
+            flags.append("Answered YES: has tried to kill themselves or made a suicide attempt at some point.")
+        if int(_val(a, "year", 0)) == 1:
+            lines.append("Felt depressed or sad most days in the past year (possible persistent depressive symptoms).")
+    if (a or {}).get("diff") not in (None, ""):
+        lines.append(f"Effect on daily life: {_DIFFICULT[int(a['diff'])][1].lower()}.")
+    return {"total": total, "max": 27, "band": band, "summary": f"{total}/27 ({band})", "lines": lines,
+            "flags": flags, "risk": bool(flags), "values": {"Total": total}}
+
+
+def _score_gad7(a):
+    total = sum(int(_val(a, i)) for i in range(1, 8))
+    band = _band(total, [(0, "minimal"), (5, "mild"), (10, "moderate"), (15, "severe")])
+    lines = [f"{total} of 21: {band} anxiety symptoms."]
+    if total >= 10:
+        lines.append("10 or more: possible generalized anxiety disorder — confirm with a clinical interview.")
+    if (a or {}).get("diff") not in (None, ""):
+        lines.append(f"Effect on daily life: {_DIFFICULT[int(a['diff'])][1].lower()}.")
+    return {"total": total, "max": 21, "band": band, "summary": f"{total}/21 ({band})", "lines": lines, "flags": [],
+            "values": {"Total": total}}
+
+
+_DASS_SCALES = {"Depression": ([3, 5, 10, 13, 16, 17, 21], [(0, "normal"), (10, "mild"), (14, "moderate"),
+                                                              (21, "severe"), (28, "extremely severe")]),
+                "Anxiety": ([2, 4, 7, 9, 15, 19, 20], [(0, "normal"), (8, "mild"), (10, "moderate"), (15, "severe"),
+                                                       (20, "extremely severe")]),
+                "Stress": ([1, 6, 8, 11, 12, 14, 18], [(0, "normal"), (15, "mild"), (19, "moderate"), (26, "severe"),
+                                                       (34, "extremely severe")])}
+
+
+def _score_dass(a):
+    vals, parts, lines = {}, [], []
+    for name, (items, bands) in _DASS_SCALES.items():
+        v = 2 * sum(int(_val(a, i)) for i in items)               # ×2: DASS-21 on the DASS-42 scale
+        vals[name] = v
+        parts.append(f"{name[0]} {v} ({_band(v, bands)})")
+        lines.append(f"{name}: {v} of 42 — {_band(v, bands)}.")
+    lines.append("Scores are doubled to the full DASS scale. The DASS measures severity along each dimension; it "
+                 "isn't a diagnosis.")
+    worst = max(_band(vals[n], b).count("severe") for n, (_, b) in _DASS_SCALES.items())
+    return {"total": None, "max": 42, "band": "", "summary": ", ".join(parts), "lines": lines, "flags": [],
+            "values": vals, "worse_up": True, "_sev": worst}
+
+
+def _score_k10(a):
+    item = {i: (int(_val(a, i, 1)) if str(i) in (a or {}) else 1) for i in range(1, 11)}
+    total = sum(item.values())
+    band = _band(total, [(10, "likely to be well"), (20, "mild"), (25, "moderate"), (30, "severe")])
+    k6 = sum(item[i] - 1 for i in (2, 4, 5, 8, 9, 10))
+    lines = [f"{total} (10–50): " + ("likely to be well." if total < 20 else
+                                    f"likely to have a {band} mental health disorder (primary care guide)."),
+             f"K6 from the same answers: {k6} of 24" + (" — 13 or more suggests serious psychological distress."
+                                                         if k6 >= 13 else ".")]
+    return {"total": total, "max": 50, "band": band, "summary": f"{total}/50 ({band}); K6 {k6}", "lines": lines,
+            "flags": [], "values": {"K10": total, "K6": k6}}
+
+
+def _score_who5(a):
+    raw = sum(int(_val(a, i)) for i in range(1, 6))
+    pct = raw * 4
+    low = [i for i in range(1, 6) if int(_val(a, i)) <= 1]
+    poor = raw < 13 or low
+    lines = [f"Raw score {raw} of 25 = {pct}% (higher is better well-being)."]
+    if poor:
+        lines.append("Below 13, or 0–1 on any item: poor well-being — screen for depression (e.g. PHQ-9).")
+    lines.append("A 10-point change in the percentage score is a meaningful change.")
+    return {"total": pct, "max": 100, "band": "poor well-being" if poor else "", "higher_better": True,
+            "summary": f"{pct}% (raw {raw}/25)" + (" — poor well-being" if poor else ""), "lines": lines, "flags": [],
+            "values": {"Well-being %": pct}}
+
+
+def _score_pcl5(a):
+    v = {i: int(_val(a, i)) for i in range(1, 21)}
+    total = sum(v.values())
+    clusters = {"Intrusion (B)": range(1, 6), "Avoidance (C)": range(6, 8), "Mood & cognition (D)": range(8, 15),
+                "Arousal (E)": range(15, 21)}
+    vals = {"Total": total}
+    vals.update({k: sum(v[i] for i in r) for k, r in clusters.items()})
+    n = {k: sum(1 for i in r if v[i] >= 2) for k, r in clusters.items()}       # 2 = "Moderately" or more
+    dsm = n["Intrusion (B)"] >= 1 and n["Avoidance (C)"] >= 1 and n["Mood & cognition (D)"] >= 2 \
+        and n["Arousal (E)"] >= 2
+    probable = total >= 31
+    lines = [f"Total {total} of 80. " + ("31–33 or more suggests probable PTSD (National Center for PTSD) — confirm "
+                                          "with a clinical interview." if probable else "Below the usual cut-point "
+                                                                                         "(31–33).")]
+    lines.append("DSM-5 symptom pattern (items rated 2+: 1 B, 1 C, 2 D, 2 E): " + ("met" if dsm else "not met") + ".")
+    lines += [f"{k}: {vals[k]}" for k in clusters]
+    return {"total": total, "max": 80, "band": "probable PTSD" if probable else "below cut-point",
+            "summary": f"{total}/80" + (" (probable PTSD)" if probable else ""), "lines": lines, "flags": [],
+            "values": vals}
+
+
+def _score_pcptsd5(a):
+    if int(_val(a, "exp")) != 1:
+        return {"total": 0, "max": 5, "band": "no trauma exposure reported", "summary": "0/5 (no exposure reported)",
+                "lines": ["No traumatic event reported: screen total 0."], "flags": [], "values": {"Total": 0}}
+    total = sum(int(_val(a, i)) for i in range(1, 6))
+    pos = total >= 4
+    lines = [f"{total} of 5 “yes”. " + ("Positive screen (cut-point 4): probable PTSD — further assessment, ideally "
+                                       "a structured interview." if pos else "Below the cut-point of 4."),
+             "VA guidance: for women a cut-point of 3 may be considered to avoid missed cases."]
+    return {"total": total, "max": 5, "band": "positive" if pos else "negative",
+            "summary": f"{total}/5 ({'positive' if pos else 'negative'})", "lines": lines, "flags": [],
+            "values": {"Total": total}}
+
+
+def _score_iesr(a):
+    sub = {"Intrusion": [1, 2, 3, 6, 9, 14, 16, 20], "Avoidance": [5, 7, 8, 11, 12, 13, 17, 22],
+           "Hyperarousal": [4, 10, 15, 18, 19, 21]}
+    total = sum(int(_val(a, i)) for i in range(1, 23))
+    vals = {"Total": total}
+    lines = [f"Total {total} of 88. " + ("33 or more: best cut-point for probable PTSD." if total >= 33 else
+                                         "24 or more: PTSD is a clinical concern." if total >= 24 else
+                                         "Below 24.")]
+    for k, items in sub.items():
+        m = round(sum(int(_val(a, i)) for i in items) / len(items), 2)
+        vals[k] = m
+        lines.append(f"{k}: mean {m} (0–4)")
+    lines.append("A screening measure, not a diagnosis.")
+    band = "probable PTSD" if total >= 33 else "clinical concern" if total >= 24 else "below 24"
+    return {"total": total, "max": 88, "band": band, "summary": f"{total}/88 ({band})", "lines": lines,
+            "flags": [], "values": vals}
+
+
+def _score_audit(a):
+    v = {i: int(_val(a, i)) for i in range(1, 11)}
+    total = sum(v.values())
+    zone = _band(total, [(0, "Zone I: low risk"), (8, "Zone II: hazardous use"), (16, "Zone III: harmful use"),
+                         (20, "Zone IV: possible dependence")])
+    ac = v[1] + v[2] + v[3]
+    lines = [f"Total {total} of 40 — {zone}.",
+             {"Zone I: low risk": "Alcohol education.", "Zone II: hazardous use": "Simple advice.",
+              "Zone III: harmful use": "Simple advice plus brief counseling and continued monitoring.",
+              "Zone IV: possible dependence": "Referral to a specialist for diagnostic evaluation and treatment."}[zone]
+             + " (WHO guidance)",
+             f"AUDIT-C (questions 1–3): {ac} of 12 — positive at 4+ for men, 3+ for women."]
+    flags = []
+    if v[4] + v[5] + v[6] > 0:
+        lines.append("Points on questions 4–6 suggest possible alcohol dependence.")
+    return {"total": total, "max": 40, "band": zone.split(":")[0], "summary": f"{total}/40 ({zone})",
+            "lines": lines, "flags": flags, "values": {"AUDIT": total, "AUDIT-C": ac}}
+
+
+_ASRS_SOMETIMES = {1, 2, 3, 9, 12, 16, 18}            # shaded from "Sometimes"; the others from "Often"
+
+
+def _score_asrs(a):
+    v = {i: int(_val(a, i)) for i in range(1, 19)}
+    hit = {i: v[i] >= (2 if i in _ASRS_SOMETIMES else 3) for i in v}
+    part_a = sum(hit[i] for i in range(1, 7))
+    part_b = sum(hit[i] for i in range(7, 19))
+    inatt = sum(hit[i] for i in (1, 2, 3, 4, 7, 8, 9, 10, 11))
+    hyper = sum(hit[i] for i in (5, 6, 12, 13, 14, 15, 16, 17, 18))
+    pos = part_a >= 4
+    lines = [f"Part A (screener): {part_a} of 6 in the shaded range — " +
+             ("4 or more: symptoms highly consistent with ADHD in adults; further investigation warranted."
+              if pos else "below the screener threshold of 4."),
+             f"Part B: {part_b} of 12 in the shaded range (more detail for the clinical interview).",
+             f"All 18: {inatt} of 9 inattentive and {hyper} of 9 hyperactive/impulsive symptoms in the shaded range."]
+    return {"total": part_a, "max": 6, "band": "positive screen" if pos else "negative screen",
+            "summary": f"Part A {part_a}/6 ({'positive' if pos else 'negative'}); Part B {part_b}/12", "lines": lines,
+            "flags": [], "values": {"Part A": part_a, "Part B": part_b}}
+
+
+_GDS_KEY = {1: 0, 2: 1, 3: 1, 4: 1, 5: 0, 6: 1, 7: 0, 8: 1, 9: 1, 10: 1, 11: 0, 12: 1, 13: 0, 14: 1, 15: 1}
+
+
+def _score_gds(a):
+    total = sum(1 for i, key in _GDS_KEY.items() if str(i) in (a or {}) and int(a[str(i)]) == key)
+    band = "normal" if total <= 5 else "suggests depression" if total < 10 else "almost always depression"
+    lines = [f"{total} of 15. " + ("Above 5 suggests depression; follow up with a clinical interview."
+                                   if total > 5 else "5 or less: not suggestive of depression.")]
+    if total >= 10:
+        lines.append("10 or more almost always indicates depression.")
+    return {"total": total, "max": 15, "band": band, "summary": f"{total}/15 ({band})", "lines": lines, "flags": [],
+            "values": {"Total": total}}
+
+
+def _score_bam(a):
+    g = lambda i: int(_val(a, i))
+    use = g(4) + g(5) + g(6)
+    risk = g(1) + g(2) + g(3) + g(8) + g(11) + g(15)
+    prot = g(9) + g(10) + g(12) + g(13) + g(14) + g(16)
+    drugs = [lbl for qid, lbl in (("7a", "marijuana"), ("7b", "sedatives/tranquilizers"), ("7c", "cocaine/crack"),
+                                  ("7d", "other stimulants"), ("7e", "opiates"), ("7f", "inhalants"),
+                                  ("7g", "other drugs")) if g(qid) > 0]
+    lines = [f"Use {use} (0–90), Risk {risk} (0–180), Protective {prot} (0–180).",
+             "Lower Use and Risk and higher Protective are better; there are no cut-offs — compare with this "
+             "patient's earlier BAMs and look at the items behind each score.",
+             f"Days drinking: {g(4)}; heavy drinking: {g(5)}; drug use: {g(6)}" +
+             (f" ({', '.join(drugs)})" if drugs else "") + "."]
+    return {"total": use, "max": 90, "band": "", "summary": f"Use {use}, Risk {risk}, Protective {prot}",
+            "lines": lines, "flags": [], "values": {"Use": use, "Risk": risk, "Protective": prot}}
+
+
+def _score_asq(a):
+    yes = [i for i in range(1, 5) if int(_val(a, i)) == 1]
+    if not yes:
+        return {"total": 0, "max": 1, "band": "negative", "summary": "Negative screen",
+                "lines": ["No to questions 1–4: negative screen. Clinical judgment can always override a negative "
+                          "screen."], "flags": [], "values": {}, "risk": False}
+    acute = int(_val(a, 5)) == 1
+    only_past = yes == [4]
+    flags = [("ACUTE POSITIVE SCREEN — imminent risk: thoughts of killing themselves right now. Needs a STAT/urgent "
+              "safety and full mental health evaluation; the patient can't leave until evaluated. Keep them in "
+              "sight, remove dangerous objects, alert the clinician responsible.") if acute else
+             ("Non-acute positive screen — potential risk. Needs a brief suicide safety assessment to decide whether "
+              "(and when) a full mental health evaluation is needed.")]
+    lines = [f"Yes to question{'s' if len(yes) > 1 else ''} {', '.join(map(str, yes))}."]
+    if 4 in yes and (a or {}).get("4a") not in (None, ""):
+        lines.append("Most recent attempt: " + ("within the last 12 months." if int(a["4a"]) == 1 else
+                                                "over 1 year ago."))
+    if only_past and not acute and int(_val(a, "4a", 1)) == 0:
+        lines.append("Positive only because of a past attempt more than a year ago: for adults a brief suicide "
+                     "safety assessment may not be necessary; for youth, only if one has been documented since "
+                     "that attempt (NIMH).")
+    lines.append("Give every patient: 988 Suicide & Crisis Lifeline (call or text 988) and Crisis Text Line "
+                 "(text HOME to 741741).")
+    return {"total": 2 if acute else 1, "max": 2, "band": "acute positive" if acute else "non-acute positive",
+            "summary": "ACUTE positive screen" if acute else "Non-acute positive screen", "lines": lines,
+            "flags": flags, "values": {}, "risk": True}
+
+
+def _score_cssrs(a):
+    y = lambda q: int(_val(a, q)) == 1
+    recent6 = y(6) and int(_val(a, "6a")) == 1
+    if y(4) or y(5) or recent6:
+        level = "high"
+    elif y(3) or y(6):
+        level = "moderate"
+    elif y(1) or y(2):
+        level = "low"
+    else:
+        level = "none"
+    said = [n for n, q in (("wish to be dead", 1), ("thoughts of killing themselves", 2), ("thinking about how", 3),
+                           ("some intention of acting", 4), ("worked out details / intends to carry out a plan", 5),
+                           ("suicidal behavior or preparation (lifetime)", 6)) if y(q)]
+    flags = []
+    if level == "high":
+        flags.append("HIGH RISK on the C-SSRS screener (intent, a plan, or suicidal behavior in the past 3 months): "
+                     "immediate safety evaluation and safety planning; don't leave the patient alone.")
+    elif level == "moderate":
+        flags.append("MODERATE RISK on the C-SSRS screener: complete a suicide safety assessment and safety plan; "
+                     "consult your supervisor.")
+    elif level == "low":
+        flags.append("LOW RISK on the C-SSRS screener (passive or active ideation without method, intent or "
+                     "plan): assess further and consider a safety plan and follow-up.")
+    lines = [("Yes to: " + "; ".join(said) + ".") if said else "No to every question."]
+    if y(6):
+        lines.append("Behavior was " + ("within the past three months." if recent6 else "more than three months ago."))
+    return {"total": {"none": 0, "low": 1, "moderate": 2, "high": 3}[level], "max": 3,
+            "band": f"{level} risk" if level != "none" else "no ideation reported",
+            "summary": f"{level.capitalize()} risk" if level != "none" else "No ideation or behavior reported",
+            "lines": lines, "flags": flags, "values": {}, "risk": level != "none"}
+
+
+_CRAFFT_SUD = {1: 32, 2: 64, 3: 79, 4: 92, 5: 100, 6: 100}
+
+
+def _score_crafft(a):
+    days = [int(_val(a, i)) for i in (1, 2, 3)]
+    score = sum(1 for i in range(4, 10) if int(_val(a, i)) == 1)
+    car = int(_val(a, 4)) == 1
+    lines = [f"Past-year days: alcohol {days[0]}, marijuana {days[1]}, other drugs {days[2]}.",
+             f"CRAFFT score {score} of 6" + (" — 2 or more suggests a serious problem and need for further "
+                                              "assessment." if score >= 2 else ".")]
+    if score:
+        lines.append(f"About {_CRAFFT_SUD[score]}% of adolescents with this score have a DSM-5 substance use "
+                     "disorder (Mitchell et al., 2014).")
+    flags = ["CAR question answered YES: riding/driving risk counseling (Contract for Life, crafft.org/contract)."] \
+        if car else []
+    return {"total": score, "max": 6, "band": "positive" if score >= 2 else "negative",
+            "summary": f"CRAFFT {score}/6" + (" (positive)" if score >= 2 else "") +
+                       ("; no use reported" if not any(days) else ""),
+            "lines": lines, "flags": flags, "values": {"CRAFFT score": score}}
+
+
+_S2BI_SUBST = [("1", "nicotine/tobacco"), ("2", "alcohol"), ("3", "marijuana"), ("4", "prescription drugs not "
+               "prescribed"), ("5", "illegal drugs"), ("6", "inhalants"), ("7", "herbs or synthetic drugs")]
+
+
+def _score_s2bi(a):
+    used = [(lbl, int(_val(a, q))) for q, lbl in _S2BI_SUBST if int(_val(a, q)) > 0]
+    top = max([v for _, v in used], default=0)
+    level = ["No reported use", "Lower risk (once or twice)", "Higher risk (monthly use)",
+             "Highest risk (weekly or more)"][top]
+    advice = ["Positive reinforcement; discourage all substance use.",
+              "Brief advice: recommend not using at all.",
+              "Monthly use: a substance use disorder is likely. Brief intervention, recommend cessation, and consider "
+              "a referral.",
+              "Weekly or more: a severe substance use disorder is likely. Brief intervention and referral to "
+              "treatment."][top]
+    freq = {1: "once or twice", 2: "monthly", 3: "weekly or more"}
+    lines = [level + ".", advice]
+    if used:
+        lines.append("Past year: " + "; ".join(f"{lbl} {freq[v]}" for lbl, v in used) + ".")
+    return {"total": top, "max": 3, "band": level, "summary": level, "lines": lines, "flags": [], "values": {}}
+
+
+_SCARED_SUB = {"Panic/somatic": ([1, 6, 9, 12, 15, 18, 19, 22, 24, 27, 30, 34, 38], 7,
+                                 "panic disorder or significant somatic symptoms"),
+               "Generalized anxiety": ([5, 7, 14, 21, 23, 28, 33, 35, 37], 9, "generalized anxiety disorder"),
+               "Separation anxiety": ([4, 8, 13, 16, 20, 25, 29, 31], 5, "separation anxiety disorder"),
+               "Social anxiety": ([3, 10, 26, 32, 39, 40, 41], 8, "social anxiety disorder"),
+               "School avoidance": ([2, 11, 17, 36], 3, "significant school avoidance")}
+
+
+def _score_scared(a):
+    total = sum(int(_val(a, i)) for i in range(1, 42))
+    vals, lines = {"Total": total}, [f"Total {total} of 82. " + (
+        "Above 30 is more specific for an anxiety disorder." if total > 30 else
+        "25 or more may indicate an anxiety disorder." if total >= 25 else "Below 25.")]
+    for name, (items, cut, what) in _SCARED_SUB.items():
+        v = sum(int(_val(a, i)) for i in items)
+        vals[name] = v
+        lines.append(f"{name}: {v}" + (f" — {cut}+ may indicate {what}." if v >= cut else f" (cut-point {cut})."))
+    band = "likely anxiety disorder" if total > 30 else "possible anxiety disorder" if total >= 25 else "below 25"
+    return {"total": total, "max": 82, "band": band, "summary": f"{total}/82 ({band})", "lines": lines, "flags": [],
+            "values": vals}
+
+
+def _score_smfq(a):
+    total = sum(int(_val(a, i)) for i in range(1, 14))
+    pos = total >= 8
+    lines = [f"{total} of 26. " + ("8 or more suggests possible depression — follow up with a clinical interview "
+                                   "(some studies use a higher cut-point for teens)." if pos else "Below 8.")]
+    if int(_val(a, 8)) == 2 or int(_val(a, 5)) == 2:
+        lines.append("Strong self-criticism endorsed (“I hated myself” / “I felt I was no good anymore”).")
+    return {"total": total, "max": 26, "band": "possible depression" if pos else "below cut-point",
+            "summary": f"{total}/26" + (" (possible depression)" if pos else ""), "lines": lines, "flags": [],
+            "values": {"Total": total}}
+
+
+def _score_psc(a, youth=False):
+    if youth:                     # Y-PSC-17 item order
+        sub = {"Internalizing": [2, 6, 9, 11, 15], "Attention": [1, 3, 7, 13, 17],
+               "Externalizing": [4, 5, 8, 10, 12, 14, 16]}
+    else:
+        sub = {"Internalizing": [1, 2, 3, 4, 5], "Attention": [6, 7, 8, 9, 10],
+               "Externalizing": [11, 12, 13, 14, 15, 16, 17]}
+    cuts = {"Internalizing": 5, "Attention": 7, "Externalizing": 7}
+    total = sum(int(_val(a, i)) for i in range(1, 18))
+    vals, lines = {"Total": total}, [f"Total {total} of 34" + (" — 15 or more: positive screen; further evaluation."
+                                                                  if total >= 15 else " (cut-point 15).")]
+    for k, items in sub.items():
+        v = sum(int(_val(a, i)) for i in items)
+        vals[k] = v
+        lines.append(f"{k}: {v}" + (f" — positive ({cuts[k]}+)." if v >= cuts[k] else f" (cut-point {cuts[k]})."))
+    if (a or {}).get("help") not in (None, "") and int(a["help"]) == 1:
+        lines.append("The parent says the child has emotional or behavioral problems they need help with.")
+    pos = total >= 15 or any(vals[k] >= cuts[k] for k in cuts)
+    return {"total": total, "max": 34, "band": "positive" if pos else "negative",
+            "summary": f"{total}/34 ({'positive' if pos else 'negative'})", "lines": lines, "flags": [],
+            "values": vals}
+
+
+# ---- the instruments -----------------------------------------------------------------------------------------
+_PHQ_STEM = "Over the last 2 weeks, how often have you been bothered by any of the following problems?"
+_PHQ9_ITEMS = ["Little interest or pleasure in doing things", "Feeling down, depressed, or hopeless",
+               "Trouble falling or staying asleep, or sleeping too much", "Feeling tired or having little energy",
+               "Poor appetite or overeating",
+               "Feeling bad about yourself — or that you are a failure or have let yourself or your family down",
+               "Trouble concentrating on things, such as reading the newspaper or watching television",
+               "Moving or speaking so slowly that other people could have noticed? Or the opposite — being so "
+               "fidgety or restless that you have been moving around a lot more than usual",
+               "Thoughts that you would be better off dead or of hurting yourself in some way"]
+_GAD7_ITEMS = ["Feeling nervous, anxious, or on edge", "Not being able to stop or control worrying",
+               "Worrying too much about different things", "Trouble relaxing",
+               "Being so restless that it is hard to sit still", "Becoming easily annoyed or irritable",
+               "Feeling afraid as if something awful might happen"]
+_ANY = lambda ids: (lambda a: any(int(_val(a, i)) > 0 for i in ids))
+_PHQ_PFIZER = ("PHQ-9 and GAD-7: developed by Drs. Robert L. Spitzer, Janet B.W. Williams, Kurt Kroenke and colleagues, "
+               "with an educational grant from Pfizer Inc. No permission required to reproduce, translate, display "
+               "or distribute.")
+
+ASSESS_INSTRUMENTS = {}
+
+
+def _inst(**d):
+    d.setdefault("respondent", "patient")
+    d.setdefault("stem", "")
+    ASSESS_INSTRUMENTS[d["id"]] = d
+    return d
+
+
+_inst(id="phq9", name="PHQ-9", title="Patient Health Questionnaire-9", groups=("adult",), cat="Depression",
+      measures="Depression severity", ages="18+", minutes=3, measure_kind="PHQ-9",
+      intro="This questionnaire asks how you have been feeling over the last 2 weeks.", stem=_PHQ_STEM,
+      items=[_q(i, t, _FREQ4) for i, t in enumerate(_PHQ9_ITEMS, 1)] + [
+          _q("diff", "If you checked off any problems, how difficult have these problems made it for you to do your "
+                     "work, take care of things at home, or get along with other people?", _DIFFICULT,
+             stem="", show=_ANY(range(1, 10)), scored=False)],
+      score=_score_phq, credit=_PHQ_PFIZER)
+
+_inst(id="phqa", name="PHQ-A", title="PHQ-9 modified for Adolescents", groups=("adolescent",), cat="Depression",
+      measures="Depression symptoms", ages="11–17", minutes=4,
+      intro="How often have you been bothered by each of the following symptoms during the past two weeks? Choose the "
+            "answer that best describes how you have been feeling.",
+      stem="During the past two weeks, how often have you been bothered by:",
+      items=[_q(i, t, _FREQ4) for i, t in enumerate([
+          "Feeling down, depressed, irritable, or hopeless?", "Little interest or pleasure in doing things?",
+          "Trouble falling asleep, staying asleep, or sleeping too much?", "Poor appetite, weight loss, or overeating?",
+          "Feeling tired, or having little energy?",
+          "Feeling bad about yourself – or feeling that you are a failure, or that you have let yourself or your "
+          "family down?", "Trouble concentrating on things like school work, reading, or watching TV?",
+          "Moving or speaking so slowly that other people could have noticed? Or the opposite – being so fidgety or "
+          "restless that you were moving around a lot more than usual?",
+          "Thoughts that you would be better off dead, or of hurting yourself in some way?"], 1)] + [
+          _q("year", "In the past year have you felt depressed or sad most days, even if you felt okay sometimes?",
+             _YN, stem=""),
+          _q("diff", "If you are experiencing any of the problems on this form, how difficult have these problems made "
+                     "it for you to do your work, take care of things at home or get along with other people?",
+             _DIFFICULT, stem="", show=_ANY(range(1, 10))),
+          _q("month", "Has there been a time in the past month when you have had serious thoughts about ending your "
+                      "life?", _YN, stem=""),
+          _q("ever", "Have you EVER, in your WHOLE LIFE, tried to kill yourself or made a suicide attempt?", _YN,
+             stem="")],
+      score=lambda a: _score_phq(a, adolescent=True),
+      credit="Modified with permission from the PHQ (Spitzer, Williams & Kroenke, 1999) by J. Johnson (Johnson, 2002).")
+
+_inst(id="gad7", name="GAD-7", title="Generalized Anxiety Disorder-7", groups=("adolescent", "adult"),
+      cat="Anxiety, stress & distress", measures="Generalized anxiety symptoms", ages="12+", minutes=2,
+      measure_kind="GAD-7", intro="This questionnaire asks how you have been feeling over the last 2 weeks.",
+      stem=_PHQ_STEM,
+      items=[_q(i, t, _FREQ4) for i, t in enumerate(_GAD7_ITEMS, 1)] + [
+          _q("diff", "If you checked off any problems, how difficult have these problems made it for you to do your "
+                     "work, take care of things at home, or get along with other people?", _DIFFICULT,
+             stem="", show=_ANY(range(1, 8)), scored=False)],
+      score=_score_gad7, credit=_PHQ_PFIZER)
+
+_inst(id="dass21", name="DASS-21", title="Depression Anxiety Stress Scales (21 items)", groups=("adolescent", "adult"),
+      cat="Anxiety, stress & distress", measures="Depression, anxiety and stress", ages="14+", minutes=5,
+      intro="Please read each statement and choose the answer which indicates how much the statement applied to you "
+            "over the past week. There are no right or wrong answers. Do not spend too much time on any statement.",
+      stem="Over the past week:",
+      items=[_q(i, t, [(0, "Did not apply to me at all"), (1, "Applied to me to some degree, or some of the time"),
+                       (2, "Applied to me to a considerable degree, or a good part of time"),
+                       (3, "Applied to me very much, or most of the time")]) for i, t in enumerate([
+          "I found it hard to wind down", "I was aware of dryness of my mouth",
+          "I couldn't seem to experience any positive feeling at all",
+          "I experienced breathing difficulty (eg, excessively rapid breathing, breathlessness in the absence of "
+          "physical exertion)", "I found it difficult to work up the initiative to do things",
+          "I tended to over-react to situations", "I experienced trembling (eg, in the hands)",
+          "I felt that I was using a lot of nervous energy",
+          "I was worried about situations in which I might panic and make a fool of myself",
+          "I felt that I had nothing to look forward to", "I found myself getting agitated",
+          "I found it difficult to relax", "I felt down-hearted and blue",
+          "I was intolerant of anything that kept me from getting on with what I was doing",
+          "I felt I was close to panic", "I was unable to become enthusiastic about anything",
+          "I felt I wasn't worth much as a person", "I felt that I was rather touchy",
+          "I was aware of the action of my heart in the absence of physical exertion (eg, sense of heart rate "
+          "increase, heart missing a beat)", "I felt scared without any good reason",
+          "I felt that life was meaningless"], 1)],
+      score=_score_dass, series=[("Depression", 42), ("Anxiety", 42), ("Stress", 42)],
+      credit="Lovibond, S.H. & Lovibond, P.F. (1995). Manual for the Depression Anxiety Stress Scales. Psychology "
+             "Foundation, Sydney. www.psy.unsw.edu.au/dass")
+
+_K10_OPTS = [(1, "None of the time"), (2, "A little of the time"), (3, "Some of the time"), (4, "Most of the time"),
+             (5, "All of the time")]
+_inst(id="k10", name="K10", title="Kessler Psychological Distress Scale (with K6)", groups=("adolescent", "adult"),
+      cat="Anxiety, stress & distress", measures="Psychological distress (K6 scored too)", ages="12+", minutes=3,
+      intro="These questions are about how you have been feeling in the past 4 weeks.",
+      stem="In the past 4 weeks:",
+      items=[_q(i, t, _K10_OPTS, show=s) for i, (t, s) in enumerate([
+          ("About how often did you feel tired out for no good reason?", None),
+          ("About how often did you feel nervous?", None),
+          ("About how often did you feel so nervous that nothing could calm you down?",
+           lambda a: int(_val(a, 2, 1)) > 1),
+          ("About how often did you feel hopeless?", None),
+          ("About how often did you feel restless or fidgety?", None),
+          ("About how often did you feel so restless you could not sit still?", lambda a: int(_val(a, 5, 1)) > 1),
+          ("About how often did you feel depressed?", None),
+          ("About how often did you feel that everything is an effort?", None),
+          ("About how often did you feel so sad that nothing could cheer you up?", None),
+          ("About how often did you feel worthless?", None)], 1)],
+      score=_score_k10, series=[("K10", 50)],
+      credit="Kessler RC et al. (2002). Short screening scales to monitor population prevalences and trends in "
+             "non-specific psychological distress. Psychol Med 32:959–76. © World Health Organization.")
+
+_inst(id="who5", name="WHO-5", title="WHO-Five Well-Being Index", groups=("adolescent", "adult"),
+      cat="Anxiety, stress & distress", measures="Psychological well-being", ages="9+", minutes=1,
+      intro="Please indicate for each of the five statements which is closest to how you have been feeling over the "
+            "last two weeks.", stem="Over the last two weeks:",
+      items=[_q(i, t, [(5, "All of the time"), (4, "Most of the time"), (3, "More than half of the time"),
+                       (2, "Less than half of the time"), (1, "Some of the time"), (0, "At no time")])
+             for i, t in enumerate(["I have felt cheerful and in good spirits", "I have felt calm and relaxed",
+                                    "I have felt active and vigorous", "I woke up feeling fresh and rested",
+                                    "My daily life has been filled with things that interest me"], 1)],
+      score=_score_who5, higher_better=True,
+      credit="WHO (Five) Well-Being Index (1998 version). Psychiatric Research Unit, WHO Collaborating Centre in "
+             "Mental Health, Frederiksborg General Hospital.")
+
+_inst(id="pcl5", name="PCL-5", title="PTSD Checklist for DSM-5", groups=("adult",), cat="Trauma & PTSD",
+      measures="PTSD symptoms", ages="18+", minutes=6,
+      intro="Below is a list of problems that people sometimes have in response to a very stressful experience. "
+            "Keeping your worst event in mind, please read each problem carefully and then select how much you have "
+            "been bothered by that problem in the past month.",
+      stem="In the past month, how much were you bothered by:",
+      items=[_q("event", "Your worst event (optional — you can skip this):", kind="text", stem="", scored=False)] +
+            [_q(i, t, _BOTHER5) for i, t in enumerate([
+                "Repeated, disturbing, and unwanted memories of the stressful experience?",
+                "Repeated, disturbing dreams of the stressful experience?",
+                "Suddenly feeling or acting as if the stressful experience were actually happening again (as if you "
+                "were actually back there reliving it)?",
+                "Feeling very upset when something reminded you of the stressful experience?",
+                "Having strong physical reactions when something reminded you of the stressful experience (for "
+                "example, heart pounding, trouble breathing, sweating)?",
+                "Avoiding memories, thoughts, or feelings related to the stressful experience?",
+                "Avoiding external reminders of the stressful experience (for example, people, places, conversations, "
+                "activities, objects, or situations)?", "Trouble remembering important parts of the stressful experience?",
+                "Having strong negative beliefs about yourself, other people, or the world (for example, having "
+                "thoughts such as: I am bad, there is something seriously wrong with me, no one can be trusted, the "
+                "world is completely dangerous)?",
+                "Blaming yourself or someone else for the stressful experience or what happened after it?",
+                "Having strong negative feelings such as fear, horror, anger, guilt, or shame?",
+                "Loss of interest in activities that you used to enjoy?", "Feeling distant or cut off from other people?",
+                "Trouble experiencing positive feelings (for example, being unable to feel happiness or have loving "
+                "feelings for people close to you)?", "Irritable behavior, angry outbursts, or acting aggressively?",
+                "Taking too many risks or doing things that could cause you harm?",
+                "Being “superalert” or watchful or on guard?", "Feeling jumpy or easily startled?",
+                "Having difficulty concentrating?", "Trouble falling or staying asleep?"], 1)],
+      score=_score_pcl5, series=[("Total", 80)],
+      credit="Weathers, F.W., Litz, B.T., Keane, T.M., Palmieri, P.A., Marx, B.P., & Schnurr, P.P. (2013). The PTSD "
+             "Checklist for DSM-5 (PCL-5). National Center for PTSD, www.ptsd.va.gov")
+
+_inst(id="pcptsd5", name="PC-PTSD-5", title="Primary Care PTSD Screen for DSM-5", groups=("adult",),
+      cat="Trauma & PTSD", measures="Brief PTSD screen", ages="18+", minutes=2,
+      intro="Sometimes things happen to people that are unusually or especially frightening, horrible, or traumatic. "
+            "For example: a serious accident or fire; a physical or sexual assault or abuse; an earthquake or flood; "
+            "a war; seeing someone be killed or seriously injured; having a loved one die through homicide or "
+            "suicide.",
+      items=[_q("exp", "Have you ever experienced this kind of event?", _YN)] +
+            [_q(i, t, _YN, stem="In the past month, have you…", show=lambda a: int(_val(a, "exp")) == 1)
+             for i, t in enumerate([
+                 "had nightmares about the event(s) or thought about the event(s) when you did not want to?",
+                 "tried hard not to think about the event(s) or went out of your way to avoid situations that "
+                 "reminded you of the event(s)?", "been constantly on guard, watchful, or easily startled?",
+                 "felt numb or detached from people, activities, or your surroundings?",
+                 "felt guilty or unable to stop blaming yourself or others for the event(s) or any problems the "
+                 "event(s) may have caused?"], 1)],
+      score=_score_pcptsd5,
+      credit="Prins, A., Bovin, M.J., Kimerling, R., et al. (2015). Primary Care PTSD Screen for DSM-5 (PC-PTSD-5). "
+             "National Center for PTSD, www.ptsd.va.gov")
+
+_inst(id="iesr", name="IES-R", title="Impact of Event Scale – Revised", groups=("adult",), cat="Trauma & PTSD",
+      measures="Distress after a traumatic event", ages="18+", minutes=5,
+      intro="Below is a list of difficulties people sometimes have after stressful life events. Please read each "
+            "item, and then indicate how distressing each difficulty has been for you DURING THE PAST SEVEN DAYS with "
+            "respect to the event. How much were you distressed or bothered by these difficulties?",
+      stem="During the past seven days, with respect to the event:",
+      items=[_q("event", "The event (optional — you can skip this):", kind="text", stem="", scored=False)] +
+            [_q(i, t, _BOTHER5) for i, t in enumerate([
+                "Any reminder brought back feelings about it", "I had trouble staying asleep",
+                "Other things kept making me think about it", "I felt irritable and angry",
+                "I avoided letting myself get upset when I thought about it or was reminded of it",
+                "I thought about it when I didn't mean to", "I felt as if it hadn't happened or wasn't real",
+                "I stayed away from reminders about it", "Pictures about it popped into my mind",
+                "I was jumpy and easily startled", "I tried not to think about it",
+                "I was aware that I still had a lot of feelings about it, but I didn't deal with them",
+                "My feelings about it were kind of numb",
+                "I found myself acting or feeling as though I was back at that time", "I had trouble falling asleep",
+                "I had waves of strong feelings about it", "I tried to remove it from my memory",
+                "I had trouble concentrating",
+                "Reminders of it caused me to have physical reactions, such as sweating, trouble breathing, nausea, "
+                "or a pounding heart", "I had dreams about it", "I felt watchful or on-guard",
+                "I tried not to talk about it"], 1)],
+      score=_score_iesr, series=[("Total", 88)],
+      credit="Weiss, D.S., & Marmar, C.R. (1997). The Impact of Event Scale-Revised. In J.P. Wilson & T.M. Keane "
+             "(Eds.), Assessing Psychological Trauma and PTSD (pp. 399–411). Guilford Press.")
+
+_FREQ_AUDIT = [(0, "Never"), (1, "Less than monthly"), (2, "Monthly"), (3, "Weekly"), (4, "Daily or almost daily")]
+_INJ = [(0, "No"), (2, "Yes, but not in the last year"), (4, "Yes, during the last year")]
+_drinker = lambda a: int(_val(a, 1)) > 0
+_beyond = lambda a: _drinker(a) and int(_val(a, 2)) + int(_val(a, 3)) > 0
+_inst(id="audit", name="AUDIT", title="Alcohol Use Disorders Identification Test (AUDIT-C scored too)",
+      groups=("adult",), cat="Substance use", measures="Alcohol use (hazardous, harmful, dependence)", ages="18+",
+      minutes=3,
+      intro="These questions are about your use of alcoholic beverages during the past year. One drink means one "
+            "can or bottle of beer, one glass of wine, or one shot of liquor or one mixed drink. Please answer "
+            "honestly.",
+      items=[_q(1, "How often do you have a drink containing alcohol?",
+                [(0, "Never"), (1, "Monthly or less"), (2, "2 to 4 times a month"), (3, "2 to 3 times a week"),
+                 (4, "4 or more times a week")]),
+             _q(2, "How many drinks containing alcohol do you have on a typical day when you are drinking?",
+                [(0, "1 or 2"), (1, "3 or 4"), (2, "5 or 6"), (3, "7, 8, or 9"), (4, "10 or more")], show=_drinker),
+             _q(3, "How often do you have six or more drinks on one occasion?", _FREQ_AUDIT, show=_drinker),
+             _q(4, "How often during the last year have you found that you were not able to stop drinking once you "
+                   "had started?", _FREQ_AUDIT, show=_beyond),
+             _q(5, "How often during the last year have you failed to do what was normally expected from you because "
+                   "of drinking?", _FREQ_AUDIT, show=_beyond),
+             _q(6, "How often during the last year have you needed a first drink in the morning to get yourself going "
+                   "after a heavy drinking session?", _FREQ_AUDIT, show=_beyond),
+             _q(7, "How often during the last year have you had a feeling of guilt or remorse after drinking?",
+                _FREQ_AUDIT, show=_beyond),
+             _q(8, "How often during the last year have you been unable to remember what happened the night before "
+                   "because you had been drinking?", _FREQ_AUDIT, show=_beyond),
+             _q(9, "Have you or someone else been injured as a result of your drinking?", _INJ),
+             _q(10, "Has a relative or friend or a doctor or another health worker been concerned about your drinking "
+                    "or suggested you cut down?", _INJ)],
+      score=_score_audit, series=[("AUDIT", 40)],
+      credit="Babor, T.F., Higgins-Biddle, J.C., Saunders, J.B., & Monteiro, M.G. (2001). AUDIT: The Alcohol Use "
+             "Disorders Identification Test (2nd ed.). World Health Organization.")
+
+_inst(id="asrs", name="ASRS v1.1", title="Adult ADHD Self-Report Scale v1.1 Symptom Checklist", groups=("adult",),
+      cat="ADHD", measures="ADHD symptoms (Part A screener + Part B)", ages="18+", minutes=5,
+      intro="Please answer the questions below, rating yourself on each of the criteria shown. As you answer each "
+            "question, choose the answer that best describes how you have felt and conducted yourself over the past "
+            "6 months.", stem="Over the past 6 months:",
+      items=[_q(i, t, _OFTEN5) for i, t in enumerate([
+          "How often do you have trouble wrapping up the final details of a project, once the challenging parts have "
+          "been done?", "How often do you have difficulty getting things in order when you have to do a task that "
+          "requires organization?", "How often do you have problems remembering appointments or obligations?",
+          "When you have a task that requires a lot of thought, how often do you avoid or delay getting started?",
+          "How often do you fidget or squirm with your hands or feet when you have to sit down for a long time?",
+          "How often do you feel overly active and compelled to do things, like you were driven by a motor?",
+          "How often do you make careless mistakes when you have to work on a boring or difficult project?",
+          "How often do you have difficulty keeping your attention when you are doing boring or repetitive work?",
+          "How often do you have difficulty concentrating on what people say to you, even when they are speaking to "
+          "you directly?", "How often do you misplace or have difficulty finding things at home or at work?",
+          "How often are you distracted by activity or noise around you?",
+          "How often do you leave your seat in meetings or in other situations in which you are expected to stay "
+          "seated?", "How often do you feel restless or fidgety?",
+          "How often do you have difficulty unwinding and relaxing when you have time to yourself?",
+          "How often do you find yourself talking too much when you are in social situations?",
+          "When you're in a conversation, how often do you find yourself finishing the sentences of the people you "
+          "are talking to, before they can finish them themselves?",
+          "How often do you have difficulty waiting your turn in situations when turn taking is required?",
+          "How often do you interrupt others when they are busy?"], 1)],
+      score=_score_asrs, series=[("Part A", 6), ("Part B", 12)],
+      credit="© World Health Organization 2003. Based on the Composite International Diagnostic Interview © 2001 WHO. "
+             "Kessler RC et al., Harvard Medical School.")
+
+_inst(id="gds15", name="GDS-15", title="Geriatric Depression Scale (short form) — older adults", groups=("adult",),
+      cat="Depression", measures="Depression symptoms in older adults", ages="55+ / older adults", minutes=3,
+      intro="Choose the best answer for how you have felt over the past week.", stem="Over the past week:",
+      items=[_q(i, t, _YN) for i, t in enumerate([
+          "Are you basically satisfied with your life?", "Have you dropped many of your activities and interests?",
+          "Do you feel that your life is empty?", "Do you often get bored?", "Are you in good spirits most of the time?",
+          "Are you afraid that something bad is going to happen to you?", "Do you feel happy most of the time?",
+          "Do you often feel helpless?",
+          "Do you prefer to stay at home, rather than going out and doing new things?",
+          "Do you feel you have more problems with memory than most?", "Do you think it is wonderful to be alive now?",
+          "Do you feel pretty worthless the way you are now?", "Do you feel full of energy?",
+          "Do you feel that your situation is hopeless?", "Do you think that most people are better off than you are?"],
+          1)],
+      score=_score_gds,
+      credit="Sheikh, J.I., & Yesavage, J.A. (1986). Geriatric Depression Scale (GDS): Recent evidence and development "
+             "of a shorter version. Public domain.")
+
+_BAM5 = [(0, "Not at all"), (8, "Slightly"), (15, "Moderately"), (22, "Considerably"), (30, "Extremely")]
+_days = lambda i, text, **kw: _q(i, text, kind="number", lo=0, hi=30, unit=kw.pop("unit", "days"), **kw)
+_used_drugs = lambda a: int(_val(a, 6)) > 0
+_inst(id="bam", name="BAM", title="Brief Addiction Monitor (continuous)", groups=("adult",), cat="Substance use",
+      measures="Recovery progress: substance use, risk and protective factors", ages="18+", minutes=5,
+      intro="This is a standard set of questions about several areas of your life such as your health, alcohol and "
+            "drug use, etc. The questions generally ask about the past 30 days. Please consider each question and "
+            "answer as accurately as possible.",
+      items=[_q(1, "In the past 30 days, how would you say your physical health has been?",
+                [(0, "Excellent"), (8, "Very Good"), (15, "Good"), (22, "Fair"), (30, "Poor")]),
+             _days(2, "In the past 30 days, how many nights did you have trouble falling asleep or staying asleep?",
+                   unit="nights"),
+             _days(3, "In the past 30 days, how many days have you felt depressed, anxious, angry or very upset "
+                      "throughout most of the day?"),
+             _days(4, "In the past 30 days, how many days did you drink ANY alcohol?"),
+             _days(5, "In the past 30 days, how many days did you have at least 5 drinks (if you are a man) or at least "
+                      "4 drinks (if you are a woman)? [One drink is considered one shot of hard liquor (1.5 oz.) or "
+                      "12-ounce can/bottle of beer or 5-ounce glass of wine.]", show=lambda a: int(_val(a, 4)) > 0),
+             _days(6, "In the past 30 days, how many days did you use any illegal or street drugs or abuse any "
+                      "prescription medications?")] +
+            [_days(q, t, stem="In the past 30 days, how many days did you use any of the following drugs:",
+                   show=_used_drugs) for q, t in (
+                ("7a", "Marijuana (cannabis, pot, weed)?"),
+                ("7b", "Sedatives and/or Tranquilizers (benzos, Valium, Xanax, Ativan, Ambien, barbs, Phenobarbital, "
+                       "downers, etc.)?"), ("7c", "Cocaine and/or Crack?"),
+                ("7d", "Other Stimulants (amphetamine, methamphetamine, Dexedrine, Ritalin, Adderall, speed, crystal "
+                       "meth, ice, etc.)?"),
+                ("7e", "Opiates (Heroin, Morphine, Dilaudid, Demerol, Oxycontin, oxy, codeine (Tylenol 2,3,4), "
+                       "Percocet, Vicodin, Fentanyl, etc.)?"),
+                ("7f", "Inhalants (glues, adhesives, nail polish remover, paint thinner, etc.)?"),
+                ("7g", "Other drugs (steroids, non-prescription sleep and diet pills, Benadryl, Ephedra, other "
+                       "over-the-counter or unknown medications)?"))] +
+            [_q(8, "In the past 30 days, how much were you bothered by cravings or urges to drink alcohol or use drugs?",
+                _BAM5),
+             _q(9, "How confident are you that you will NOT use alcohol and drugs in the next 30 days?", _BAM5),
+             _days(10, "In the past 30 days, how many days did you attend self-help meetings like AA or NA to support "
+                       "your recovery?"),
+             _days(11, "In the past 30 days, how many days were you in any situations or with any people that might put "
+                       "you at an increased risk for using alcohol or drugs (i.e., around risky “people, places or "
+                       "things”)?"),
+             _q(12, "Does your religion or spirituality help support your recovery?", _BAM5),
+             _days(13, "In the past 30 days, how many days did you spend much of the time at work, school, or doing "
+                       "volunteer work?"),
+             _q(14, "Do you have enough income (from legal sources) to pay for necessities such as housing, "
+                    "transportation, food and clothing for yourself and your dependents?", [(0, "No"), (30, "Yes")]),
+             _q(15, "In the past 30 days, how much have you been bothered by arguments or problems getting along with "
+                    "any family members or friends?", _BAM5),
+             _days(16, "In the past 30 days, how many days did you contact or spend time with any family members or "
+                       "friends who are supportive of your recovery?"),
+             _q(17, "How satisfied are you with your progress toward achieving your recovery goals?", _BAM5,
+                scored=False)],
+      score=_score_bam, series=[("Use", 90), ("Risk", 180), ("Protective", 180)],
+      credit="Brief Addiction Monitor (BAM), U.S. Department of Veterans Affairs. Public domain.")
+
+_ASQ_ANY = lambda a: any(int(_val(a, i)) == 1 for i in range(1, 5))
+_inst(id="asq", name="ASQ", title="Ask Suicide-Screening Questions", groups=("child", "adolescent", "adult"),
+      cat="Suicide risk & safety", measures="Suicide risk screen (with acuity question)",
+      ages="10+ (use judgment for 8–9)", minutes=1,
+      intro="These are a few questions about your safety. Please answer each one honestly. Your counselor will talk "
+            "with you about your answers.",
+      items=[_q(1, "In the past few weeks, have you wished you were dead?", _YN),
+             _q(2, "In the past few weeks, have you felt that you or your family would be better off if you were dead?",
+                _YN),
+             _q(3, "In the past week, have you been having thoughts about killing yourself?", _YN),
+             _q(4, "Have you ever tried to kill yourself?", _YN),
+             _q("4a", "When was the most recent attempt?", [(1, "Within the last 12 months"), (0, "Over 1 year ago")],
+                show=lambda a: int(_val(a, 4)) == 1),
+             _q(5, "Are you having thoughts of killing yourself right now?", _YN, show=_ASQ_ANY)],
+      score=_score_asq, risk_tool=True,
+      credit="Ask Suicide-Screening Questions (ASQ), National Institute of Mental Health (NIMH). Public domain. "
+             "www.nimh.nih.gov/asQ")
+
+_inst(id="cssrs", name="C-SSRS screener", title="Columbia-Suicide Severity Rating Scale — Screen (recent)",
+      groups=("adolescent", "adult"), cat="Suicide risk & safety", measures="Suicidal ideation and behavior",
+      ages="12+", minutes=2,
+      intro="These questions are about thoughts of suicide in the past month. Please answer each one honestly. Your "
+            "counselor will talk with you about your answers.",
+      stem="In the past month:",
+      items=[_q(1, "Have you wished you were dead or wished you could go to sleep and not wake up?", _YN),
+             _q(2, "Have you actually had any thoughts of killing yourself?", _YN),
+             _q(3, "Have you been thinking about how you might do this?", _YN, show=lambda a: int(_val(a, 2)) == 1),
+             _q(4, "Have you had these thoughts and had some intention of acting on them?", _YN,
+                show=lambda a: int(_val(a, 2)) == 1),
+             _q(5, "Have you started to work out or worked out the details of how to kill yourself? Do you intend to "
+                   "carry out this plan?", _YN, show=lambda a: int(_val(a, 2)) == 1),
+             _q(6, "Have you ever done anything, started to do anything, or prepared to do anything to end your life? "
+                   "(For example: collected pills, obtained a gun, gave away valuables, wrote a will or suicide note, "
+                   "took out pills but didn't swallow any, held a gun but changed your mind or it was grabbed from "
+                   "your hand, went to the roof but didn't jump; or actually took pills, tried to shoot yourself, cut "
+                   "yourself, tried to hang yourself, etc.)", _YN, stem=""),
+             _q("6a", "Was this within the past three months?", _YN, stem="", show=lambda a: int(_val(a, 6)) == 1)],
+      score=_score_cssrs, risk_tool=True,
+      credit="Columbia-Suicide Severity Rating Scale, Screen Version – Recent. © 2008 The Research Foundation for "
+             "Mental Hygiene, Inc. Kelly Posner, Ph.D.")
+
+_inst(id="crafft", name="CRAFFT 2.1", title="The CRAFFT Questionnaire (version 2.1)", groups=("adolescent",),
+      cat="Substance use", measures="Alcohol and drug use risk", ages="12–21", minutes=3,
+      intro="Please answer all questions honestly; your answers will be kept confidential.",
+      items=[_q(1, "Drink more than a few sips of beer, wine, or any drink containing alcohol? Put “0” if none.",
+                kind="number", lo=0, hi=365, unit="days",
+                stem="During the PAST 12 MONTHS, on how many days did you:"),
+             _q(2, "Use any marijuana (weed, oil, or hash, by smoking, vaping, or in food) or “synthetic marijuana” "
+                   "(like “K2,” “Spice”) or “vaping” THC oil? Put “0” if none.", kind="number", lo=0, hi=365,
+                unit="days", stem="During the PAST 12 MONTHS, on how many days did you:"),
+             _q(3, "Use anything else to get high (like other illegal drugs, prescription or over-the-counter "
+                   "medications, and things that you sniff, huff, or vape)? Put “0” if none.", kind="number", lo=0,
+                hi=365, unit="days", stem="During the PAST 12 MONTHS, on how many days did you:"),
+             _q(4, "Have you ever ridden in a CAR driven by someone (including yourself) who was “high” or had been "
+                   "using alcohol or drugs?", _YN)] +
+            [_q(i, t, _YN, show=lambda a: any(int(_val(a, j)) > 0 for j in (1, 2, 3))) for i, t in (
+                (5, "Do you ever use alcohol or drugs to RELAX, feel better about yourself, or fit in?"),
+                (6, "Do you ever use alcohol or drugs while you are by yourself, or ALONE?"),
+                (7, "Do you ever FORGET things you did while using alcohol or drugs?"),
+                (8, "Do your FAMILY or FRIENDS ever tell you that you should cut down on your drinking or drug use?"),
+                (9, "Have you ever gotten into TROUBLE while you were using alcohol or drugs?"))],
+      score=_score_crafft,
+      credit="© John R. Knight, MD, Boston Children’s Hospital, 2016. Reproduced with permission from the Center for "
+             "Adolescent Substance Abuse Research (CeASAR), Boston Children’s Hospital. www.crafft.org")
+
+_S2BI_OPTS = [(0, "Never"), (1, "Once or twice"), (2, "Monthly"), (3, "Weekly or more")]
+_S2BI_MORE = lambda a: any(int(_val(a, i)) > 0 for i in (1, 2, 3))
+_inst(id="s2bi", name="S2BI", title="Screening to Brief Intervention", groups=("adolescent",), cat="Substance use",
+      measures="Past-year substance use frequency (risk level)", ages="12–17", minutes=1,
+      intro="The following questions will ask about your use, if any, of alcohol, tobacco, and other drugs. Please "
+            "answer every question.", stem="In the past year, how many times have you used:",
+      items=[_q(i, t, _S2BI_OPTS, show=None if i <= 3 else _S2BI_MORE) for i, t in enumerate([
+          "Nicotine/Tobacco (including cigarettes, electronic cigarettes, or vapes)?", "Alcohol?",
+          "Marijuana (such as smoking, vaping or edibles)?",
+          "Prescription drugs that were not prescribed for you (such as pain medication or Adderall)?",
+          "Illegal drugs (such as cocaine, Ecstasy or Molly)?", "Inhalants (such as nitrous oxide)?",
+          "Herbs or synthetic drugs (such as salvia, “K2”, or bath salts)?"], 1)],
+      score=_score_s2bi,
+      credit="S2BI Tool developed at Boston Children’s Hospital with support from the National Institute on Drug Abuse. "
+             "© Boston Children’s Hospital. Licensed under CC BY-NC 4.0.")
+
+_SCARED_OPTS = [(0, "Not True or Hardly Ever True"), (1, "Somewhat True or Sometimes True"),
+                (2, "Very True or Often True")]
+_inst(id="scared", name="SCARED", title="Screen for Child Anxiety Related Disorders (child version)",
+      groups=("child", "adolescent"), cat="Anxiety, stress & distress", measures="Anxiety disorders (5 subscales)",
+      ages="8–18 (for 8–11, sit with them)", minutes=10,
+      intro="Below is a list of sentences that describe how people feel. Read each phrase and decide if it is “Not "
+            "True or Hardly Ever True” or “Somewhat True or Sometimes True” or “Very True or Often True” for you. "
+            "Choose the answer that seems to describe you for the last 3 months.",
+      stem="For the last 3 months:",
+      items=[_q(i, t, _SCARED_OPTS) for i, t in enumerate([
+          "When I feel frightened, it is hard to breathe.", "I get headaches when I am at school.",
+          "I don’t like to be with people I don’t know well.", "I get scared if I sleep away from home.",
+          "I worry about other people liking me.", "When I get frightened, I feel like passing out.", "I am nervous.",
+          "I follow my mother or father wherever they go.", "People tell me that I look nervous.",
+          "I feel nervous with people I don’t know well.", "I get stomachaches at school.",
+          "When I get frightened, I feel like I am going crazy.", "I worry about sleeping alone.",
+          "I worry about being as good as other kids.", "When I get frightened, I feel like things are not real.",
+          "I have nightmares about something bad happening to my parents.", "I worry about going to school.",
+          "When I get frightened, my heart beats fast.", "I get shaky.",
+          "I have nightmares about something bad happening to me.", "I worry about things working out for me.",
+          "When I get frightened, I sweat a lot.", "I am a worrier.", "I get really frightened for no reason at all.",
+          "I am afraid to be alone in the house.", "It is hard for me to talk with people I don’t know well.",
+          "When I get frightened, I feel like I am choking.", "People tell me that I worry too much.",
+          "I don’t like to be away from my family.", "I am afraid of having anxiety (or panic) attacks.",
+          "I worry that something bad might happen to my parents.", "I feel shy with people I don’t know well.",
+          "I worry about what is going to happen in the future.", "When I get frightened, I feel like throwing up.",
+          "I worry about how well I do things.", "I am scared to go to school.",
+          "I worry about things that have already happened.", "When I get frightened, I feel dizzy.",
+          "I feel nervous when I am with other children or adults and I have to do something while they watch me (for "
+          "example: read aloud, speak, play a game, play a sport).",
+          "I feel nervous when I am going to parties, dances, or any place where there will be people that I don’t "
+          "know well.", "I am shy."], 1)],
+      score=_score_scared, series=[("Total", 82)],
+      credit="Developed by Boris Birmaher, M.D., Suneeta Khetarpal, M.D., Marlane Cully, M.Ed., David Brent, M.D., and "
+             "Sandra McKenzie, Ph.D., University of Pittsburgh (1995). Available at no cost: pediatricbipolar.pitt.edu")
+
+_inst(id="smfq", name="SMFQ", title="Short Mood and Feelings Questionnaire (child self-report)", groups=("child",),
+      cat="Depression", measures="Depression symptoms", ages="6–17", minutes=3,
+      intro="This form is about how you might have been feeling or acting recently. For each question, choose how you "
+            "have been feeling or acting in the past two weeks. If a sentence was not true about you, choose NOT TRUE. "
+            "If a sentence was only sometimes true, choose SOMETIMES. If a sentence was true about you most of the "
+            "time, choose TRUE.", stem="In the past two weeks:",
+      items=[_q(i, t, [(0, "Not true"), (1, "Sometimes"), (2, "True")]) for i, t in enumerate([
+          "I felt miserable or unhappy.", "I didn’t enjoy anything at all.",
+          "I felt so tired I just sat around and did nothing.", "I was very restless.", "I felt I was no good anymore.",
+          "I cried a lot.", "I found it hard to think properly or concentrate.", "I hated myself.",
+          "I was a bad person.", "I felt lonely.", "I thought nobody really loved me.",
+          "I thought I could never be as good as other kids.", "I did everything wrong."], 1)],
+      score=_score_smfq,
+      credit="Mood and Feelings Questionnaire: Short Version. Copyright Adrian Angold & Elizabeth J. Costello, 1987; "
+             "Developmental Epidemiology Program, Duke University.")
+
+_PSC_CREDIT = ("Pediatric Symptom Checklist ©1988, M. Jellinek & J.M. Murphy, Massachusetts General Hospital (PSC-17 "
+               "created by W. Gardner & K. Kelleher).")
+_inst(id="psc17", name="PSC-17 (parent)", title="Pediatric Symptom Checklist-17 — completed by a parent",
+      groups=("child", "adolescent"), cat="Behavior & functioning",
+      measures="Emotional and behavioral difficulties (parent report)", ages="4–17", minutes=3, respondent="parent",
+      intro="For the parent or guardian: please mark the answer that best describes your child.",
+      stem="Your child:",
+      items=[_q(i, t, _NSO3) for i, t in enumerate([
+          "Feels sad, unhappy", "Feels hopeless", "Is down on self", "Worries a lot", "Seems to be having less fun",
+          "Fidgety, unable to sit still", "Daydreams too much", "Distracted easily", "Has trouble concentrating",
+          "Acts as if driven by a motor", "Fights with other children", "Does not listen to rules",
+          "Does not understand other people’s feelings", "Teases others", "Blames others for his/her troubles",
+          "Refuses to share", "Takes things that do not belong to him/her"], 1)] + [
+          _q("help", "Does your child have any emotional or behavioral problems for which she/he needs help?",
+             [(0, "No"), (1, "Yes")], stem="", scored=False)],
+      score=lambda a: _score_psc(a), series=[("Total", 34)], credit=_PSC_CREDIT)
+
+_inst(id="ypsc17", name="Y-PSC-17", title="Youth Pediatric Symptom Checklist-17 (self-report)",
+      groups=("adolescent",), cat="Behavior & functioning", measures="Emotional and behavioral difficulties",
+      ages="11+", minutes=3,
+      intro="Please mark the answer that best fits you.", stem="How often do you:",
+      items=[_q(i, t, _NSO3) for i, t in enumerate([
+          "Fidgety, unable to sit still", "Feel sad, unhappy", "Daydream too much", "Refuse to share",
+          "Do not understand other people’s feelings", "Feel hopeless", "Have trouble concentrating",
+          "Fight with other children", "Down on yourself", "Blame others for your troubles",
+          "Seem to be having less fun", "Do not listen to rules", "Act as if driven by a motor", "Tease others",
+          "Worry a lot", "Take things that do not belong to you", "Distract easily"], 1)],
+      score=lambda a: _score_psc(a, youth=True), series=[("Total", 34)],
+      credit=_PSC_CREDIT + " Youth form adapted with permission for Feelings Need Check Ups Too, 2004.")
+
+
+def score_assessment(iid, answers):
+    """Score one completed (or partly completed) administration. Returns the result dict."""
+    inst = ASSESS_INSTRUMENTS[iid]
+    res = dict(inst["score"](answers or {}))
+    res.setdefault("flags", [])
+    res.setdefault("lines", [])
+    res.setdefault("values", {})
+    res["risk"] = bool(res.get("risk") or res["flags"] and inst.get("risk_tool"))
+    return res
+
+
+def assessment_primary(entry):
+    """(value, max) used for the trend chart of one administration's main score (None if it has none)."""
+    r = entry.get("result") or {}
+    if r.get("total") is None:
+        return None
+    return r["total"], r.get("max") or 1
+
+
+def assessments_text(client, limit_days=None):
+    """One line per instrument (latest administration, with the change since the one before) for notes and the AI."""
+    by = {}
+    for a in client.get("assessments") or []:
+        if a.get("administered") and a.get("completed", True) and a.get("instrument") in ASSESS_INSTRUMENTS \
+                and ASSESS_INSTRUMENTS[a["instrument"]].get("measure_kind") is None:
+            by.setdefault(a["instrument"], []).append(a)
+    out = []
+    for iid, lst in by.items():
+        lst.sort(key=lambda x: (x.get("date", ""), x.get("added", "")))
+        last = lst[-1]
+        r = last.get("result") or {}
+        line = f"{ASSESS_INSTRUMENTS[iid]['name']} {r.get('summary', '')} on {fmt_date(last.get('date', ''))}"
+        if len(lst) > 1 and r.get("total") is not None and (lst[-2].get("result") or {}).get("total") is not None:
+            prev = lst[-2]["result"]["total"]
+            ch = r["total"] - prev
+            line += f" ({'up' if ch > 0 else 'down' if ch < 0 else 'no change'}" + (f" {abs(ch)}" if ch else "") + \
+                    f" from {prev} on {fmt_date(lst[-2].get('date', ''))})"
+        if r.get("flags"):
+            line += "; " + " ".join(f for f in r["flags"][:1])
+        out.append(line + ".")
+    return "\n".join(out)
 MEASURE_EXTRACT_PROMPT = """Below is the text of a patient's registration packet (read from a form). Find the \
 PHQ-9 and the GAD-7 questionnaires, if they are there, and read the patient's answers. Each answer is scored \
 0 = "Not at all", 1 = "Several days", 2 = "More than half the days", 3 = "Nearly every day". Use a total only if \
@@ -10152,6 +11139,13 @@ def caseload(pairs, today=None, include_dismissed=False):
                 raw["scores"].append({"client": c, "text": f"{kind} {t['previous']['total']} → {t['latest']['total']} "
                                                            f"({measure_band(kind, t['latest']['total'])})",
                                       "when": t["latest"]["date"], "select": "insights:scores"})
+        recent_cut = date.fromordinal(date.today().toordinal() - 60).isoformat()
+        for a_ in c.get("assessments") or []:           # positive suicide screens taken here in the last 60 days
+            r_ = a_.get("result") or {}
+            if a_.get("administered") and a_.get("instrument") != "bssa" and r_.get("risk") \
+                    and (a_.get("date") or "") >= recent_cut:
+                raw["risk"].append({"client": c, "text": f"{a_.get('name', 'Assessment')}: {r_.get('summary', '')}",
+                                    "when": a_["date"], "select": "assess"})
         for x in c.get("followups") or []:
             if not x.get("done"):
                 raw["followups"].append({"client": c, "text": x["text"], "when": x.get("date") or "", "fid": x["id"],
@@ -13322,7 +14316,9 @@ def run_gui():
                 flags = self.insight_flags(client, sessions)
                 lb.insert("end", "📈  Progress & risk" + (f"  · {flags}" if flags else ""))
                 items.append(("assess", None))
-                n_as = len(client.get("measures") or []) + len(client.get("assessments") or [])
+                n_as = len([m for m in client.get("measures") or [] if m.get("id") not in
+                            {a.get("measure_id") for a in client.get("assessments") or []}]) + \
+                    len(client.get("assessments") or [])
                 lb.insert("end", "🧾  Assessments" + (f"  · {n_as}" if n_as else ""))
                 comms = client.get("communications") or []
                 n_legacy = sum(1 for _, d in sessions if d["meta"].get("source") == "messages")
@@ -14747,21 +15743,23 @@ def run_gui():
             head = Flow(v, gap=px(8))
             head.pack(fill="x")
             head.add(ttk.Label(head, text="Assessments", style="H2.TLabel"))
-            head.add(ttk.Button(head, text="＋  Add assessment…", style="Accent.TButton",
-                                command=lambda: self.assessment_dialog(client)), gap=px(16))
+            head.add(ttk.Button(head, text="▶  Take assessment…", style="Accent.TButton",
+                                command=lambda: self.take_assessment(client)), gap=px(16))
+            head.add(ttk.Button(head, text="＋  Record a result…", command=lambda: self.assessment_dialog(client)))
             head.add(ttk.Button(head, text="＋  PHQ-9 / GAD-7",
                                 command=lambda: self.measure_dialog(client, select="assess")))
             regs = [x for x in client.get("files") or [] if x.get("kind") == "registration"]
             if regs:
                 head.add(ttk.Button(head, text="Read scores from registration form",
                                     command=lambda: self.read_measures_from_file(client, regs[-1])))
-            ttk.Label(v, text="Every assessment this patient has taken, newest first, with its result, notes and "
-                              "completed form. PHQ-9 and GAD-7 are also charted under Progress & risk.",
+            ttk.Label(v, text="Every assessment this patient has taken, newest first. “Take assessment…” has them "
+                              "answer on this computer, full screen; “Record a result…” is for ones given elsewhere.",
                       style="Muted.TLabel", wraplength=px(520), justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(v, owner=("measures", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
             sc, box = scrollable(v)
             sc.pack(fill="both", expand=True, pady=(px(8), 0))
-            rows = [("m", m["date"], m) for m in client.get("measures") or []] + \
+            linked = {a.get("measure_id") for a in client.get("assessments") or [] if a.get("measure_id")}
+            rows = [("m", m["date"], m) for m in client.get("measures") or [] if m.get("id") not in linked] + \
                    [("a", a.get("date", ""), a) for a in client.get("assessments") or []]
             if not rows:
                 ttk.Label(box, text="No assessments yet. Use “Add assessment…” for any questionnaire or screening "
@@ -14787,6 +15785,19 @@ def run_gui():
                              "Bad.TLabel")
                     acts.add(ttk.Button(acts, text="Remove",
                                         command=lambda m=x: self.measure_remove(client, m["id"], select="assess")))
+                elif x.get("administered"):                # taken on this computer (or the safety assessment)
+                    r_ = x.get("result") or {}
+                    line(f"{fmt_date(x.get('date', ''))}   {x.get('name', 'Assessment')}"
+                         + ("" if x.get("completed", True) else "   · stopped early"), "Strong.TLabel", 0)
+                    line(r_.get("summary", x.get("score", "")))
+                    for fl in (r_.get("flags") or [])[:1]:
+                        line("⚠  " + fl, "Bad.TLabel")
+                    line(("Taken at " if x.get("instrument") != "bssa" else "") +
+                         self.assessment_session_label(client["id"], x.get("date", "")), "Caption.TLabel")
+                    acts.add(ttk.Button(acts, text="Results", style="Accent.TButton",
+                                        command=lambda a=x: self.assessment_results(client, a)))
+                    acts.add(ttk.Button(acts, text="Remove", command=lambda a=x: self.assessment_remove(client, a)),
+                             gap=px(12))
                 else:
                     line(f"{fmt_date(x.get('date', ''))}   {x.get('name', 'Assessment')}", "Strong.TLabel", 0)
                     if x.get("score"):
@@ -14821,10 +15832,7 @@ def run_gui():
                 return
             if a.get("file_id"):
                 _quiet(self.patient_file_remove, client["id"], a["file_id"])
-            c = vault.load_client(client["id"])
-            c["assessments"] = [x for x in c.get("assessments") or [] if x.get("id") != a.get("id")]
-            vault.save_client(c)
-            self._sig = vault.signature()
+            self.assessment_delete(client["id"], a.get("id"))     # (and its PHQ-9/GAD-7 score, if it made one)
             self.open_client(client["id"], select="assess")
 
         def assessment_dialog(self, client, existing=None):
@@ -15098,6 +16106,721 @@ def run_gui():
             ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
             self._term_win = {"win": win, "date": day_var, "name": name_var, "therapist": ther_var, "reasons": rvars,
                               "other": other, "pick": picked, "archive": arch_var, "save": save}
+
+        # ---------------------------------------------------------------- assessments taken on this computer
+        def assessment_session_label(self, cid, day):
+            """Which session an assessment belongs to: the session on file for that date (found each time, so a
+            session added later still links up)."""
+            try:
+                recs = [(s, d) for s, d in vault.sessions_for(cid) if d.get("meta", {}).get("session_date") == day]
+            except Exception:
+                recs = []
+            if recs:
+                return f"{day_title(recs)} · {fmt_date(day)}"
+            return f"{fmt_date(day)} (no session on file for that date yet)"
+
+        def take_assessment(self, client):
+            """Pick the age group, then a questionnaire from that group's own list, then hand the computer over."""
+            cid, code = client["id"], client.get("code", "")
+            client = vault.load_client(cid)
+            win = new_window(root, f"{code} — take an assessment", "820x720")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Take an assessment", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Choose the age group first. Each group has its own list, so a child can't be given an "
+                              "adult measure. The patient answers on this computer, full screen; you see the results "
+                              "after you enter your vault password.", style="Muted.TLabel", wraplength=px(740),
+                      justify="left").pack(anchor="w", pady=(px(2), px(10)))
+            grp_var = tk.StringVar(value=client.get("assess_group", ""))
+            grow = Flow(f, gap=px(14))
+            grow.pack(fill="x")
+            for key, label, ages in ASSESS_GROUPS:
+                grow.add(ttk.Radiobutton(grow, text=f"{label} ({ages})", value=key, variable=grp_var))
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            start = ttk.Button(btns, text="Start (full screen)  ▶", style="Accent.TButton", state="disabled")
+            start.pack(side="right", padx=px(8))
+            ttk.Button(btns, text="Clinician form: Brief Suicide Safety Assessment…",
+                       command=lambda: (win.destroy(), self.bssa_dialog(client))).pack(side="left")
+            info = ttk.Label(f, text="", wraplength=px(740), justify="left")
+            info.pack(side="bottom", anchor="w", fill="x", pady=(px(8), 0))
+            when = ttk.Label(f, text="Taken today: " + self.assessment_session_label(cid, date.today().isoformat()),
+                             style="Caption.TLabel")
+            when.pack(side="bottom", anchor="w", pady=(px(6), 0))
+            box, tv = tree_box(f, columns=("measures", "ages", "mins"), show="tree headings", height=14,
+                               selectmode="browse")
+            tv.heading("#0", text="Assessment", anchor="w")
+            tv.column("#0", width=px(210), stretch=False)
+            for c_, t_, w_ in (("measures", "Measures", 330), ("ages", "Ages", 150), ("mins", "About", 70)):
+                tv.heading(c_, text=t_, anchor="w")
+                tv.column(c_, width=px(w_), anchor="w", stretch=(c_ == "measures"))
+            box.pack(fill="both", expand=True, pady=(px(10), 0))
+
+            def fill(*_):
+                tv.delete(*tv.get_children())
+                start.config(state="disabled")
+                info.config(text="")
+                g = grp_var.get()
+                if not g:
+                    info.config(text="Choose Children, Adolescents or Adults to see that list.", style="Muted.TLabel")
+                    return
+                for cat in ASSESS_CATEGORIES:
+                    insts = [i for i in ASSESS_INSTRUMENTS.values() if g in i["groups"] and i["cat"] == cat]
+                    if not insts:
+                        continue
+                    tv.insert("", "end", iid="cat:" + cat, text=cat, open=True)
+                    for i in insts:
+                        tv.insert("cat:" + cat, "end", iid=i["id"], text=i["name"],
+                                  values=(i["measures"] + ("  (parent completes)" if i["respondent"] == "parent" else ""),
+                                          i["ages"], f"{i['minutes']} min"))
+
+            def picked(*_):
+                sel = tv.selection()
+                iid = sel[0] if sel and sel[0] in ASSESS_INSTRUMENTS else None
+                start.config(state="normal" if iid else "disabled")
+                if iid:
+                    i = ASSESS_INSTRUMENTS[iid]
+                    n = len(i["items"])
+                    info.config(style="TLabel", text=f"{i['title']} — {n} questions, about {i['minutes']} min. "
+                                + ("Hand the computer to the PARENT or GUARDIAN. " if i["respondent"] == "parent" else "")
+                                + ("For ages 8–11, sit with the child in case they have questions. "
+                                   if iid == "scared" and grp_var.get() == "child" else ""))
+            grp_var.trace_add("write", fill)
+            tv.bind("<<TreeviewSelect>>", picked)
+
+            def go(*_):
+                sel = tv.selection()
+                if not sel or sel[0] not in ASSESS_INSTRUMENTS:
+                    return
+                g = grp_var.get()
+                try:
+                    c_ = vault.load_client(cid)
+                    if c_.get("assess_group") != g:
+                        c_["assess_group"] = g
+                        vault.save_client(c_)
+                except Exception:
+                    pass
+                win.destroy()
+                self.run_assessment(client, sel[0], g)
+            start.config(command=go)
+            tv.bind("<Double-1>", go)
+            fill()
+            self._take_win = {"win": win, "group": grp_var, "tv": tv, "start": go}
+
+        def run_assessment(self, client, iid, group):
+            """The patient's side: full screen, one question at a time, results hidden. Ends on a hand-back screen
+            that only your vault password gets past."""
+            inst = ASSESS_INSTRUMENTS[iid]
+            cid, code = client["id"], client.get("code", "")
+            pal = THEME["P"]
+            W = tk.Toplevel(root)
+            W.title(APP_NAME)
+            W.configure(background=pal["bg"])
+            try:
+                W.attributes("-fullscreen", True)
+            except tk.TclError:
+                W.state("zoomed")
+            _quiet(W.attributes, "-topmost", True)
+            W.protocol("WM_DELETE_WINDOW", lambda: None)          # Alt+F4 / the close box do nothing
+            fam = F["body"].actual("family")
+            disp = F["title"].actual("family")
+            fn = {"q": tkfont.Font(family=disp, size=22), "a": tkfont.Font(family=fam, size=17),
+                  "s": tkfont.Font(family=fam, size=14), "big": tkfont.Font(family=disp, size=30),
+                  "small": tkfont.Font(family=fam, size=11)}
+            colw = min(max(W.winfo_screenwidth() - px(120), px(500)), px(1040))
+            st = {"answers": {}, "qid": None, "hist": [], "start": time.time(), "closed": False, "entry": None,
+                  "stopped": False}
+            self._assessing = True
+            col = tk.Frame(W, background=pal["bg"])
+            col.place(relx=0.5, rely=0.5, anchor="center", width=colw)
+            top = tk.Frame(W, background=pal["bg"])
+            top.place(relx=0.5, y=px(24), anchor="n", width=colw)
+
+            def keep_front():
+                if st["closed"] or not W.winfo_exists():
+                    return
+                _quiet(W.lift)
+                _quiet(W.attributes, "-topmost", True)
+                try:
+                    if W.focus_get() is None:
+                        W.focus_force()
+                except (tk.TclError, KeyError):
+                    _quiet(W.focus_force)
+                self.last_activity = time.time()
+                W.after(800, keep_front)
+
+            def clear():
+                for w_ in list(col.winfo_children()) + list(top.winfo_children()):
+                    w_.destroy()
+                for k in [str(n) for n in range(1, 10)] + ["<Return>"]:
+                    _quiet(W.unbind, k if k.startswith("<") else f"<KeyPress-{k}>")
+
+            def lbl(parent, text, font, fg=None, **kw):
+                return tk.Label(parent, text=text, font=font, background=pal["bg"], foreground=fg or pal["text"],
+                                wraplength=colw, justify="left", anchor="w", **kw)
+
+            def big_btn(parent, text, cmd, accent=False, chosen=False):
+                b = tk.Button(parent, text=text, command=cmd, font=fn["a"], anchor="w", justify="left",
+                              relief="flat", borderwidth=0, cursor="hand2", wraplength=colw - px(60),
+                              padx=px(22), pady=px(12),
+                              background=pal["accent"] if accent else (pal["accent_soft"] if chosen else pal["surface"]),
+                              foreground=pal["on_accent"] if accent else pal["text"],
+                              activebackground=pal["accent_soft"], activeforeground=pal["text"],
+                              highlightthickness=2, highlightbackground=pal["accent"] if chosen else pal["border"],
+                              highlightcolor=pal["accent"])
+                return b
+
+            def small_btn(parent, text, cmd):
+                return tk.Button(parent, text=text, command=cmd, font=fn["small"], relief="flat", borderwidth=0,
+                                 cursor="hand2", background=pal["bg"], foreground=pal["muted"],
+                                 activebackground=pal["surface2"], activeforeground=pal["text"], padx=px(10),
+                                 pady=px(6))
+
+            def visible():
+                return assessment_visible(inst, st["answers"])
+
+            def intro():
+                clear()
+                lbl(col, inst["title"], fn["big"]).pack(anchor="w", fill="x")
+                if inst["respondent"] == "parent":
+                    lbl(col, "For the parent or guardian", fn["s"], pal["accent"]).pack(anchor="w", pady=(px(6), 0))
+                lbl(col, inst["intro"], fn["s"]).pack(anchor="w", fill="x", pady=(px(18), px(8)))
+                lbl(col, "Choose an answer for each question. You can go back to change an answer. When you're "
+                         "finished, hand the computer back to your counselor.", fn["s"], pal["muted"]).pack(
+                    anchor="w", fill="x", pady=(0, px(26)))
+                b = big_btn(col, "Start  ▶", lambda: ask(visible()[0]["id"]), accent=True)
+                b.pack(anchor="w")
+                b.focus_set()
+                W.bind("<Return>", lambda e: ask(visible()[0]["id"]))
+                small_btn(col, "Stop — I need to talk to my counselor", stop).pack(anchor="w", pady=(px(30), 0))
+
+            def progress(q):
+                vis = visible()
+                i = next((n for n, x in enumerate(vis) if x["id"] == q["id"]), 0)
+                lbl(top, f"Question {i + 1} of {len(vis)}", fn["small"], pal["muted"]).pack(anchor="w")
+                bar = tk.Canvas(top, height=px(6), highlightthickness=0, borderwidth=0, background=pal["surface2"])
+                bar.pack(fill="x", pady=(px(4), 0))
+                W.update_idletasks()
+                bar.create_rectangle(0, 0, colw * (i + 1) / max(len(vis), 1), px(6), fill=pal["accent"], outline="")
+
+            def ask(qid):
+                clear()
+                q = next(x for x in inst["items"] if x["id"] == qid)
+                st["qid"] = qid
+                progress(q)
+                stem = q.get("stem", inst.get("stem", ""))
+                if stem:
+                    lbl(col, stem, fn["s"], pal["muted"]).pack(anchor="w", fill="x", pady=(0, px(6)))
+                lbl(col, q["text"], fn["q"]).pack(anchor="w", fill="x", pady=(0, px(22)))
+                cur = st["answers"].get(qid)
+                if q["kind"] == "choice":
+                    for n, (score, label) in enumerate(q["opts"], 1):
+                        b = big_btn(col, f"{label}", lambda s=score: choose(qid, s), chosen=(cur == score))
+                        b.pack(fill="x", pady=px(5))
+                        if n <= 9:
+                            W.bind(f"<KeyPress-{n}>", lambda e, s=score: choose(qid, s))
+                else:
+                    row = tk.Frame(col, background=pal["bg"])
+                    row.pack(anchor="w", fill="x")
+                    var = tk.StringVar(value="" if cur is None else str(cur))
+                    en = tk.Entry(row, textvariable=var, font=fn["q"], width=6 if q["kind"] == "number" else 40,
+                                  relief="flat", highlightthickness=2, highlightbackground=pal["border"],
+                                  highlightcolor=pal["accent"], background=pal["surface"], foreground=pal["text"],
+                                  insertbackground=pal["text"])
+                    en.pack(side="left", ipady=px(6))
+                    if q["kind"] == "number":
+                        lbl(row, f"  {q.get('unit', '')}  (0–{q['hi']})", fn["s"], pal["muted"]).pack(side="left")
+                    err = lbl(col, "", fn["s"], pal["bad"])
+                    err.pack(anchor="w", pady=(px(6), 0))
+
+                    def submit(*_):
+                        raw = var.get().strip()
+                        if q["kind"] == "text":
+                            st["answers"][qid] = raw[:300]
+                            return advance(qid)
+                        if not re.fullmatch(r"\d{1,3}", raw) or not q.get("lo", 0) <= int(raw) <= q["hi"]:
+                            return err.config(text=f"Please type a number from {q.get('lo', 0)} to {q['hi']}.")
+                        choose(qid, int(raw), delay=0)
+                    bb = tk.Frame(col, background=pal["bg"])
+                    bb.pack(anchor="w", pady=(px(14), 0))
+                    big_btn(bb, "Next  ▶", submit, accent=True).pack(side="left")
+                    if q["kind"] == "text":
+                        big_btn(bb, "Skip", lambda: (st["answers"].pop(qid, None), advance(qid))).pack(
+                            side="left", padx=(px(10), 0))
+                    W.bind("<Return>", submit)
+                    en.focus_set()
+                nav = tk.Frame(col, background=pal["bg"])
+                nav.pack(anchor="w", fill="x", pady=(px(26), 0))
+                if st["hist"]:
+                    small_btn(nav, "◀  Back", back).pack(side="left")
+                small_btn(nav, "Stop — I need to talk to my counselor", stop).pack(side="right")
+
+            def choose(qid, value, delay=160):
+                st["answers"][qid] = value
+                W.after(delay, lambda: advance(qid))
+
+            def advance(qid):
+                if st["closed"] or st["qid"] != qid:
+                    return
+                vis = visible()
+                ids = [x["id"] for x in vis]
+                for k in list(st["answers"]):               # answers to questions that no longer apply
+                    if k not in ids:
+                        st["answers"].pop(k)
+                i = ids.index(qid) if qid in ids else -1
+                st["hist"].append(qid)
+                if i + 1 < len(ids):
+                    ask(ids[i + 1])
+                else:
+                    finish(completed=True)
+
+            def back():
+                if st["hist"]:
+                    ask(st["hist"].pop())
+
+            def stop():
+                st["stopped"] = True
+                finish(completed=False)
+
+            def finish(completed):
+                vis = visible()
+                answered = [q for q in vis if q["id"] in st["answers"]]
+                needed = [q for q in vis if q["kind"] != "text"]
+                complete = completed and all(q["id"] in st["answers"] for q in needed)
+                if answered:
+                    st["entry"] = self._assessment_store(cid, inst, group, st["answers"], complete, len(answered),
+                                                         len(needed), int(time.time() - st["start"]))
+                handback()
+
+            def handback():
+                clear()
+                lbl(col, "Thank you." if not st["stopped"] else "Okay.", fn["big"]).pack(anchor="w")
+                lbl(col, "Please hand the computer back to your counselor.", fn["q"]).pack(anchor="w", pady=(px(14), 0))
+                small_btn(col, "Counselor: continue", unlock_screen).pack(anchor="w", pady=(px(60), 0))
+
+            def unlock_screen():
+                clear()
+                lbl(col, "Counselor", fn["big"]).pack(anchor="w")
+                lbl(col, "Enter your vault password to see the results.", fn["s"], pal["muted"]).pack(
+                    anchor="w", pady=(px(8), px(14)))
+                pw = tk.Entry(col, show="•", font=fn["q"], width=24, relief="flat", highlightthickness=2,
+                              highlightbackground=pal["border"], highlightcolor=pal["accent"],
+                              background=pal["surface"], foreground=pal["text"], insertbackground=pal["text"])
+                pw.pack(anchor="w", ipady=px(6))
+                err = lbl(col, "", fn["s"], pal["bad"])
+                err.pack(anchor="w", pady=(px(6), 0))
+
+                def attempt(*_):
+                    if vault.verify(pw.get()):
+                        close()
+                    else:
+                        err.config(text="Incorrect password.")
+                        pw.delete(0, "end")
+                row = tk.Frame(col, background=pal["bg"])
+                row.pack(anchor="w", pady=(px(12), 0))
+                big_btn(row, "Continue", attempt, accent=True).pack(side="left")
+                small_btn(row, "Back to the patient's screen", handback).pack(side="left", padx=(px(14), 0))
+                W.bind("<Return>", attempt)
+                pw.focus_set()
+                st["pw"] = pw
+
+            def close():
+                st["closed"] = True
+                self._assessing = False
+                self.last_activity = time.time()
+                _quiet(W.grab_release)
+                W.destroy()
+                e = st["entry"]
+                if e is None:
+                    self.set_status(f"{code}: {inst['name']} stopped before any answers — nothing saved.")
+                    return
+                if not e.get("completed") and not messagebox.askyesno(
+                        APP_NAME, f"{inst['name']} was stopped after {e.get('answered', 0)} of {e.get('of', 0)} "
+                                  "questions. Keep the partial answers?"):
+                    self.assessment_delete(cid, e["id"])
+                    self.set_status(f"{code}: partial {inst['name']} discarded.")
+                    if self.client_id == cid and not self.wizard:
+                        self.open_client(cid, select="assess")
+                    return
+                if self.client_id == cid and not self.wizard:
+                    self.open_client(cid, select="assess")
+                self.assessment_results(vault.load_client(cid), e)
+
+            W.bind("<Escape>", lambda e: "break")
+            W.bind("<Control-Shift-Q>", lambda e: unlock_screen())       # counselor's way out at any point
+            W.bind("<Control-Shift-q>", lambda e: unlock_screen())
+            intro()
+            W.update_idletasks()
+            _quiet(W.grab_set)
+            W.focus_force()
+            keep_front()
+            self._assess_run = {"win": W, "state": st, "choose": choose, "ask": ask, "stop": stop,
+                                "unlock": unlock_screen, "visible": visible, "close": close}
+            return W
+
+        def _assessment_store(self, cid, inst, group, answers, completed, answered, of, secs):
+            """Save one administration right away (and a PHQ-9/GAD-7 also as a score for the charts and notes)."""
+            res = score_assessment(inst["id"], answers)
+            now = datetime.now()
+            entry = {"id": uuid.uuid4().hex[:12], "name": inst["name"], "instrument": inst["id"], "group": group,
+                     "date": now.date().isoformat(), "time": now.strftime("%H:%M"), "answers": dict(answers),
+                     "result": res, "score": res.get("summary", ""), "notes": "", "file_id": "", "administered": True,
+                     "completed": bool(completed), "answered": answered, "of": of, "duration": secs,
+                     "added": now.isoformat(timespec="seconds"), "updated": now.isoformat(timespec="seconds")}
+            c = vault.load_client(cid)
+            kind = inst.get("measure_kind")
+            if completed and kind:
+                try:
+                    m = measure_entry(kind, entry["date"], items=[int(answers[str(i)]) for i in
+                                                                  range(1, MEASURES[kind]["items"] + 1)],
+                                      source="taken here")
+                    c.setdefault("measures", []).append(m)
+                    entry["measure_id"] = m["id"]
+                except (ValueError, KeyError):
+                    pass
+            c.setdefault("assessments", []).append(entry)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            return entry
+
+        def assessment_delete(self, cid, aid):
+            c = vault.load_client(cid)
+            a = next((x for x in c.get("assessments") or [] if x.get("id") == aid), None)
+            c["assessments"] = [x for x in c.get("assessments") or [] if x.get("id") != aid]
+            if a and a.get("measure_id"):
+                c["measures"] = [m for m in c.get("measures") or [] if m.get("id") != a["measure_id"]]
+            vault.save_client(c)
+            self._sig = vault.signature()
+
+        def draw_assess_chart(self, parent, inst, entries):
+            """Each administration over time (oldest first); several scores share the chart as % of their maximum."""
+            series = inst.get("series") or [("Total", None)]
+            h = px(170)
+            c = register(tk.Canvas(parent, height=h, highlightthickness=0, borderwidth=0), "canvas")
+            c.configure(background=P("surface"))
+            colors = [P("accent"), P("warn"), P("good")]
+
+            def val(e, key):
+                r = e.get("result") or {}
+                v = (r.get("values") or {}).get(key)
+                if v is None and key == "Total":
+                    v = r.get("total")
+                return v
+
+            def draw(w):
+                c.delete("all")
+                left, right, top_, bottom = px(44), w - px(16), px(14), h - px(30)
+                n = len(entries)
+                X = lambda i: left + (right - left) * ((i + 0.5) / max(n, 1))
+                c.create_line(left, bottom, right, bottom, fill=P("border"))
+                for frac, txt in ((0, "0"), (1, "max")):
+                    y_ = bottom - (bottom - top_) * frac
+                    c.create_text(left - px(6), y_, text=txt, anchor="e", fill=P("muted"), font=F["caption"])
+                for si, (key, mx) in enumerate(series):
+                    mx = mx or (entries[-1].get("result") or {}).get("max") or 1
+                    pts = [(X(i), bottom - (bottom - top_) * min(float(val(e, key) or 0) / mx, 1.0), val(e, key))
+                           for i, e in enumerate(entries) if val(e, key) is not None]
+                    col_ = colors[si % len(colors)]
+                    if len(pts) >= 2:
+                        c.create_line(*[v for x_, y_, _ in pts for v in (x_, y_)], fill=col_, width=2)
+                    for x_, y_, v in pts:
+                        c.create_oval(x_ - 4, y_ - 4, x_ + 4, y_ + 4, fill=col_, outline=P("surface"))
+                        c.create_text(x_, y_ - px(10), text=f"{v:g}" if isinstance(v, (int, float)) else str(v),
+                                      fill=P("text"), font=F["caption_strong"])
+                    if len(series) > 1:
+                        c.create_text(right - px(4), top_ + px(14) * si, text=key, anchor="ne", fill=col_,
+                                      font=F["caption_strong"])
+                for i, e in enumerate(entries):
+                    c.create_text(X(i), bottom + px(5), text=fmt_date(e.get("date", "")), anchor="n", fill=P("muted"),
+                                  font=F["caption"])
+            c.bind("<Configure>", lambda e: draw(max(e.width, px(320))))
+            return c
+
+        def assessment_report(self, client, entry):
+            """Plain-text summary (for Copy)."""
+            inst = ASSESS_INSTRUMENTS.get(entry.get("instrument"), {})
+            r = entry.get("result") or {}
+            out = [f"{inst.get('title', entry.get('name', 'Assessment'))} ({entry.get('name', '')})",
+                   f"Taken {fmt_date(entry.get('date', ''))} {entry.get('time', '')} — "
+                   + self.assessment_session_label(client["id"], entry.get("date", "")),
+                   f"Result: {r.get('summary', '')}"]
+            if not entry.get("completed", True):
+                out.append(f"Stopped early: {entry.get('answered', 0)} of {entry.get('of', 0)} questions answered.")
+            out += [f"⚠ {x}" for x in r.get("flags") or []]
+            out += r.get("lines") or []
+            if entry.get("notes"):
+                out.append("Notes: " + entry["notes"])
+            return "\n".join(out)
+
+        def assessment_results(self, client, entry):
+            """The counselor's view of one administration: score, flags, meaning, trend, every answer."""
+            cid = client["id"]
+            client = vault.load_client(cid)
+            inst = ASSESS_INSTRUMENTS.get(entry.get("instrument"), {"title": entry.get("name", ""), "items": []})
+            r = entry.get("result") or {}
+            win = new_window(root, f"{client.get('code', '')} — {entry.get('name', '')} results", "920x800")
+            outer, box = scrollable(win, padding=(px(22), px(16)))
+            outer.pack(fill="both", expand=True)
+            ttk.Label(box, text=f"{entry.get('name', '')} — results", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(box, text=inst.get("title", ""), style="Muted.TLabel").pack(anchor="w")
+            meta = f"Taken {fmt_date(entry.get('date', ''))} {entry.get('time', '')}  ·  " + \
+                self.assessment_session_label(cid, entry.get("date", ""))
+            if entry.get("duration"):
+                meta += f"  ·  {entry['duration'] // 60} min {entry['duration'] % 60} s"
+            ttk.Label(box, text=meta, style="Caption.TLabel").pack(anchor="w", pady=(px(2), 0))
+            if not entry.get("completed", True):
+                ttk.Label(box, text=f"Stopped early: {entry.get('answered', 0)} of {entry.get('of', 0)} questions "
+                                    "answered — the score is incomplete.", style="Warn.TLabel").pack(anchor="w")
+            for fl in r.get("flags") or []:
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(px(8), 0))
+                ttk.Label(card, text="⚠  " + fl, style="BadStrong.TLabel", wraplength=px(780), justify="left").pack(
+                    anchor="w")
+            if entry.get("instrument") != "bssa" and (r.get("risk") or r.get("flags")):
+                ttk.Button(box, text="Start a Brief Suicide Safety Assessment…", style="Accent.TButton",
+                           command=lambda: self.bssa_dialog(client, entry)).pack(anchor="w", pady=(px(8), 0))
+            ttk.Label(box, text=r.get("summary", ""), style="Badge.TLabel", wraplength=px(800), justify="left").pack(
+                anchor="w", pady=(px(12), px(4)))
+            for line in r.get("lines") or []:
+                ttk.Label(box, text=line, wraplength=px(800), justify="left").pack(anchor="w", pady=px(1))
+            # trend: every completed administration of this instrument
+            same = sorted([a for a in client.get("assessments") or [] if a.get("instrument") == entry.get("instrument")
+                           and a.get("administered") and a.get("completed", True)],
+                          key=lambda a: (a.get("date", ""), a.get("added", "")))
+            if entry.get("instrument") in ASSESS_INSTRUMENTS and (r.get("values") or r.get("total") is not None):
+                ttk.Label(box, text="Trend", style="Strong.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+                if len(same) >= 2:
+                    self.draw_assess_chart(box, inst, same).pack(fill="x", padx=(0, px(8)))
+                    prev = [a for a in same if (a.get("date", ""), a.get("added", "")) <
+                            (entry.get("date", ""), entry.get("added", "")) and a.get("id") != entry.get("id")]
+                    if prev and r.get("total") is not None and (prev[-1].get("result") or {}).get("total") is not None:
+                        ch = r["total"] - prev[-1]["result"]["total"]
+                        better = (ch > 0) == bool(inst.get("higher_better"))
+                        word = "no change" if not ch else ("better" if better else "worse")
+                        ttk.Label(box, text=f"{'+' if ch > 0 else ''}{ch} since {fmt_date(prev[-1].get('date', ''))} "
+                                            f"({prev[-1]['result'].get('summary', '')}) — {word}.",
+                                  style="Good.TLabel" if word == "better" else "Warn.TLabel" if word == "worse"
+                                  else "Muted.TLabel").pack(anchor="w", pady=(px(4), 0))
+                else:
+                    ttk.Label(box, text="The trend appears once this has been taken again.", style="Muted.TLabel").pack(
+                        anchor="w")
+            # every answer
+            answers = entry.get("answers") or {}
+            items = [q for q in inst.get("items") or [] if q["id"] in answers]
+            if items:
+                ttk.Label(box, text="Answers", style="Strong.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+                for n, q in enumerate(items, 1):
+                    row = ttk.Frame(box)
+                    row.pack(fill="x", pady=px(1))
+                    v = answers[q["id"]]
+                    shown = _label_of(inst, q["id"], v) if q["kind"] == "choice" else (
+                        f"{v} {q.get('unit', '')}".strip() if q["kind"] == "number" else (v or "—"))
+                    ttk.Label(row, text=f"{n}. {q['text']}", wraplength=px(560), justify="left").pack(side="left",
+                                                                                                    anchor="w")
+                    ttk.Label(row, text=shown, style="Strong.TLabel", wraplength=px(220), justify="right").pack(
+                        side="right", anchor="e")
+            if entry.get("instrument") == "bssa":
+                for line in (entry.get("report") or []):
+                    ttk.Label(box, text=line, wraplength=px(800), justify="left").pack(anchor="w", pady=px(1))
+            ttk.Label(box, text="Notes", style="Strong.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+            nfr, notes = scrolled_text(box, height=4)
+            nfr.pack(fill="x")
+            set_text(notes, entry.get("notes", ""))
+            bar = Flow(box, gap=px(8))
+            bar.pack(fill="x", pady=(px(10), 0))
+
+            def save_notes():
+                c = vault.load_client(cid)
+                for a in c.get("assessments") or []:
+                    if a.get("id") == entry["id"]:
+                        a["notes"] = get_text(notes).strip()
+                        a["updated"] = datetime.now().isoformat(timespec="seconds")
+                        entry["notes"] = a["notes"]
+                vault.save_client(c)
+                self.set_status("Notes saved.")
+            bar.add(ttk.Button(bar, text="Save notes", command=save_notes))
+            bar.add(ttk.Button(bar, text="Copy summary",
+                               command=lambda: self.copy(self.assessment_report(client, entry), "Assessment summary")))
+            bar.add(ttk.Button(bar, text="Close", command=win.destroy))
+            if inst.get("credit"):
+                ttk.Label(box, text=inst["credit"], style="Caption.TLabel", wraplength=px(800), justify="left").pack(
+                    anchor="w", pady=(px(14), 0))
+            box.realize_all()
+            self._results_win = {"win": win, "notes": notes, "save": save_notes}
+            return win
+
+        BSSA_SYMPTOMS = ["Depression", "Anxiety", "Impulsivity / recklessness", "Hopelessness", "Anhedonia",
+                         "Isolation", "Irritability", "Substance or alcohol use", "Sleep problems", "Appetite changes",
+                         "Other concerning changes"]
+        BSSA_DISPOSITIONS = [
+            ("emergency", "Emergency psychiatric evaluation — imminent risk (current suicidal thoughts): send to the "
+                          "emergency department (unless the patient's current mental health provider is reached and an "
+                          "alternative safety plan for imminent risk is in place)."),
+            ("further", "Further evaluation of risk is necessary — review the safety plan; mental health referral as "
+                        "soon as possible (preferably within 72 hours)."),
+            ("nonurgent", "Might benefit from non-urgent mental health follow-up — review the safety plan; referral."),
+            ("none", "No further intervention is necessary at this time.")]
+
+        def bssa_dialog(self, client, from_entry=None):
+            """NIMH's Brief Suicide Safety Assessment as a form you fill in with the patient (after a positive
+            screen)."""
+            cid = client["id"]
+            win = new_window(root, f"{client.get('code', '')} — Brief Suicide Safety Assessment", "860x860")
+            win.grab_set()
+            outer, f = scrollable(win, padding=(px(22), px(16)))
+            outer.pack(fill="both", expand=True)
+            ttk.Label(f, text="Brief Suicide Safety Assessment", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="NIMH ASQ toolkit guide for clinicians, used after a positive suicide risk screen. Interview "
+                              "the patient alone. When you have enough information for a disposition, the assessment "
+                              "is complete." + (f"  Following: {from_entry.get('name')} "
+                                                f"{(from_entry.get('result') or {}).get('summary', '')} "
+                                                f"({fmt_date(from_entry.get('date', ''))})." if from_entry else ""),
+                      style="Muted.TLabel", wraplength=px(780), justify="left").pack(anchor="w", pady=(px(2), px(8)))
+            ttk.Label(f, text="Start by thanking them: “These can be hard things to talk about. Thank you for telling "
+                              "us.”", style="Caption.TLabel", wraplength=px(780), justify="left").pack(anchor="w")
+            v = {}
+
+            def head(t):
+                ttk.Label(f, text=t, style="H2.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+
+            def prompt(t):
+                ttk.Label(f, text=t, style="Caption.TLabel", wraplength=px(780), justify="left").pack(anchor="w")
+
+            def yn(key, text):
+                row = Flow(f, gap=px(10))
+                row.pack(fill="x", pady=px(2))
+                row.add(ttk.Label(row, text=text, wraplength=px(520), justify="left"))
+                v[key] = tk.StringVar(value="")
+                for opt in ("Yes", "No"):
+                    row.add(ttk.Radiobutton(row, text=opt, value=opt, variable=v[key]))
+
+            def text(key, label, height=2):
+                ttk.Label(f, text=label).pack(anchor="w", pady=(px(4), 0))
+                fr_, t_ = scrolled_text(f, height=height)
+                fr_.pack(fill="x")
+                v[key] = t_
+
+            head("Frequency of suicidal thoughts")
+            prompt("“In the past few weeks, have you been thinking about killing yourself?” If yes: “How often?” "
+                   "“When was the last time you had these thoughts?”")
+            yn("thoughts", "Thoughts of killing themselves in the past few weeks")
+            text("frequency", "How often / last time")
+            prompt("“Are you having thoughts of killing yourself right now?” (If yes: imminent risk — urgent/STAT mental "
+                   "health evaluation; don't leave the patient alone.)")
+            yn("now", "Thoughts of killing themselves right now")
+            head("Suicide plan / intent to die")
+            prompt("“Do you have a plan to kill yourself?” If yes: “What is your plan?” If no: “If you were going to "
+                   "kill yourself, how would you do it?” Ask about method and access to means.")
+            yn("plan", "Has a plan")
+            text("plan_detail", "Plan, method and access to means")
+            row = Flow(f, gap=px(8))
+            row.pack(fill="x", pady=px(2))
+            row.add(ttk.Label(row, text="“On a scale from 0 to 10, how serious are you about killing yourself?”"))
+            v["serious"] = tk.StringVar(value="")
+            row.add(ttk.Spinbox(row, from_=0, to=10, textvariable=v["serious"], width=4))
+            head("Past behavior")
+            prompt("“Have you ever tried to hurt yourself?” “Have you ever tried to kill yourself?” If yes: “How? When? "
+                   "Why?” “Did you want to die?” “Did you receive medical/psychiatric treatment?” Past suicidal "
+                   "behavior is the strongest risk factor for future attempts.")
+            yn("selfharm", "Past self-injury")
+            yn("attempt", "Past suicide attempt")
+            text("past_detail", "Method, when, intent, treatment")
+            head("Symptoms (in the past few weeks)")
+            sym = ttk.Frame(f)
+            sym.pack(fill="x")
+            for i, s in enumerate(self.BSSA_SYMPTOMS):
+                v["sym:" + s] = tk.BooleanVar(value=False)
+                ttk.Checkbutton(sym, text=s, variable=v["sym:" + s]).grid(row=i // 3, column=i % 3, sticky="w",
+                                                                          padx=(0, px(14)), pady=px(1))
+            text("sym_detail", "Details")
+            head("Social support & stressors")
+            prompt("Support network (a trusted person; past counseling), family conflict, work pressure, domestic "
+                   "violence (“Are you worried that anyone in your life is trying to hurt you?”), suicide contagion, "
+                   "and reasons for living (“What are some of the reasons you would NOT kill yourself?”).")
+            text("support", "Supports and stressors", 3)
+            text("reasons", "Reasons for living")
+            head("Safety plan")
+            prompt("Not a “safety contract” (not effective, may be dangerous). Who they'll tell or call, coping "
+                   "strategies, and securing or removing lethal means (guns, medications, ropes…).")
+            text("plan_people", "Who they will tell / call (including 988)")
+            text("plan_coping", "Coping strategies")
+            text("plan_means", "Means restriction")
+            prompt("“Do you think you need help to keep yourself safe?” (A no doesn't mean they're safe; a yes is a "
+                   "reason to act immediately.)")
+            yn("needhelp", "Says they need help to keep themselves safe")
+            head("Disposition")
+            v["disp"] = tk.StringVar(value="")
+            for key, label in self.BSSA_DISPOSITIONS:
+                ttk.Radiobutton(f, text=label, value=key, variable=v["disp"]).pack(anchor="w", pady=px(2))
+            v["resources"] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(f, text="Resources given: 988 Suicide & Crisis Lifeline (call, text, chat 988) and Crisis "
+                                    "Text Line (text HOME to 741741)", variable=v["resources"]).pack(anchor="w",
+                                                                                                   pady=(px(8), 0))
+            text("notes", "Other notes")
+            msg = ttk.Label(f, text="", style="Bad.TLabel")
+            msg.pack(anchor="w", pady=(px(6), 0))
+
+            def get(k):
+                x = v[k]
+                return get_text(x).strip() if isinstance(x, tk.Text) else x.get()
+
+            def save():
+                disp = get("disp")
+                if not disp:
+                    return msg.config(text="Choose a disposition.")
+                lab = dict(self.BSSA_DISPOSITIONS)[disp]
+                ans = {k: (get(k) if not isinstance(v[k], tk.BooleanVar) else bool(v[k].get())) for k in v}
+                report = []
+                for key, label in (("thoughts", "Thoughts in the past few weeks"), ("now", "Thoughts right now"),
+                                   ("plan", "Has a plan"), ("selfharm", "Past self-injury"),
+                                   ("attempt", "Past suicide attempt"), ("needhelp", "Needs help to stay safe")):
+                    if ans.get(key):
+                        report.append(f"{label}: {ans[key]}")
+                if ans.get("serious") not in ("", None):
+                    report.append(f"Seriousness (0–10): {ans['serious']}")
+                syms = [s for s in self.BSSA_SYMPTOMS if ans.get("sym:" + s)]
+                if syms:
+                    report.append("Symptoms: " + ", ".join(syms))
+                for key, label in (("frequency", "Frequency / last time"), ("plan_detail", "Plan / means"),
+                                   ("past_detail", "Past behavior"), ("sym_detail", "Symptom details"),
+                                   ("support", "Supports & stressors"), ("reasons", "Reasons for living"),
+                                   ("plan_people", "Safety plan — people to tell/call"),
+                                   ("plan_coping", "Safety plan — coping"), ("plan_means", "Means restriction"),
+                                   ("notes", "Notes")):
+                    if ans.get(key):
+                        report.append(f"{label}: {ans[key]}")
+                report.append("Disposition: " + lab)
+                if ans.get("resources"):
+                    report.append("Resources given: 988 Suicide & Crisis Lifeline; Crisis Text Line.")
+                flags = []
+                if ans.get("now") == "Yes":
+                    flags.append("Thoughts of killing themselves right now: imminent risk — urgent/STAT mental health "
+                                 "evaluation; don't leave the patient alone.")
+                if ans.get("needhelp") == "Yes":
+                    flags.append("Says they need help to keep themselves safe: act immediately to ensure safety.")
+                now = datetime.now()
+                short = lab.split(" — ")[0].split(" (")[0]
+                entry = {"id": uuid.uuid4().hex[:12], "name": "Brief Suicide Safety Assessment", "instrument": "bssa",
+                         "date": now.date().isoformat(), "time": now.strftime("%H:%M"), "answers": {}, "report": report,
+                         "fields": ans, "result": {"summary": short, "lines": [], "flags": flags, "risk": True,
+                                                   "values": {}, "total": None},
+                         "score": short, "notes": "", "file_id": "", "administered": True, "completed": True,
+                         "follows": (from_entry or {}).get("id", ""), "added": now.isoformat(timespec="seconds"),
+                         "updated": now.isoformat(timespec="seconds")}
+                c = vault.load_client(cid)
+                c.setdefault("assessments", []).append(entry)
+                vault.save_client(c)
+                self._sig = vault.signature()
+                win.destroy()
+                self.set_status(f"{client.get('code', '')}: brief suicide safety assessment saved ({short}).")
+                if self.client_id == cid and not self.wizard:
+                    self.open_client(cid, select="assess")
+            btns = pin_bottom(ttk.Frame(win, padding=(px(22), 0, px(22), px(14))), pady=(px(6), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            self._bssa_win = {"win": win, "v": v, "save": save}
+            return win
 
         # ---------------------------------------------------------------- External communication log
         def comm_save(self, cid, entry):
@@ -21976,6 +23699,8 @@ def run_gui():
 
         def idle_check(self):
             mins = int(cfg.get("autolock_minutes", 0) or 0)
+            if getattr(self, "_assessing", False):          # a patient is taking an assessment: never lock under it
+                self.last_activity = time.time()
             if mins and not self.locked and time.time() - self.last_activity > mins * 60:
                 self.lock()
             root.after(15_000, self.idle_check)

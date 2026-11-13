@@ -19,6 +19,13 @@ at the top of the file. Every build is a commit in this repository, so the histo
   computer through the shared data folder, encrypted.
 - **Patients.** Each patient has a case overview, treatment plan, Ask-AI chat about their record, and
   day-by-day sessions. The local AI reads patients' names (they never leave the computer), which keeps notes clear about who said what; Settings or a patient's profile can hide them instead.
+- **Assessment library.** On a patient's Assessments tab, **Take assessment…** lists free, validated
+  questionnaires by age group (children / adolescents / adults, kept separate), then runs the one you
+  pick full screen for the patient, one question at a time. When they're done it waits on a hand-back
+  screen; your vault password shows the scored results, flags (e.g. suicide-risk items), the session
+  it was taken at and the trend across retakes. Positive suicide screens appear on Home and offer
+  NIMH's Brief Suicide Safety Assessment as a form. Wording and scoring follow each instrument's
+  official public form (credits are shown with the results).
 - **Assessments & termination.** Each patient has an Assessments tab (PHQ-9/GAD-7 scores plus any
   other questionnaire, with its result, notes and the completed form) and a Termination tab (the
   practice's termination letter: date, reasons, therapist, and the submitted form). Both stay out
