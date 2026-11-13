@@ -46,3 +46,15 @@ tests/screenshots/
 
 # LM Studio tuning leftovers
 lm_tune*
+
+# Installer builds (installer/build.ps1): staging, download cache, output, bundled engine and models
+/build/
+/dist/
+/engine/
+/models/
+/python/
+/bundle.json
+hardware.json
+*.gguf
+*.bin
+*.tar.gz

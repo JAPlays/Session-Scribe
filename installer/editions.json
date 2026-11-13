@@ -1,0 +1,18 @@
+{
+  "_comment": "One entry per installer. build.ps1 -Edition <key> builds it. Each edition is the same program with a different AI model inside; the app still fits its settings to the computer it lands on, and more .gguf models can be added later (Settings shows them).",
+
+  "mistral-24b": {
+    "title": "Mistral Small 24B",
+    "for": "Computers with 32 GB of memory or more. Integrated graphics works (notes take a while); a graphics card with 16 GB or more makes it fast.",
+    "min_ram_gb": 24,
+    "llm": [
+      {"repo": "lmstudio-community/Mistral-Small-3.1-24B-Instruct-2503-GGUF", "quant": "Q4_K_M",
+       "license": "Apache-2.0"}
+    ],
+    "whisper_models": ["large-v3-turbo"],
+    "language": "en",
+    "llama_backend": "vulkan",
+    "torch": "cpu",
+    "packages": ["whisperx", "cryptography", "pypdf", "sv-ttk", "imageio-ffmpeg"]
+  }
+}

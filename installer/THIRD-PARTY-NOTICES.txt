@@ -1,0 +1,30 @@
+Session Scribe — what this installer contains
+=============================================
+
+Session Scribe runs entirely on this computer. Recordings, transcripts and notes never leave it.
+Everything it writes is a draft: review each note before it goes into the record.
+
+This installer bundles the following free software and models, under their own licenses:
+
+  Python (python-build-standalone)   PSF License; build tooling MPL-2.0
+      https://github.com/astral-sh/python-build-standalone
+  llama.cpp (llama-server)           MIT License
+      https://github.com/ggml-org/llama.cpp
+  WhisperX                           BSD-2-Clause
+      https://github.com/m-bain/whisperX
+  faster-whisper / CTranslate2       MIT License
+  OpenAI Whisper model weights       MIT License
+  PyTorch, torchaudio                BSD-3-Clause
+  wav2vec2 alignment model (torchaudio)  see https://pytorch.org/audio
+  pyannote.audio                     MIT License
+  pyannote speaker models            speaker-diarization-3.1: MIT; speaker-diarization-community-1:
+                                     CC-BY-4.0 (whichever this WhisperX version uses; the model terms
+                                     were accepted on huggingface.co by whoever built this installer)
+      https://huggingface.co/pyannote
+  FFmpeg (via imageio-ffmpeg)        LGPL/GPL; see https://ffmpeg.org/legal.html
+  cryptography                       Apache-2.0 / BSD
+  pypdf                              BSD-3-Clause
+  sv-ttk                             MIT License
+
+AI model(s): see the line at the end for which model is inside and its license. Mistral Small is
+released by Mistral AI under the Apache-2.0 license.

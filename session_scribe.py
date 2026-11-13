@@ -32,13 +32,32 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.12.10"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.1"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(APP_DIR, "bin")
 DOWNLOAD_MODE = "--download-models" in sys.argv
 TRANSCRIBE_MODE = "--transcribe-worker" in sys.argv     # a child process that transcribes one recording
+
+
+def _read_bundle():
+    """bundle.json, written by the installer build (installer/build.ps1): which edition this is and what
+    it ships (Python, the built-in AI, the models). {} for a plain copy of the program."""
+    try:
+        import json as _json
+        with open(os.path.join(APP_DIR, "bundle.json"), encoding="utf-8-sig") as f:    # PowerShell adds a BOM
+            b = _json.load(f)
+        return b if isinstance(b, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+BUNDLE = _read_bundle()
+if BUNDLE:      # the installer's own copies of the speech, alignment and speaker models: no download, no token
+    os.environ["HF_HOME"] = os.path.join(APP_DIR, "models", "hf")
+    os.environ.pop("HF_HUB_CACHE", None)
+    os.environ["TORCH_HOME"] = os.path.join(APP_DIR, "models", "torch")
 
 # The environment as it was (proxy settings included) — only for the installers and the model
 # download, which carry no patient data and may need a proxy to reach the internet.
@@ -178,6 +197,10 @@ DEFAULT_CONFIG = {
     "model": "",
     "lm_context": 16384,        # when Session Scribe has LM Studio load the model: context length (tokens)
     "lm_parallel": 1,           # …and request slots (1 = all the memory for one request at a time: fastest here)
+    "ai_engine": "auto",        # auto = the built-in AI when this copy has one (installer builds), else LM Studio
+    "gpu_layers": "",           # built-in AI: model layers on the graphics chip (set by auto_tune for this computer)
+    "whisper_threads": 0,       # processor threads for the speech model (0 = its default)
+    "tuned_for": "",            # the hardware the settings were last fitted to (auto_tune)
     "whisper_model": "large-v3-turbo",
     "language": "en",
     "batch_size": 8,
@@ -4007,8 +4030,13 @@ def models_status(cfg, hf_token):
                 align = False
             with _PROBE_LOCK:
                 _SETUP_PROBES["align_en"] = align
-    speaker = speaker_model_cached() if hf_token else None
+    speaker = speaker_model_cached() if speakers_on(hf_token) else None
     return {"whisper": model in cached, "cached": cached, "align": align, "speaker": speaker}
+
+
+def speakers_on(hf_token):
+    """Speaker labels: with a Hugging Face token, or without one when the installer brought the model."""
+    return bool(hf_token) or bool(BUNDLE and speaker_model_cached())
 
 
 def speaker_model_cached():
@@ -6179,7 +6207,9 @@ def transcribe(audio_path, cfg, hf_token, progress):
     Interrupted part-way (the worker died, hung, or the computer slept long enough to break it), it is
     started again automatically and carries on from the last finished piece (see checkpoint_for)."""
     check_cancelled()
-    ckpt = checkpoint_for(audio_path, cfg, bool(hf_token))
+    ckpt = checkpoint_for(audio_path, cfg, speakers_on(hf_token))
+    if ai_engine(cfg) == "builtin":
+        ENGINE.make_room(cfg)          # a computer short on memory unloads the AI while it transcribes
     if os.environ.get("SESSION_SCRIBE_INPROC_TRANSCRIBE"):
         return transcribe_here(audio_path, cfg, hf_token, progress, ckpt)
     _SleepWatch.start()
@@ -6274,7 +6304,7 @@ def _transcribe_run(audio_path, cfg, hf_token, progress, ckpt, attempt=0):
     try:
         mname = cfg.get("whisper_model") or "large-v3-turbo"
         job = {"audio": audio_path, "hf_token": hf_token or "", "parent_pid": os.getpid(),
-               "cfg": dict({k: cfg.get(k) for k in ("whisper_model", "language", "batch_size",
+               "cfg": dict({k: cfg.get(k) for k in ("whisper_model", "language", "batch_size", "whisper_threads",
                                                     "min_speakers", "max_speakers") if cfg.get(k) is not None},
                            timing=timing_tx(mname), duration_hint=audio_seconds(audio_path)),
                "ckpt": ckpt}
@@ -6546,7 +6576,7 @@ def transcribe_here(audio_path, cfg, hf_token, progress, ckpt=None):
     """progress(text, percent) — percent is overall 0-100 across every step, in proportion to how long
     each step takes on this computer; set_eta() carries the time left alongside. With ckpt (see
     checkpoint_for) every finished piece is saved as it's done, and a later run carries on from there."""
-    diarize = bool(hf_token)
+    diarize = speakers_on(hf_token)
     mname = cfg.get("whisper_model") or "large-v3-turbo"
     prof = cfg.get("timing") or timing_tx(mname)
     dev_guess = prof.get("last_device") or "cpu"
@@ -6611,8 +6641,9 @@ def transcribe_here(audio_path, cfg, hf_token, progress, ckpt=None):
             plan.update(0, f"Loading the speech model ({mname}, " + ("graphics card" if device == "cuda" else
                            "processor — can take a minute or two") + ")…")
             t1 = time.time()
-            m = _stage(f"loading the speech model ({mname})", whisperx.load_model,
-                       mname, device, compute_type=compute, language=lang)
+            threads = int(cfg.get("whisper_threads") or 0) if device == "cpu" else 0
+            m = _stage(f"loading the speech model ({mname})", _call_with_optional, whisperx.load_model,
+                       {"threads": threads} if threads else {}, mname, device, compute_type=compute, language=lang)
             print(f"[worker] model {mname} loaded on {device}/{compute} in {time.time() - t1:.1f}s",
                   file=sys.stderr, flush=True)
             return m
@@ -6706,9 +6737,9 @@ def transcribe_here(audio_path, cfg, hf_token, progress, ckpt=None):
 
                 def make_dp():
                     try:
-                        return DP(use_auth_token=hf_token, device=device)
+                        return DP(use_auth_token=hf_token or None, device=device)
                     except TypeError:
-                        return DP(token=hf_token, device=device)
+                        return DP(token=hf_token or None, device=device)
                 dm = _stage("loading the speaker model (pyannote)", make_dp)
                 # pyannote's steps and how much of the speaker step each one takes
                 spans = {"segmentation": (0.0, 0.30), "speaker_counting": (0.30, 0.35),
@@ -6921,7 +6952,583 @@ def read_messages_file(path):
 
 
 # --------------------------------------------------------------------------- #
-# Local LLM (LM Studio)
+# Built-in AI (installer builds): llama.cpp's llama-server instead of LM Studio
+# --------------------------------------------------------------------------- #
+# An installer build ships llama-server in engine\ and one or more GGUF models in models\llm\. The app
+# starts the server itself (on this computer only, 127.0.0.1) with the model chosen in Settings, sized
+# for this computer's memory and graphics, and stops it when the app closes. Without an engine folder
+# (a plain copy of the program) everything works with LM Studio, as before.
+ENGINE_DIR = os.path.join(APP_DIR, "engine")
+LLM_DIRS = (os.path.join(APP_DIR, "models", "llm"), os.path.join(LOCAL_DIR, "models"))
+HARDWARE_PATH = os.path.join(LOCAL_DIR, "hardware.json")
+GB = 1024 ** 3
+_SHARD = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.I)
+
+
+def engine_exe():
+    """The bundled llama-server, or None."""
+    for name in ("llama-server.exe", "llama-server"):
+        p = os.path.join(ENGINE_DIR, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def ai_engine(cfg):
+    """'builtin' (bundled llama-server) or 'lmstudio'."""
+    choice = (cfg or {}).get("ai_engine") or "auto"
+    if choice == "lmstudio":
+        return "lmstudio"
+    return "builtin" if engine_exe() else "lmstudio"
+
+
+def ai_name(cfg):
+    return "the built-in AI" if ai_engine(cfg) == "builtin" else "LM Studio"
+
+
+# ---- this computer's hardware --------------------------------------------- #
+def _ram_bytes():
+    """(total, available) memory in bytes; (0, 0) if it can't be read."""
+    try:
+        if IS_WIN:
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS()
+            ms.dwLength = ctypes.sizeof(MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return int(ms.ullTotalPhys), int(ms.ullAvailPhys)
+        if IS_MAC:
+            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                       text=True, timeout=10).stdout.strip())
+            return total, total // 2
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = int(v.split()[0]) * 1024
+        return info.get("MemTotal", 0), info.get("MemAvailable", info.get("MemFree", 0))
+    except Exception:
+        return 0, 0
+
+
+def _cpu_info():
+    """(name, physical cores, logical cores)."""
+    logical = os.cpu_count() or 4
+    name, physical = platform.processor() or "", 0
+    try:
+        if IS_WIN:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores | "
+                                  "ConvertTo-Json"], capture_output=True, text=True, timeout=30).stdout
+            rows = json.loads(out or "[]")
+            rows = rows if isinstance(rows, list) else [rows]
+            physical = sum(int(r.get("NumberOfCores") or 0) for r in rows)
+            name = (rows[0].get("Name") or name).strip() if rows else name
+        elif not IS_MAC and os.path.exists("/proc/cpuinfo"):
+            cores = set()
+            phys = core = None
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    k, _, v = line.partition(":")
+                    k, v = k.strip(), v.strip()
+                    if k == "model name" and not name.strip():
+                        name = v
+                    elif k == "physical id":
+                        phys = v
+                    elif k == "core id":
+                        core = v
+                    elif not k and phys is not None:
+                        cores.add((phys, core))
+                        phys = core = None
+            if phys is not None:
+                cores.add((phys, core))
+            physical = len(cores)
+    except Exception:
+        pass
+    return name, physical or max(1, logical // 2), logical
+
+
+_INTEGRATED = re.compile(r"\b(UHD|Iris|HD Graphics|Radeon\(TM\) Graphics|Radeon Graphics|Vega \d+ Graphics|"
+                         r"Radeon \d{3}M|Arc\(TM\) Graphics|Adreno|Mali|llvmpipe)\b", re.I)
+
+
+def _gpu_devices(exe=None):
+    """Graphics devices llama-server can use: [{'name', 'total', 'free', 'integrated'}] (bytes).
+    Asks the bundled llama-server itself (--list-devices), so it lists exactly what it will see."""
+    exe = exe or engine_exe()
+    if not exe:
+        return []
+    try:
+        out = subprocess.run([exe, "--list-devices"], capture_output=True, text=True, errors="replace",
+                             timeout=60, cwd=os.path.dirname(exe))
+        text = (out.stdout or "") + "\n" + (out.stderr or "")
+    except Exception:
+        return []
+    gpus = []
+    for m in re.finditer(r"^\s*([A-Za-z]+\d+):\s*(.+?)\s*\((\d+)\s*MiB,\s*(\d+)\s*MiB free\)", text, re.M):
+        name = m.group(2).strip()
+        gpus.append({"id": m.group(1), "name": name, "total": int(m.group(3)) * 1024 ** 2,
+                     "free": int(m.group(4)) * 1024 ** 2, "integrated": bool(_INTEGRATED.search(name))})
+    return gpus
+
+
+def _cuda_available():
+    """Whether the speech engine can use an NVIDIA card (without importing PyTorch here: slow)."""
+    if not shutil.which("nvidia-smi"):
+        return False
+    try:
+        spec = importlib.util.find_spec("torch")
+        if spec is None or not spec.origin:
+            return False
+        lib = os.path.join(os.path.dirname(spec.origin), "lib")
+        return any("cudart" in f.lower() or f.lower().startswith("cudnn") for f in os.listdir(lib))
+    except Exception:
+        return False
+
+
+def detect_hardware(refresh=False):
+    """What this computer has, for sizing the AI and the speech model. Cached in hardware.json (the
+    checks take a few seconds); refresh=True looks again. Free memory is always read fresh."""
+    total, avail = _ram_bytes()
+    hw = {} if refresh else _read_json(HARDWARE_PATH)
+    if not hw.get("cpu_logical") or hw.get("ram_total") != total or hw.get("engine") != bool(engine_exe()):
+        name, physical, logical = _cpu_info()
+        hw = {"ram_total": total, "cpu_name": name, "cpu_physical": physical, "cpu_logical": logical,
+              "gpus": _gpu_devices(), "cuda": _cuda_available(), "engine": bool(engine_exe()),
+              "checked": datetime.now().isoformat(timespec="seconds")}
+        try:
+            os.makedirs(LOCAL_DIR, exist_ok=True)
+            _atomic_json(HARDWARE_PATH, hw)
+        except OSError:
+            pass
+    hw["ram_free"] = avail
+    return hw
+
+
+def hardware_cached():
+    """The last hardware check, without running a new one (for screens that redraw often)."""
+    hw = _read_json(HARDWARE_PATH)
+    return hw if hw.get("cpu_logical") else {"ram_total": _ram_bytes()[0], "gpus": []}
+
+
+def best_gpu(hw):
+    """The graphics device to run the AI on: a dedicated card if there is one, else integrated."""
+    gpus = [g for g in hw.get("gpus") or [] if g.get("total")]
+    if not gpus:
+        return None
+    return sorted(gpus, key=lambda g: (not g.get("integrated"), g.get("free") or 0))[-1]
+
+
+def hardware_summary(hw):
+    bits = [f"{hw.get('ram_total', 0) / GB:.0f} GB memory"]
+    if hw.get("cpu_name"):
+        bits.append(f"{hw['cpu_name']} ({hw.get('cpu_physical')} cores)")
+    g = best_gpu(hw)
+    if g:
+        kind = "integrated graphics" if g.get("integrated") else f"{g['total'] / GB:.0f} GB graphics card"
+        bits.append(f"{g['name']} ({kind})")
+    else:
+        bits.append("no graphics acceleration found")
+    return ", ".join(bits)
+
+
+# ---- model files ------------------------------------------------------------ #
+def _gguf_meta(path, want):
+    """The metadata values named in `want` from a GGUF file's header (stops reading once it has them)."""
+    scalar = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+    got = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("not a GGUF file")
+        version = struct.unpack("<I", f.read(4))[0]
+        if version < 2:
+            raise ValueError("GGUF version 1 isn't supported")
+        _tensors, nkv = struct.unpack("<QQ", f.read(16))
+
+        def rstr():
+            n = struct.unpack("<Q", f.read(8))[0]
+            return f.read(n).decode("utf-8", errors="replace")
+
+        def rval(t):
+            if t in scalar:
+                fmt = scalar[t]
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+            if t == 8:
+                return rstr()
+            if t == 9:
+                it, n = struct.unpack("<IQ", f.read(12))
+                if it in scalar and n > 64:                 # long numeric arrays: skip over them
+                    f.seek(n * struct.calcsize(scalar[it]), 1)
+                    return None
+                if it == 8 and n > 64:                      # e.g. the tokenizer's vocabulary
+                    for _ in range(n):
+                        f.seek(struct.unpack("<Q", f.read(8))[0], 1)
+                    return None
+                return [rval(it) for _ in range(n)]
+            raise ValueError(f"unknown GGUF value type {t}")
+        for _ in range(nkv):
+            key = rstr()
+            t = struct.unpack("<I", f.read(4))[0]
+            val = rval(t)
+            if key in want or key == "general.architecture":
+                got[key] = val
+                if key == "general.architecture":
+                    want = set(w.replace("{arch}", val) for w in want)
+                if "general.architecture" in got and all(w in got for w in want):
+                    break
+    return got
+
+
+_GGUF_CACHE = {}
+
+
+def gguf_info(path):
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return {}
+    if key not in _GGUF_CACHE:
+        _GGUF_CACHE[key] = _gguf_info(path)
+    return dict(_GGUF_CACHE[key])
+
+
+def _gguf_info(path):
+    """{'layers', 'ctx_train', 'kv_bytes_per_token', 'arch'} for a model file ({} if unreadable).
+    The memory a context of N tokens needs is about N × kv_bytes_per_token (16-bit cache)."""
+    want = {"general.architecture", "{arch}.block_count", "{arch}.context_length", "{arch}.embedding_length",
+            "{arch}.attention.head_count", "{arch}.attention.head_count_kv", "{arch}.attention.key_length",
+            "{arch}.attention.value_length"}
+    try:
+        meta = _gguf_meta(path, want)
+    except (OSError, ValueError, struct.error):
+        return {}
+    arch = meta.get("general.architecture") or ""
+
+    def g(name, default=0):
+        v = meta.get(f"{arch}.{name}", default)
+        if isinstance(v, list):
+            v = max((x for x in v if isinstance(x, (int, float))), default=default)
+        return v or default
+    layers, heads = int(g("block_count")), int(g("attention.head_count", 1))
+    kv_heads = int(g("attention.head_count_kv", heads))
+    head_dim = int(g("embedding_length")) // max(heads, 1)
+    k_len, v_len = int(g("attention.key_length", head_dim)), int(g("attention.value_length", head_dim))
+    return {"arch": arch, "layers": layers, "ctx_train": int(g("context_length")),
+            "kv_bytes_per_token": layers * kv_heads * (k_len + v_len) * 2}
+
+
+def model_files():
+    """Every AI model (GGUF) this computer has: the installer's models\\llm and the local app folder's
+    models\\ (drop more files there). Split models count once, by their first part."""
+    seen, out = set(), []
+    for d in LLM_DIRS:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fn in names:
+            low = fn.lower()
+            if not low.endswith(".gguf") or "mmproj" in low:
+                continue
+            m = _SHARD.search(fn)
+            if m and int(m.group(1)) != 1:
+                continue
+            path = os.path.join(d, fn)
+            parts = [path]
+            if m:
+                stem = fn[:m.start()]
+                parts = [os.path.join(d, f"{stem}-{i:05d}-of-{m.group(2)}.gguf") for i in range(1, int(m.group(2)) + 1)]
+                if not all(os.path.isfile(p) for p in parts):
+                    continue                             # incomplete download: leave it out
+            name = _SHARD.sub("", fn)
+            name = name[:-5] if name.lower().endswith(".gguf") else name
+            if name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append({"name": name, "path": path, "bytes": sum(os.path.getsize(p) for p in parts),
+                        "bundled": d == LLM_DIRS[0]})
+    return out
+
+
+def find_model(name):
+    name = (name or "").strip().lower()
+    return next((m for m in model_files() if m["name"].lower() == name), None)
+
+
+# ---- fitting a model to this computer -------------------------------------- #
+OVERHEAD = int(0.8 * GB)        # llama-server's own buffers, beyond the weights and the context cache
+CONTEXTS = (16384, 12288, 8192)
+
+
+def plan_model(model, hw, ctx_wanted=16384):
+    """How to run `model` here: {'fit': 'good'|'slow'|'no', 'ctx', 'gpu_layers', 'need', 'why'}.
+    Memory needed ≈ the file + the context cache + a little overhead. On a dedicated card as much as fits
+    goes on the card and the rest stays in memory; integrated graphics share the computer's memory, so
+    there it's about whether the computer has room."""
+    info = gguf_info(model["path"]) if os.path.isfile(model.get("path") or "") else {}
+    layers = info.get("layers") or 40
+    per_tok = info.get("kv_bytes_per_token") or 160 * 1024
+    ctx_cap = info.get("ctx_train") or 32768
+    ram = hw.get("ram_total") or 8 * GB
+    gpu = best_gpu(hw)
+    dedicated = gpu is not None and not gpu.get("integrated")
+    room_ram = ram - 3 * GB                       # Windows and the app itself keep a few GB
+    vram = (gpu.get("free") or gpu.get("total") or 0) if dedicated else 0
+    weights = model.get("bytes") or 0
+    for ctx in [c for c in CONTEXTS if c <= max(ctx_wanted, CONTEXTS[-1])]:
+        ctx = min(ctx, ctx_cap)
+        need = weights + per_tok * ctx + OVERHEAD
+        if need <= room_ram + vram * 0.9:
+            break
+    else:
+        return {"fit": "no", "ctx": CONTEXTS[-1], "gpu_layers": 0, "need": need,
+                "why": f"needs about {need / GB:.0f} GB of memory; this computer has {ram / GB:.0f} GB"}
+    if dedicated:
+        usable = vram * 0.9 - per_tok * ctx - OVERHEAD
+        n = layers if usable >= weights else max(0, int(layers * usable / max(weights, 1)))
+        on_card = n / max(layers, 1)
+        fit = "good" if on_card >= 0.999 else "slow"
+        why = ("runs entirely on the graphics card" if fit == "good" else
+               f"{on_card:.0%} on the graphics card, the rest on the processor")
+    else:
+        # Integrated graphics (or none): the model runs from the computer's memory either way. Offloading
+        # layers lets the integrated GPU (Vulkan) help with reading the transcript — as many as the share
+        # of memory the graphics driver offers will hold.
+        n = 0
+        if gpu is not None:
+            usable = (gpu.get("free") or gpu.get("total") or 0) * 0.9 - per_tok * ctx - OVERHEAD
+            n = layers if usable >= weights else max(0, int(layers * usable / max(weights, 1)))
+        share = need / max(ram, 1)
+        fit = "good" if share <= 0.6 and weights <= 8 * GB else "slow"
+        why = ((f"uses about {need / GB:.0f} of {ram / GB:.0f} GB memory"
+                + ("" if fit == "good" else "; large for this computer, so expect slow note writing")))
+        if gpu is not None:
+            why += f"; {gpu['name']} helps"
+    if ctx < ctx_wanted:
+        why += f"; context shortened to {ctx // 1024}K to fit"
+    return {"fit": fit, "ctx": ctx, "gpu_layers": n, "need": need, "why": why}
+
+
+FIT_LABEL = {"good": "Fits well", "slow": "Slow here", "no": "Won't fit"}
+
+
+def recommend_whisper(hw, cached):
+    """(speech model, batch size, threads) for this computer from the models it has."""
+    cuda = hw.get("cuda")
+    ram = (hw.get("ram_total") or 8 * GB) / GB
+    cores = hw.get("cpu_physical") or 4
+    order = (["large-v3-turbo", "large-v3", "medium.en", "small.en"] if cuda or (ram >= 12 and cores >= 6)
+             else ["medium.en", "small.en", "large-v3-turbo", "large-v3"] if ram >= 8 else
+             ["small.en", "medium.en", "large-v3-turbo", "large-v3"])
+    model = next((m for m in order if m in cached), None)
+    batch = 16 if cuda else (8 if ram >= 16 else 4)
+    return model, batch, max(1, min(cores, 16))
+
+
+def auto_tune(cfg, refresh=False):
+    """Fit the settings to this computer: the AI model (the installer's choice if it fits, otherwise the
+    best one that does), its context and graphics offload, and the speech model. Runs on the first start
+    of an installer build and from Settings › Check this computer again. Returns a summary line."""
+    hw = detect_hardware(refresh)
+    stamp = f"{hw.get('ram_total')}|{[g.get('name') for g in hw.get('gpus') or []]}|{len(model_files())}"
+    if not refresh and cfg.get("tuned_for") == stamp:
+        return None
+    changes = []
+    if ai_engine(cfg) == "builtin":
+        models = model_files()
+        bundle = BUNDLE.get("default_model") or ""
+        current = find_model(cfg.get("model")) or find_model(bundle)
+        plans = {m["name"]: plan_model(m, hw) for m in models}
+        rank = {"good": 0, "slow": 1, "no": 2}
+        pick = current if current and plans[current["name"]]["fit"] != "no" else None
+        if pick is None and models:                         # largest model that still runs well, else fits
+            pick = sorted(models, key=lambda m: (rank[plans[m["name"]]["fit"]], -m["bytes"]))[0]
+        if pick:
+            p = plans[pick["name"]]
+            cfg.update(model=pick["name"], lm_context=p["ctx"], gpu_layers=p["gpu_layers"])
+            changes.append(f"AI: {pick['name']} ({FIT_LABEL[p['fit']].lower()}: {p['why']})")
+    wm, batch, threads = recommend_whisper(hw, cached_whisper_models())
+    if wm:
+        cfg.update(whisper_model=wm, batch_size=batch, whisper_threads=threads)
+        changes.append(f"speech: {wm}")
+    cfg["tuned_for"] = stamp
+    save_config(cfg)
+    return f"This computer: {hardware_summary(hw)}. " + ("Using " + "; ".join(changes) + "." if changes else "")
+
+
+# ---- running llama-server ------------------------------------------------- #
+class LocalEngine:
+    """Starts, watches and stops the bundled llama-server. One model at a time; asking for another
+    model (or other settings) restarts it. The server listens on 127.0.0.1 only."""
+
+    def __init__(self):
+        self.proc = None
+        self.key = None
+        self.port = None
+        self.alias = None
+        self.lock = threading.RLock()
+        self.log_path = os.path.join(LOCAL_DIR, "logs", "ai-engine.log")
+        self._job = None
+
+    @property
+    def base_url(self):
+        return f"http://127.0.0.1:{self.port}/v1"
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _tie_to_app(self, p):
+        """Windows: put the server in a job that closes with the app, so a crash never leaves it holding
+        memory. (Elsewhere, stop() runs when the app exits.)"""
+        if not IS_WIN:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            if self._job is None:
+                job = k32.CreateJobObjectW(None, None)
+
+                class BASIC(ctypes.Structure):
+                    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                                ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                                ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                                ("SchedulingClass", wintypes.DWORD)]
+
+                class IOC(ctypes.Structure):
+                    _fields_ = [(n, ctypes.c_uint64) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+                class EXT(ctypes.Structure):
+                    _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IOC),
+                                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+                info = EXT()
+                info.BasicLimitInformation.LimitFlags = 0x2000          # KILL_ON_JOB_CLOSE
+                k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+                self._job = job
+            handle = k32.OpenProcess(0x0001 | 0x0100, False, p.pid)      # TERMINATE | SET_QUOTA
+            k32.AssignProcessToJobObject(self._job, handle)
+            k32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    def log_tail(self, n=4000):
+        try:
+            with open(self.log_path, encoding="utf-8", errors="replace") as f:
+                return f.read()[-n:]
+        except OSError:
+            return ""
+
+    def ensure(self, cfg, model_name=None):
+        try:
+            return self._ensure(cfg, model_name)
+        except RuntimeError as e:
+            ngl = cfg.get("gpu_layers")
+            if not ngl or "stopped while loading" not in str(e):
+                raise
+            # Some graphics drivers can't run it: carry on with the processor only, and remember that.
+            cfg["gpu_layers"] = 0
+            _quiet(save_config, cfg)
+            return self._ensure(cfg, model_name)
+
+    def _ensure(self, cfg, model_name=None):
+        """Make sure the server runs the chosen model with this computer's settings; returns the model's
+        name (what the server answers to). Waits while the model loads (a minute or more for a big one)."""
+        exe = engine_exe()
+        if not exe:
+            raise RuntimeError("The built-in AI isn't installed in this copy of Session Scribe.")
+        model = find_model(model_name or cfg.get("model")) or (model_files() or [None])[0]
+        if model is None:
+            raise RuntimeError("No AI model found. Put a .gguf model file in " + LLM_DIRS[1] + " or reinstall.")
+        ctx = int(cfg.get("lm_context") or 16384)
+        ngl = cfg.get("gpu_layers")
+        ngl = 0 if ngl in (None, "") else int(ngl)
+        key = (model["path"], ctx, ngl)
+        with self.lock:
+            if self.running() and self.key == key:
+                return self.alias
+            self.stop()
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            self.port = self._free_port()
+            self.alias = model["name"]
+            cmd = [exe, "-m", model["path"], "--host", "127.0.0.1", "--port", str(self.port),
+                   "-c", str(ctx), "-ngl", str(ngl), "--parallel", "1", "--alias", self.alias, "--jinja"]
+            log = open(self.log_path, "w", encoding="utf-8", errors="replace")
+            log.write(" ".join(cmd) + "\n")
+            log.flush()
+            kw = {"start_new_session": True} if not IS_WIN else {}
+            self.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                         cwd=os.path.dirname(exe), **kw)
+            log.close()
+            self._tie_to_app(self.proc)
+            self.key = key
+            deadline = time.time() + 1800
+            while True:
+                if self.proc.poll() is not None:
+                    tail = self.log_tail(1500)
+                    self.proc, self.key = None, None
+                    hint = (" It may not have enough memory for this model — pick a smaller one in Settings."
+                            if re.search(r"alloc|memory|out of", tail, re.I) else "")
+                    raise RuntimeError(f"The built-in AI stopped while loading {model['name']}.{hint}\n\n"
+                                       + tail.strip()[-600:])
+                try:
+                    with _NO_PROXY.open(f"http://127.0.0.1:{self.port}/health", timeout=2) as r:
+                        if r.status == 200:
+                            break
+                except Exception:
+                    pass
+                if time.time() > deadline:
+                    self.stop()
+                    raise RuntimeError(f"The built-in AI took too long to load {model['name']}.")
+                try:
+                    check_cancelled()
+                except Cancelled:
+                    self.stop()
+                    raise
+                time.sleep(0.5)
+            return self.alias
+
+    def stop(self):
+        with self.lock:
+            p, self.proc, self.key = self.proc, None, None
+            if p is None or p.poll() is not None:
+                return
+            try:
+                p.terminate()
+                p.wait(timeout=10)
+            except Exception:
+                _quiet(p.kill)
+
+    def make_room(self, cfg):
+        """Before transcribing: if this computer can't hold the AI model and the speech models at once,
+        unload the AI (it starts again by itself for the notes)."""
+        if not self.running():
+            return
+        hw = detect_hardware()
+        if (hw.get("ram_free") or 0) < 6 * GB:
+            self.stop()
+
+
+ENGINE = LocalEngine()
+
+
+# --------------------------------------------------------------------------- #
+# Local LLM (LM Studio or the built-in AI)
 # --------------------------------------------------------------------------- #
 def assert_local_url(url):
     if not _is_local_host(urllib.parse.urlparse(url).hostname):
@@ -6952,6 +7559,8 @@ def _http_json(url, body=None, timeout=30):
 
 
 def list_models(cfg, timeout=30):
+    if ai_engine(cfg) == "builtin":
+        return [m["name"] for m in model_files()]
     data = _http_json(cfg["lmstudio_url"].rstrip("/") + "/models", timeout=timeout)
     return [m.get("id") for m in data.get("data", []) if m.get("id")]
 
@@ -6964,6 +7573,8 @@ def ensure_model_loaded(cfg, model):
     one request slot, flash attention) instead of letting LM Studio load it on demand with its defaults —
     those (several request slots) made reading long transcripts about 3× slower on a laptop GPU.
     Quietly does nothing on LM Studio versions without the /api/v1 endpoints."""
+    if ai_engine(cfg) == "builtin":
+        return ENGINE.ensure(cfg, model)
     if not model:
         return
     base = cfg["lmstudio_url"].rstrip("/")
@@ -7007,7 +7618,7 @@ def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=
             try:
                 return _llm_chat_once(cfg, prompt, on_progress, expected, system, on_text, temperature, on_eta)
             except RuntimeError as e:
-                if wait is None or not str(e).startswith("Couldn't reach LM Studio"):
+                if wait is None or not str(e).startswith("Couldn't reach"):
                     raise
                 if getattr(e, "refused", False) and not _SleepWatch.slept_since(started - 120):
                     raise                 # LM Studio simply isn't running: say so now, don't make you wait
@@ -7027,12 +7638,19 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     If the task is cancelled, the connection is cut at once and LM Studio stops writing."""
     import http.client
     check_cancelled()
-    model = cfg.get("model") or (list_models(cfg) or [None])[0]
-    if not model:
-        raise RuntimeError("LM Studio is running but no model is loaded.")
-    if cfg.get("model"):
-        ensure_model_loaded(cfg, model)
-    url = cfg["lmstudio_url"].rstrip("/") + "/chat/completions"
+    builtin = ai_engine(cfg) == "builtin"
+    who = "The built-in AI" if builtin else "LM Studio"
+    if builtin:
+        model = ENGINE.ensure(cfg)                       # starts it (or switches model) when needed
+        base = ENGINE.base_url
+    else:
+        model = cfg.get("model") or (list_models(cfg) or [None])[0]
+        if not model:
+            raise RuntimeError("LM Studio is running but no model is loaded.")
+        if cfg.get("model"):
+            ensure_model_loaded(cfg, model)
+        base = cfg["lmstudio_url"]
+    url = base.rstrip("/") + "/chat/completions"
     assert_local_url(url)
     body = {"model": model, "temperature": temperature, "stream": True,
             "messages": [{"role": "system", "content": system or SYSTEM_PROMPT},
@@ -7083,7 +7701,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
         r = conn.getresponse()
         if r.status >= 400:
             detail = r.read().decode("utf-8", errors="replace")[:300]
-            raise RuntimeError(f"LM Studio returned an error ({r.status}): {detail}")
+            raise RuntimeError(f"{who} returned an error ({r.status}): {detail}")
         if "event-stream" not in (r.getheader("Content-Type") or ""):
             data = json.loads(r.read().decode("utf-8"))      # server ignored streaming
             choice = data["choices"][0]
@@ -7129,7 +7747,11 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     except Exception as e:
         check_cancelled()                  # a read cut short by cancelling is a cancel, not an error
         if isinstance(e, (KeyError, IndexError, ValueError)):
-            raise RuntimeError("LM Studio sent back an unexpected response.") from None
+            raise RuntimeError(f"{who} sent back an unexpected response.") from None
+        if builtin:                        # it stopped part-way: the next try starts it again
+            err = RuntimeError(f"Couldn't reach the built-in AI. Details: {e}\n\n{ENGINE.log_tail(600)}")
+            err.refused = False
+            raise err from None
         err = RuntimeError("Couldn't reach LM Studio. Open LM Studio, load a model, and start the "
                            f"local server (Developer tab). Details: {e}")
         # not running at all (vs. a connection dropped part-way, e.g. by the computer sleeping)
@@ -7147,8 +7769,9 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     text = re.sub(r"^\s*```[a-z]*\n|\n```\s*$", "", text.strip())
     if finish == "length":
-        text += ("\n\n[VERIFY: the AI stopped early — output may be cut off. Increase the context "
-                 "length in LM Studio.]")
+        text += ("\n\n[VERIFY: the AI stopped early — output may be cut off. "
+                 + ("Choose a model with more room in Settings, or lower “Condense transcripts over”.]" if builtin
+                    else "Increase the context length in LM Studio.]"))
     return text.strip()
 
 
@@ -9223,6 +9846,10 @@ def run_gui():
 
     cfg = load_config()
     vault = Vault(cfg["vault_dir"])
+    if engine_exe():                 # installer build: fit the AI and speech model to this computer (first start)
+        import atexit
+        atexit.register(lambda: _quiet(ENGINE.stop))
+        threading.Thread(target=lambda: _quiet(auto_tune, cfg), daemon=True).start()
 
     _dpi_aware()
     if IS_WIN:                       # its own taskbar button and icon (not grouped under "Python")
@@ -10736,8 +11363,9 @@ def run_gui():
             items = [("Speech engine", engine_installed()),
                      ("FFmpeg", ffmpeg_installed()),
                      ("Speech models", ms["whisper"] and ms["align"] is not False and ms["speaker"] is not False),
-                     ("Speaker labels", bool(self.settings.get("hf_token")) or None),
-                     ("LM Studio", isinstance(self.lm_status, list) and bool(self.lm_status)
+                     ("Speaker labels", speakers_on(self.settings.get("hf_token")) or None),
+                     ("AI" if ai_engine(cfg) == "builtin" else "LM Studio",
+                      isinstance(self.lm_status, list) and bool(self.lm_status)
                       if self.lm_status is not None else None)]
             # Only problems are shown. Working parts, optional extras (speaker labels) and checks still
             # running stay hidden, so the top of the window is quiet when everything is fine.
@@ -17578,7 +18206,7 @@ def run_gui():
                 return messagebox.showinfo(APP_NAME, "The speech engine isn't installed yet — open Settings first.",
                                            parent=win)
             if Q["write"] and not (isinstance(self.lm_status, list) and self.lm_status):
-                if not messagebox.askyesno(APP_NAME, "LM Studio doesn't seem to be running, so the notes can't be "
+                if not messagebox.askyesno(APP_NAME, f"{ai_name(cfg)[0].upper() + ai_name(cfg)[1:]} doesn't seem to be ready, so the notes can't be "
                                                      "written. Start the queue anyway? (Transcripts are still "
                                                      "saved; you can write the notes later.)", parent=win):
                     return
@@ -17651,7 +18279,7 @@ def run_gui():
             if not secs:
                 return None
             total = estimate_tx_secs(cfg.get("whisper_model") or "large-v3-turbo",
-                                     bool(self.settings.get("hf_token")), secs)
+                                     speakers_on(self.settings.get("hf_token")), secs)
             if it.get("write", self._q()["write"]):
                 total += estimate_write_secs(it.get("kind", "progress"), secs / 60 * CHARS_PER_AUDIO_MIN)
             return total
@@ -18763,7 +19391,8 @@ def run_gui():
             prog_lbl.grid(row=2, column=1, sticky="ew")
             pbf = ttk.Frame(fs)
             pbf.grid(row=2, column=2, sticky="ne")
-            ttk.Button(pbf, text="Move…", command=lambda: move_program_dialog()).pack(side="left")
+            if not BUNDLE:            # an installed copy stays where the installer put it (shortcuts, uninstall)
+                ttk.Button(pbf, text="Move…", command=lambda: move_program_dialog()).pack(side="left")
             ttk.Button(pbf, text="Open", command=lambda: open_program_folder()).pack(side="left", padx=(px(4), 0))
             ttk.Separator(fs).grid(row=3, column=0, columnspan=3, sticky="ew", pady=px(8))
             syncrow = ttk.Frame(fs)
@@ -18983,6 +19612,33 @@ def run_gui():
                     log("✗ " + msg)
                     refresh()
                 if not self.run_bg(work, done, fail, label="Settings", quiet=True):
+                    log("Another task is running — try again when it finishes.")
+
+            def builtin_ai_row():
+                cur = find_model(cfg.get("model"))
+                if cur is None:
+                    return ("Built-in AI (writes the notes)", False,
+                            f"No AI model found. Put a .gguf model file in {LLM_DIRS[1]}, or reinstall.",
+                            ("Check again", retune))
+                pl = plan_model(cur, hardware_cached())
+                return ("Built-in AI (writes the notes)", pl["fit"] != "no",
+                        f"{cur['name']}: {FIT_LABEL[pl['fit']]} — {pl['why']}. Choose another model below.",
+                        ("Check this computer again", retune))
+
+            def retune():
+                log("Checking this computer's memory, processor and graphics…")
+
+                def done(msg):
+                    if msg:
+                        log("✓ " + msg)
+                    if ai_engine(cfg) == "builtin":
+                        sv["model"].set(cfg.get("model") or "")
+                        sv["whisper_model"].set(cfg.get("whisper_model") or "")
+                        _quiet(show_fit)
+                    refresh()
+                    self.refresh_strip()
+                if not self.run_bg(lambda progress: auto_tune(cfg, refresh=True), done,
+                                   lambda m: log("✗ " + m), label="Settings", quiet=True):
                     log("Another task is running — try again when it finishes.")
 
             def switch_python(py, ver, has):
@@ -19296,7 +19952,7 @@ def run_gui():
                 folder_detail = (f"{droot}\n" + ("Synced by Google Drive, so your other computer sees the same patients, "
                                                  "notes and templates (encrypted)." if is_cloud_path(droot) else
                                                  "On this computer only.")
-                                 + f"\nThis computer's own settings (Python, LM Studio, speech model, look) are in "
+                                 + f"\nThis computer's own settings (Python, AI, speech model, look) are in "
                                    f"{LOCAL_DIR}.")
                 dl = in_downloads(APP_DIR)
                 prog_detail = (f"{APP_DIR}\n" + ("This is your Downloads folder — easy to clear out by accident. "
@@ -19309,11 +19965,12 @@ def run_gui():
                     ("FFmpeg (reads audio files)", ffmpeg_installed(),
                      "Found." if ffmpeg_installed() else "Not found.",
                      None if ffmpeg_installed() else ("Install", lambda: task(install_ffmpeg))),
-                    ("Speaker labels", bool(token_var.get().strip()) or None,
+                    ("Speaker labels", speakers_on(token_var.get().strip()) or None,
                      "Token saved." if token_var.get().strip() else
                      "Optional. Paste a free Hugging Face token below, accept the pyannote model terms "
                      "on huggingface.co, then click Download.", None),
                     ("Speech models", models_ok, model_detail, model_actions),
+                    builtin_ai_row() if ai_engine(cfg) == "builtin" else
                     ("LM Studio (writes the notes)",
                      None if lm is None else (isinstance(lm, list) and bool(lm)),
                      "Checking…" if lm is None else (
@@ -19406,8 +20063,55 @@ def run_gui():
                                                                textvariable=sv["previous_notes"], width=4))
             pr(3, 0, "Auto-lock (minutes, 0 = off)", ttk.Entry(pg, textvariable=sv["autolock_minutes"], width=6))
             pr(3, 2, "Condense transcripts over (chars)", ttk.Entry(pg, textvariable=sv["max_chars"], width=8))
-            pr(4, 0, "LM Studio address", ttk.Entry(pg, textvariable=sv["lmstudio_url"]))
-            pr(4, 2, "AI model (blank = loaded one)", ttk.Entry(pg, textvariable=sv["model"]))
+            if ai_engine(cfg) == "builtin":
+                if not find_model(sv["model"].get()):         # first start, before auto_tune has picked one
+                    first = find_model(BUNDLE.get("default_model")) or (model_files() or [{"name": ""}])[0]
+                    sv["model"].set(first["name"])
+                mf = ttk.Frame(pg)
+                ttk.Combobox(mf, textvariable=sv["model"], values=[m["name"] for m in model_files()],
+                             state="readonly", postcommand=lambda: mcb.config(
+                                 values=[m["name"] for m in model_files()])).pack(fill="x")
+                mcb = mf.winfo_children()[0]
+                fit_lbl = ttk.Label(mf, style="Caption.TLabel", wraplength=px(360), justify="left")
+                fit_lbl.pack(fill="x", pady=(px(2), 0))
+
+                hwf = ttk.Frame(pg)
+                hw_lbl = ttk.Label(hwf, style="Caption.TLabel", wraplength=px(360), justify="left")
+                hw_lbl.pack(fill="x")
+                ttk.Button(hwf, text="Check this computer again", command=retune).pack(anchor="w", pady=(px(4), 0))
+
+                def show_fit():
+                    hw_lbl.config(text=hardware_summary(hardware_cached()))
+                    m = find_model(sv["model"].get())
+                    if m is None:
+                        return fit_lbl.config(text=f"No AI model found. Add .gguf files to {LLM_DIRS[1]}.")
+                    pl = plan_model(m, hardware_cached())
+                    fit_lbl.config(text=f"{FIT_LABEL[pl['fit']]}: {pl['why']}. {m['bytes'] / GB:.1f} GB.")
+
+                def pick_model(_e=None):
+                    m = find_model(sv["model"].get())
+                    if m is None:
+                        return
+                    pl = plan_model(m, hardware_cached())
+                    if pl["fit"] == "no" and not messagebox.askyesno(
+                            APP_NAME, f"{m['name']} {pl['why']}, so it will probably fail to load here. "
+                                      "Use it anyway?", parent=win):
+                        sv["model"].set(cfg.get("model") or "")
+                        return show_fit()
+                    cfg.update(model=m["name"], lm_context=pl["ctx"], gpu_layers=pl["gpu_layers"])
+                    save_config(cfg)
+                    show_fit()
+                    log(f"✓ Notes will be written with {m['name']} from the next AI step on "
+                        "(it takes a minute to load the first time).")
+                    self.check_lmstudio()
+                mcb.bind("<<ComboboxSelected>>", pick_model, add="+")
+                show_fit()
+                pr(4, 0, "AI model (built in)", mf)
+                pr(4, 2, "This computer", hwf)
+            else:
+                show_fit = lambda: None
+                pr(4, 0, "LM Studio address", ttk.Entry(pg, textvariable=sv["lmstudio_url"]))
+                pr(4, 2, "AI model (blank = loaded one)", ttk.Entry(pg, textvariable=sv["model"]))
             pr(5, 0, "Appearance", ttk.Combobox(pg, textvariable=appear_var, values=list(APPEARANCE.values()),
                                                 state="readonly", width=16))
             datefmt_var = tk.StringVar(value=DATE_FORMATS.get(cfg.get("date_format", "iso"), DATE_FORMATS["iso"]))
@@ -19647,7 +20351,7 @@ def run_gui():
                 return self._phone_reply(rid, state="error", text="That patient hasn't reached this computer yet "
                                                                   "(Google Drive is still syncing). Try again shortly.")
             if not (isinstance(self.lm_status, list) and self.lm_status):
-                return self._phone_reply(rid, state="error", text=f"LM Studio isn't running on "
+                return self._phone_reply(rid, state="error", text=f"The AI isn't running on "
                                                                   f"{platform.node() or 'this computer'}.")
             question = str(req.get("question") or "").strip()[:4000]
             if not question:
@@ -19700,7 +20404,8 @@ def run_gui():
                 if not engine_installed():
                     return False, "The speech engine isn't set up on this computer."
                 if Q["write"] and not (isinstance(self.lm_status, list) and self.lm_status):
-                    return False, "LM Studio isn't running, so the notes couldn't be written. Start LM Studio first."
+                    return False, ("The AI isn't ready, so the notes couldn't be written. "
+                                   + ("Check Settings." if ai_engine(cfg) == "builtin" else "Start LM Studio first."))
                 if self.busy:
                     return False, f"Another task is running ({self.task_label}). Start the queue when it finishes."
                 self.queue_start()
@@ -19879,6 +20584,7 @@ def run_gui():
             self.clear_clipboard()
             wipe_open_copies()                         # readable copies made by "Open"
             _quiet(vault.save_local_index)
+            _quiet(ENGINE.stop)                        # the built-in AI gives its memory back
             root.destroy()
 
     def start():

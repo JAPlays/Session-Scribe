@@ -60,6 +60,14 @@ only ever show program files, docs and tests.
 
 `Session Scribe.bat` points at the author's Python install. Edit the path in it if yours is elsewhere.
 
+### Or: one offline installer
+
+`installer/build.ps1` builds a Windows installer with everything inside: Python, WhisperX, the speaker
+model, FFmpeg, and a built-in AI (llama.cpp) with the model, in place of LM Studio. It installs with no
+internet and no setup steps, and the app fits itself to the computer's memory and graphics. Each kind
+of computer gets its own edition. The first one is Mistral Small 24B. See
+[installer/README.md](installer/README.md).
+
 `engine_check.py` is a diagnostic. If transcription hangs while loading PyTorch, run
 `python engine_check.py` and it reports which start-up step is to blame. It touches no patient data.
 
@@ -71,6 +79,7 @@ mock LM Studio, so no real data or model is needed.
 ```
 python tests/test_task_queue.py
 python tests/test_refresh_one.py
+python tests/test_builtin_ai.py     # installer builds: built-in AI, hardware fitting (fake llama-server)
 ```
 
 Each test opens the app window briefly and prints `N/N checks passed`. On Linux, run them under
