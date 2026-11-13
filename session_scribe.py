@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.12.6"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.12.7"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +62,7 @@ os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ.get("PATH", "")   # app-l
 
 import base64
 import collections
+import contextlib
 import gc
 import hashlib
 import hmac
@@ -198,6 +199,7 @@ DEFAULT_CONFIG = {
     "setup_assistant_offered": False,   # first Setup visit: offered to install everything for this computer
     "setup_assistant_done": False,
     "shortcut_made": False,
+    "shortcut_icon": 0,         # the desktop shortcut was given the app's icon (done once)
     "role_labels": "",          # transcript speaker labels, e.g. "Therapist, Client, Parent/Guardian, Other"
     "date_format": "iso",       # how dates are shown and typed: iso / us / eu / long (stored as YYYY-MM-DD)
     "remote_accept": True,      # this computer runs recordings sent from the other linked computer
@@ -3380,6 +3382,7 @@ class Vault:
         self._plain_bytes = 0
         self._clock = threading.Lock()
         self._index_dirty, self._index_saved = False, 0.0
+        self._tl = threading.local()                  # .memo: folder listings shared within one screen refresh
 
     @property
     def exists(self):
@@ -3537,16 +3540,56 @@ class Vault:
             os.fsync(f.fileno())
         _replace_with_retry(tmp, path)
 
+    # --- one look at each folder per screen refresh (a shared drive answers slowly)
+    def _scan(self, d):
+        """[(file name, path, (mtime_ns, size))] for the .enc files in a vault folder. Inside
+        `with vault.one_look():` each folder is listed once, however many of signature(), session_index(),
+        list_clients() and client_stamps() ask; this computer's own saves and deletes there are noticed."""
+        memo = getattr(self._tl, "memo", None)
+        if memo is not None and d in memo:
+            return memo[d]
+        out = []
+        with os.scandir(d) as it:
+            for e in it:
+                if e.name.endswith(".enc"):
+                    try:
+                        st = e.stat()
+                    except OSError:
+                        continue
+                    out.append((e.name, e.path, (st.st_mtime_ns, st.st_size)))
+        if memo is not None:
+            memo[d] = out
+        return out
+
+    @contextlib.contextmanager
+    def one_look(self):
+        if getattr(self._tl, "memo", None) is not None:        # already inside one
+            yield
+            return
+        self._tl.memo = {}
+        try:
+            yield
+        finally:
+            self._tl.memo = None
+
+    def _changed(self, d):
+        memo = getattr(self._tl, "memo", None)
+        if memo:
+            memo.pop(d, None)
+
+    def client_stamps(self):
+        """{patient id: (mtime_ns, size)} from one listing of the folder (for load_client's stamp)."""
+        try:
+            return {name[:-4]: st for name, _, st in self._scan(self.clients_dir)}
+        except OSError:
+            return {}
+
     def signature(self):
         """Changes whenever a file in the vault changes (e.g. synced from the other computer)."""
         sig = []
         for d in (self.sessions_dir, self.clients_dir):
             try:
-                with os.scandir(d) as it:
-                    for e in it:
-                        if e.name.endswith(".enc"):
-                            st = e.stat()
-                            sig.append((e.name, st.st_mtime_ns, st.st_size))
+                sig.extend((name, st[0], st[1]) for name, _, st in self._scan(d))
             except OSError:
                 pass
         try:
@@ -3605,21 +3648,22 @@ class Vault:
         path = os.path.join(self.sessions_dir, sid + ".enc")
         plain = json.dumps(data).encode("utf-8")
         self._atomic_write(path, self.fernet.encrypt(plain))
-        self._cache_put("s:" + sid, self._stamp_of(path), plain)
-        self._remember(sid, path, data)
+        self._changed(self.sessions_dir)
+        stamp = self._stamp_of(path)
+        self._cache_put("s:" + sid, stamp, plain)
+        self._remember(sid, path, data, stamp)
         return sid
 
-    def _remember(self, sid, path, data):
-        try:
-            st = os.stat(path)
-        except OSError:
+    def _remember(self, sid, path, data, stamp=None):
+        stamp = stamp or self._stamp_of(path)
+        if stamp is None:
             return
         meta = dict(data.get("meta", {}))
         meta["_x"] = {"note": bool((data.get("note") or "").strip()),          # enough for the dashboard and
                       "tx": bool((data.get("transcript") or "").strip()),      # the checklists without reading
                       "rc": data.get("risk_check"), "gc": data.get("goals_check")}   # the whole session again
         with self._ilock:
-            self._idx[sid] = ((st.st_mtime_ns, st.st_size), meta)
+            self._idx[sid] = (stamp, meta)
             self._index_dirty = True
 
     def light_sessions(self):
@@ -3647,30 +3691,34 @@ class Vault:
     def session_index(self):
         """{sid: meta} for every readable session, kept current cheaply (see _idx)."""
         try:
-            entries = list(os.scandir(self.sessions_dir))
+            entries = self._scan(self.sessions_dir)
         except OSError:
             return {}
         seen, stale = set(), []
         with self._ilock:
-            for e in entries:
-                if not e.name.endswith(".enc"):
-                    continue
-                sid = e.name[:-4]
-                try:
-                    st = e.stat()
-                except OSError:
-                    continue
+            for name, path, stamp in entries:
+                sid = name[:-4]
                 seen.add(sid)
                 cur = self._idx.get(sid)
-                if cur is None or cur[0] != (st.st_mtime_ns, st.st_size):
-                    stale.append((sid, e.path))
-        for sid, path in stale:                      # decrypt outside the lock
+                if cur is None or cur[0] != stamp:
+                    stale.append((sid, path, stamp))
+        def read(item):                              # decrypt outside the lock
+            sid, path, stamp = item
             try:
-                self._remember(sid, path, self.load_session(sid, self._stamp_of(path)))
+                self._remember(sid, path, self.load_session(sid, stamp), stamp)
+                return None
             except Exception:
-                with self._ilock:
-                    self._idx.pop(sid, None)
-                seen.discard(sid)
+                return sid
+        if len(stale) > 3:        # many to read (first unlock on this computer, or a big sync): several at once —
+            from concurrent.futures import ThreadPoolExecutor      # on a cloud-synced drive the waiting is the cost
+            with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
+                failed = [sid for sid in pool.map(read, stale) if sid]
+        else:
+            failed = [sid for sid in map(read, stale) if sid]
+        for sid in failed:
+            with self._ilock:
+                self._idx.pop(sid, None)
+            seen.discard(sid)
         with self._ilock:
             for sid in [k for k in self._idx if k not in seen]:
                 del self._idx[sid]
@@ -3698,16 +3746,26 @@ class Vault:
         index = self.session_index()
         with self._ilock:
             stamps = {sid: st for sid, (st, _) in self._idx.items()}
-        for sid, meta in index.items():
-            if meta.get("client_id") == client_id:
-                try:
-                    s.append((sid, self.load_session(sid, stamps.get(sid))))
-                except Exception:
-                    continue
+        mine = [sid for sid, meta in index.items() if meta.get("client_id") == client_id]
+
+        def read(sid):
+            try:
+                return sid, self.load_session(sid, stamps.get(sid))
+            except Exception:
+                return None
+        with self._clock:
+            cold = sum(1 for sid in mine if "s:" + sid not in self._plain)
+        if cold > 3:                 # first time this patient is opened since unlocking: read several at once
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(8, cold)) as pool:
+                s = [r for r in pool.map(read, mine) if r]
+        else:
+            s = [r for r in map(read, mine) if r]
         return sorted(s, key=lambda x: session_sort_key(x[1]))
 
     def delete_session(self, sid):
         wipe_file(os.path.join(self.sessions_dir, sid + ".enc"))
+        self._changed(self.sessions_dir)
         self._cache_drop("s:" + sid)
         with self._ilock:
             self._idx.pop(sid, None)
@@ -3738,6 +3796,7 @@ class Vault:
         path = os.path.join(self.clients_dir, client["id"] + ".enc")
         plain = json.dumps(client).encode("utf-8")
         self._atomic_write(path, self.fernet.encrypt(plain))
+        self._changed(self.clients_dir)
         self._cache_put("c:" + client["id"], self._stamp_of(path), plain)
         self._index_dirty = True
         return client["id"]
@@ -3748,16 +3807,14 @@ class Vault:
     def list_clients(self):
         out = []
         try:
-            entries = list(os.scandir(self.clients_dir))
+            entries = self._scan(self.clients_dir)
         except OSError:
             return out
-        for e in entries:
-            if e.name.endswith(".enc"):
-                try:
-                    st = e.stat()
-                    out.append(self.load_client(e.name[:-4], (st.st_mtime_ns, st.st_size)))
-                except Exception:
-                    continue
+        for name, _, stamp in entries:
+            try:
+                out.append(self.load_client(name[:-4], stamp))
+            except Exception:
+                continue
         return sorted(out, key=lambda c: c.get("code", "").lower())
 
     # --- patients' files (registration forms, parent emails…): encrypted like everything else
@@ -3793,6 +3850,7 @@ class Vault:
         for sid, _ in self.sessions_for(cid):
             self.delete_session(sid)
         wipe_file(os.path.join(self.clients_dir, cid + ".enc"))
+        self._changed(self.clients_dir)
         self._cache_drop("c:" + cid)
         self.save_local_index()
         self._tombstone("clients/" + cid + ".enc")
@@ -3840,15 +3898,6 @@ def engine_installed():
 
 def ffmpeg_installed():
     return shutil.which("ffmpeg") is not None
-
-
-def hf_cache_names():
-    home = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
-    hub = os.environ.get("HF_HUB_CACHE") or os.path.join(home, "hub")
-    try:
-        return [d.lower() for d in os.listdir(hub)]
-    except OSError:
-        return []
 
 
 def _hf_hub_dir():
@@ -3906,11 +3955,6 @@ def speaker_model_cached():
         has("speaker-diarization-community", weights) or has("speaker-diarization-community", "**/*.safetensors"))
     legacy = has("speaker-diarization-3", "config.yaml") and has("segmentation-3", weights)
     return community or legacy
-
-
-def models_cached():
-    names = hf_cache_names()
-    return (bool(cached_whisper_models()), any("pyannote" in n for n in names))
 
 
 def run_streamed(cmd, log, env=None):
@@ -4027,7 +4071,8 @@ def relaunch_if_needed():
         except OSError:
             pass
     env = dict(ONLINE_ENV, PATH=os.environ["PATH"], **{RELAUNCH_FLAG: "1"})
-    subprocess.Popen([_gui_python(py), os.path.abspath(__file__)] + sys.argv[1:], env=env)
+    argv, cwd = launch_command(_gui_python(py))
+    subprocess.Popen(argv + sys.argv[1:], env=env, cwd=cwd)
     sys.exit(0)
 
 
@@ -4049,19 +4094,63 @@ def write_mac_app(script_path, runner):
                 '<key>LSMinimumSystemVersion</key><string>11.0</string>'
                 '<key>NSHighResolutionCapable</key><true/></dict></plist>\n')
     exe = os.path.join(macos, "Session Scribe")
+    mod = launch_module(script_path)
     with open(exe, "w", encoding="utf-8") as f:
-        f.write(f'#!/bin/bash\nexec "{runner}" "{script_path}"\n')
+        if mod:
+            f.write(f'#!/bin/bash\ncd "{os.path.dirname(script_path)}"\nexec "{runner}" -m {mod}\n')
+        else:
+            f.write(f'#!/bin/bash\nexec "{runner}" "{script_path}"\n')
     os.chmod(exe, 0o755)
     return app
+
+
+def launch_module(script_path=None):
+    """The program's name as a module ("session_scribe"), or "" if the file's name can't be one.
+    Launchers start it with `python -m <name>` from its own folder: Python then keeps the compiled program
+    (__pycache__) and reuses it, instead of compiling all of it again on every start — the app opens
+    noticeably faster. (Started as a plain script, nothing is kept.)"""
+    stem, ext = os.path.splitext(os.path.basename(script_path or os.path.abspath(__file__)))
+    return stem if ext == ".py" and stem.isidentifier() else ""
+
+
+def launch_command(py, script=None):
+    """(argv, cwd) that start the program with `py` the quick way (see launch_module)."""
+    script = script or os.path.abspath(__file__)
+    mod = launch_module(script)
+    return ([py, "-m", mod], os.path.dirname(script)) if mod else ([py, script], None)
+
+
+LAUNCHER_NAMES = ("Session Scribe.bat", "Session Scribe.command", "session_scribe.sh")
+
+
+def refresh_launcher():
+    """A launcher written by an older version (it starts the program the slow way): write it again.
+    Only touches a launcher that's already there; shortcuts that point at it keep working."""
+    name = LAUNCHER_NAMES[0] if os.name == "nt" else LAUNCHER_NAMES[1] if IS_MAC else LAUNCHER_NAMES[2]
+    path = os.path.join(APP_DIR, name)
+    mod = launch_module()
+    try:
+        with open(path, encoding="utf-8") as f:
+            old = f.read()
+        if not mod or f" -m {mod}" in old:
+            return False
+        m = re.search(r'"([^"\n]*python[^"\n]*)"', old, re.I)
+        runner = m.group(1) if m and os.path.isfile(m.group(1)) else _gui_python(sys.executable)
+        write_launcher(APP_DIR, runner)
+        return True
+    except OSError:
+        return False
 
 
 def write_launcher(folder, runner):
     """Write the double-click launcher next to the program in `folder`."""
     script = os.path.basename(os.path.abspath(__file__))
+    mod = launch_module()
+    how = f'-m {mod}' if mod else f'"{script}"'
     if IS_MAC:
         path = os.path.join(folder, "Session Scribe.command")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f'#!/bin/bash\ncd "$(dirname "$0")"\nexec "{runner}" "{script}"\n')
+            f.write(f'#!/bin/bash\ncd "$(dirname "$0")"\nexec "{runner}" {how}\n')
         os.chmod(path, 0o755)
         try:
             write_mac_app(os.path.join(folder, script), runner)
@@ -4071,11 +4160,17 @@ def write_launcher(folder, runner):
     if os.name == "nt":
         path = os.path.join(folder, "Session Scribe.bat")
         with open(path, "w", encoding="utf-8", newline="\r\n") as f:
-            f.write(f'@echo off\nstart "" "{runner}" "%~dp0{script}"\n')
+            if mod:
+                f.write(f'@echo off\ncd /d "%~dp0"\nstart "" "{runner}" -m {mod}\n')
+            else:
+                f.write(f'@echo off\nstart "" "{runner}" "%~dp0{script}"\n')
     else:
         path = os.path.join(folder, "session_scribe.sh")
         with open(path, "w", encoding="utf-8") as f:
-            f.write(f'#!/bin/sh\nexec "{runner}" "$(dirname "$0")/{script}"\n')
+            if mod:
+                f.write(f'#!/bin/sh\ncd "$(dirname "$0")" && exec "{runner}" -m {mod}\n')
+            else:
+                f.write(f'#!/bin/sh\nexec "{runner}" "$(dirname "$0")/{script}"\n')
         os.chmod(path, 0o755)
     return path
 
@@ -4093,6 +4188,362 @@ def in_downloads(path):
 def _inside(path, folder):
     p, f = os.path.normcase(os.path.abspath(path)), os.path.normcase(os.path.abspath(folder))
     return p == f or p.startswith(f + os.sep)
+
+
+# --------------------------------------------------------------------------- #
+# The app's icon (title bar, taskbar, desktop shortcut): small PNGs kept in the program itself
+# --------------------------------------------------------------------------- #
+APP_ICON_PNG = {
+    16: (
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACqUlEQVR42n2TT4iVZRTGf+f93vs3595R505ZYzlYGEhEVBAuQpgsCjfhLgjG"
+        "wJW7oIW4uAwR7iOqpdlScFMbEYkiKIqSFrMo0P5J09g009zr3Pnu977nHBeSM0r07H+Hc57zPEK/H1hYsD1vfjYlnZk599zFFDcTtklCcEKB"
+        "EAZWLV/+88zzf9HvBwG4//SVwxTtj2IRHhYBuIvdJscd1Ox3q8rjN848eVkeOPV9T9UWY7vT21hfz2XWgAQHvwcWcJNGLGxHpxvz5vBvKaqD"
+        "MWd9oag3e8PVFX1mXye+cWiaZi0gsrWHA+5QJuPs1zfCN9dW9L6Jzu40Ti9F1/FkStHbNeHc/KPs3dng/zR3oMvT71yhSskLs24UE62qLFNt"
+        "4aHJOl/8uMa7n/5MaBWY3T4jBME2MydfmeXw47uYbArXb2ZpiWvUPBaXgKpRZWfv7iYvP9Uj1ALuIAKxECwZ+3otKjU0Z1wDRpaIGUrG1AgC"
+        "w83M1eURoR5wIGVnWGasVA7M7GBmZxNTxdRRSURVxTyDOQKoOWZOgZDLzBOzHV4/9OAdD0aVUmBYVkCJlhMhRAYbFWU2Znttnt3fxYtATeCR"
+        "6fZdJmZ1/rlZIl7DPBMtq4e6sjbYZP6D73jr6GMce24PAJUaP10f8u3VNcydcTbeu3iNlbURrYkJ0lg9qqaCKno9woWvfuPCl7/yy4dHGZaZ"
+        "F9/+nKXV8rahgJuDOc1WJKfkeA7Rkq2LqHiqqMeCRrPg4g9LLJxfZGllg1a7duedRBARLFVAFNc8EF49Nx1jbZFaa8rTKMdCpEqGm1NvbGVh"
+        "ex2otSN5tJo9HhSA4tjHc140zgoy4zgiggD3sltD/A8hz+v51y7Jv3XmyPvTdHcdCZq6kMX+k4xOKAZUG5f45MQy/X64BTHrbi6Y77T5AAAA"
+        "AElFTkSuQmCC"
+    ),
+    24: (
+        "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAEUklEQVR42pWW24uWVRTGf2vt/X6H+bRxGnXSC43KLEih0AgsSroqDPEiEzKv"
+        "QkiEgugcDBMUdgAlqEjoQGiYUv4BgUGlnUBNzVILSw2Po47OzHd691pdfN94StRZsOBlXzxrred59tqvMBK9vUpfnwH0vP3nRB2slRhF2Jju"
+        "2tHnJh27FEtaB670ifW8unORhGyZeLrNLY2qABLqqO4RTx8cfu2OtSNF5Bz4S1tX6pjxz9Cs4XkDcEYXgsQCkpXJzx5/79iKu5bT6yoAE17c"
+        "9mjo6Fpvw6eauGlQ0dwcu8YaKhBVSOaGiGmlO7Oh44uPrZi1VnCXCc//8oMUxsz2xpCLSDhTy+ksR8qZXlOBWtM4Xc25rhRx9ySFinh9cPvx"
+        "yuzZ0vPs5omJ+AchdKklH2qYLHtgEkvv7aEjU0SuDO4O1abx0ZajvLvpMJWCukkQLJ1xjbfHepWyFi1GFQaGG8yb2c1bC6Yy2nhj/lT2H6/y"
+        "1bYTjKsUyd1iqHk5SjR3M3Cl3siZe+t1mMNwI7F57ynqTRvx2mXah0KmzJnWRaUYmDu9k3U/HYGODLdEI+QeW2MabgncSOaoQP9ggyc//o3B"
+        "Wo6o4JcILgKYUy4Gvnv5bsZO7MCSQRvLzUCFCDXcstaBGdq259TuMgdX3j86owpghrcTDURq4NHOFbB2qwdP1pi3citD1RwJF08QVM5PUAhs"
+        "fPpObhxfxsyh3b2bIfVAiyJLuAmkxAhSVyXjlUduot4wUC4qcHq42boj7hSzwLiO7LwoNkJRQiQRq0BIhomBJ7yNpAKd5Ug9XiCyQyEqS+ZM"
+        "vlTr9oeBpZYWuUGmRKjiFnFXSAkFkjknzjZYvuZ3BodbFLU2mlPKAl+/MIup3WXMHRXB2w0FabHgnjBLNGpKpAoEw7VFz86DAwQVpnSX2ffm"
+        "fVe8YKE9mrujKuw4MADueGprKnW0NZmR5znlkrLm239Y8/1B0gWLyNwv65iRRGDdlkN8+s3flEtKnrc0AJDSE+un4HEXGsYK5smQPBnTJlR4"
+        "eNYk3nl8BqrC6eEmS1dv5VB/lRgvdtWZas6OAwMUohJU3BHB0rBnhRmRpOJiYIJ7QkXoKCh79p/khutLqApHBmrMX7GZn3cfg2L8/yZXKBci"
+        "jmEJEG0JPtyQGFSqzTzlBGlZDCG5owF6OgscOV3jwd5N7D4wQKWzeBF1FwqSUjrvKQHc82B5TcAle+yLH4kds8iHHDSIQF5PzLy5i9ycXfv6"
+        "KY8tkie76qMDnohl8Wb119x1toJ4MlvlGtTNzS1PlpJrhm//q9937e/3Qkf0RjN3N7tK5snNzDVTs7SKDQtToNfV35+5U255aAKlzntwV8wE"
+        "R0IQUVUxo+2Vq2QoKFklUD212r5c/PrIkyn09gp9faYLPlviGp/C03TcijKal1m0jsa9kpof2sYln0CvQp/L5X5bWPT5ZBpegto1opcgZHU2"
+        "LPy3LbSAOMB/K+2TasvkSnMAAAAASUVORK5CYII="
+    ),
+    32: (
+        "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAF4UlEQVR42rWXf4hcVxXHP+e+N+/tzqxxN2HTBKVGSXSNxSSNQsVKpX9pMSZt"
+        "/EP8CRXpHxoQBQWhbDaQKqjgnwrBilDF1lpsa1sq2qQ21WiDLdqYGKI1a3HTrqud2d3MvLn3HP+4b97OTGKz3doHl/eY9+acc7/ne77nHui/"
+        "zIRpc7xWl5lgJv0/pdXT9LRDRAHbfPvp94qTPaBTqmF0+E+rvkRMxLURd8YID86JPF75mplRAOn/4aovHd8ojfHvSJLdLGkOGjCzV7VpEcCl"
+        "mC+wUDzg/fJt83e86589n8L0tAPYVOzdYK521I2u265LCwGwKsD/A/iAuPpEou3W2WCdG+YP757jIOI49Q5hZkaD6hHJx7aH1ouFmSVmlmKW"
+        "CCRO1rYEEkpbZpaExflC8sY2F+RORKxKwcYvP3WdZPXfaHHRi1hqBk4EBJY6Aa9rS0PqhEaegIGaISKYmXf5WBray++f/8a1x1IANdvvXGpo"
+        "wEQQgcIr3WBce3WDzeuyGKmsHnADLjQLTp5fIk2EWiKoGmKGiTPMfwSIAZiGKQtdMVMRhG4wRmuOOz+5lb071r+q5D/0p39z213nWCoCqRPM"
+        "EHwhmE4BxJpXzU0VM0MwFtuer+17E3t3rCeo0Q1G8QpXNxhBjZuumeBb+7ew1PYIhpliqqhaVumAmuFUwZROYbxxvMa+HRsIGvNWc2vVHQhq"
+        "fOid69myPmOuWVBLBFMFCytCZGaYKmKGD8pYJmRppDLAoZ+d47d/XsDlCXoFXXAiaCew+63jHLplG06ELIWx3OGDUnMOM4WS2FEJQwCN0KBK"
+        "CINO/nC+yfEzC7jR2uoCaHukZD9SIhGibZTSV38AaIzKVu79CnLfgV1rV5+eGpa5NwMzRelPQRVd+ZHqgKGjpxc4+/wikjqupMwiYF55y+YG"
+        "N27fgPXKskxz3J9ioQ8BRXExtPhhnxcBvnDXaZ753RzUa1w2AhnIASx7pnZOcuqO61fe9dk2swrlEgGr8h9hGkzBL7/ybuabnWjcLnXe7moV"
+        "V0Tb2DSRg/T5r9BlwEda1Usv96aXdMBGntCt1yK8l9n8VZvy/8mBlZLs2adKd18AYQABGUrB9YdPcPL3F6CeVuUDQCLQ6vLVz1zDoVu24tVI"
+        "y9Lt9ZJ+UVBVTKMOaD8CqlQcwIyuj+cAtYj69L6tPLtrI1IbJKEAeOWm3RtJnCAiOBlEoGe260MMwrTkA/1CFDANWFCyBGZfWOTpvzd5z7YJ"
+        "Ol7Zs3OSPTsnX5b9PhhIhSxIVME8dfzxH02em1skrzk0KOI0as9KLyg1uoxOVTnw/WeY+0+bPHUDTnzZG7pDYpUmQuok3svnPHW82Ozwue89"
+        "jfchdsLSj9EvRKqVFnggzxwnzy1w3e1H+cT7ruYN4yN8YNcm3jxZJ6iRJhHnHz05S+uixw1Vh5XyPrtwkR8+MctfLyzRGE3xISCAqiKhX4hU"
+        "V5IFBK/Uc8fsv5Y5fPezsNTlJzM3sGWyXjn57HdPcuTnZ6GWrBwAhsvDwI2k1HMXERAphWmYhKZIX2nE9mBkCWRjNZadkZSkVjM+/u0T/Pix"
+        "5xibGIlQvszpMajFPlCiUiE+SEIrMBsIoAdlF8MXgdEswavx4a//mkdOPE9jfISi69fcp820WCGh2Zko18EqkpQrshZeeKnN/m8+wSNPnqe+"
+        "LqPoeoa/Xd0KZogR9C/9HPgpvvgilzl8Bow0dxw48hQvtTrkr88pumGNQ0LcvfiuqIZ7IwLT5vzdHz1Op/UwtbFygtABadagNJcLsiwh+MDw"
+        "+1Uv9QW1RmpF61fhno89xrS5lJmDgImXe251xeLjUhvbRrsV4gGupJZAghCCv5TtV9wxVLby12UUy38L3j4dXxwkgWMGOE59vmVbP3gvIlMk"
+        "2dtIc4ckDpc6XOqsvK9ppXm04duParu5n/tvnQUcx2ZUBobTcmDk5h/cKC7Zg+rbwUZAecUDqohFjkscTi08yH2f+sUlvobqQ+J6zebzahbt"
+        "Xf8FkgU9ByIJ/OsAAAAASUVORK5CYII="
+    ),
+    48: (
+        "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"
+        "M/7E4T95GTcmPjAj9gAAAABJRU5ErkJggg=="
+    ),
+    64: (
+        "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"
+    ),
+    256: (
+        "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"
+    ),
+}
+
+
+def _png_rgba(data):
+    """(width, height, rows of RGBA bytes) from one of the icon PNGs above (8-bit RGBA, not interlaced)."""
+    import struct
+    import zlib
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    pos, idat, w = 8, b"", 0
+    while pos < len(data):
+        n, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + n]
+        if kind == b"IHDR":
+            w, h, depth, ctype, _, _, lace = struct.unpack(">IIBBBBB", body)
+            if (depth, ctype, lace) != (8, 6, 0):
+                raise ValueError("unexpected PNG format")
+        elif kind == b"IDAT":
+            idat += body
+        pos += 12 + n
+    raw, bpp, stride = zlib.decompress(idat), 4, w * 4
+    rows, prev = [], bytearray(stride)
+    for y in range(h):
+        f = raw[y * (stride + 1)]
+        line = bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            a = line[i - bpp] if i >= bpp else 0
+            b, c = prev[i], (prev[i - bpp] if i >= bpp else 0)
+            if f == 1:
+                line[i] = (line[i] + a) & 255
+            elif f == 2:
+                line[i] = (line[i] + b) & 255
+            elif f == 3:
+                line[i] = (line[i] + ((a + b) >> 1)) & 255
+            elif f == 4:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                line[i] = (line[i] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        rows.append(bytes(line))
+        prev = line
+    return w, h, rows
+
+
+def app_icon_ico():
+    """The icon as a Windows .ico file's bytes (plain bitmaps up to 64 px, PNG at 256 — what Explorer expects)."""
+    import base64
+    import struct
+    images = []
+    for size in sorted(APP_ICON_PNG):
+        png = base64.b64decode("".join(APP_ICON_PNG[size]))
+        if size >= 256:
+            images.append((size, png))
+            continue
+        w, h, rows = _png_rgba(png)
+        xor = b"".join(bytes(v for i in range(0, len(r), 4) for v in (r[i + 2], r[i + 1], r[i], r[i + 3]))
+                       for r in reversed(rows))                       # bottom-up BGRA
+        mask = bytes(((w + 31) // 32) * 4) * h                        # (transparency comes from the alpha channel)
+        images.append((size, struct.pack("<IiiHHIIiiII", 40, w, h * 2, 1, 32, 0, len(xor) + len(mask), 0, 0, 0, 0)
+                       + xor + mask))
+    out, offset = struct.pack("<HHH", 0, 1, len(images)), 6 + 16 * len(images)
+    for size, blob in images:
+        out += struct.pack("<BBBBHHII", size % 256, size % 256, 0, 0, 1, 32, len(blob), offset)
+        offset += len(blob)
+    return out + b"".join(blob for _, blob in images)
+
+
+def app_icon_file():
+    """Path of the icon file on this computer (written once; "" if it can't be)."""
+    path = os.path.join(LOCAL_DIR, "session-scribe.ico")
+    try:
+        data = app_icon_ico()
+        if not os.path.isfile(path) or os.path.getsize(path) != len(data):
+            os.makedirs(LOCAL_DIR, exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+        return path
+    except Exception:
+        return ""
+
+
+def shortcut_icon_fix():
+    """Give a desktop shortcut made by an older version the app's icon (Windows; once, quietly)."""
+    if not IS_WIN or not shortcut_exists():
+        return False
+    ico = app_icon_file()
+    if not ico:
+        return False
+    ps = ("$w=New-Object -ComObject WScript.Shell;"
+          "foreach($d in @([Environment]::GetFolderPath('Desktop'),(Join-Path $env:PUBLIC 'Desktop'))){"
+          "$p=Join-Path $d 'Session Scribe.lnk';if(Test-Path $p){$s=$w.CreateShortcut($p);"
+          f"$s.IconLocation='{ico},0';$s.Save()}}}}")
+    subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps], capture_output=True,
+                   timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return True
 
 
 def shortcut_exists():
@@ -4130,6 +4581,7 @@ def desktop_shortcut(launcher, log=lambda t: None):
     ps = ("$d=[Environment]::GetFolderPath('Desktop');"
           "$s=(New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $d 'Session Scribe.lnk'));"
           f"$s.TargetPath='{launcher}';$s.WorkingDirectory='{os.path.dirname(launcher)}';"
+          + (f"$s.IconLocation='{app_icon_file()},0';" if app_icon_file() else "") +
           "$s.WindowStyle=7;$s.Save();Write-Output (Join-Path $d 'Session Scribe.lnk')")
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
@@ -7501,11 +7953,13 @@ def risk_source(d):
     for key in ("note", "overview"):
         if (d.get(key) or "").strip():
             parts.append(f"[{key}]\n{d[key].strip()}")
-    tl = (d.get("transcript") or "").splitlines()
+    text = d.get("transcript") or ""
     keep = set()
-    for i, ln in enumerate(tl):
-        if RISK_RE.search(ln):
-            keep.update({i - 1, i, i + 1})
+    if RISK_RE.search(text):                  # most transcripts never mention risk: one quick pass, then done
+        tl = text.splitlines()
+        for i, ln in enumerate(tl):
+            if RISK_RE.search(ln):
+                keep.update({i - 1, i, i + 1})
     if keep:
         parts.append("[transcript excerpts]\n" + "\n".join(tl[i] for i in sorted(keep) if 0 <= i < len(tl)))
     return "\n\n".join(parts)
@@ -8057,7 +8511,6 @@ EDITS:
 
 def learn_style(cfg, settings, progress):
     """Updated preference bullets from the remembered edits."""
-    names = {"note": "note", "overview": "overview"}
     pairs = "\n\n".join(
         f"[{p['date']} · {KIND_LABELS.get(p['kind'], ('Note', 'Overview'))[0 if p['doc'] == 'note' else 1]}]\n"
         f"DRAFT:\n{p['draft']}\nFINAL:\n{p['final']}" for p in settings.get("edit_pairs") or [])
@@ -8174,38 +8627,74 @@ def _norm_word(w):
     return w
 
 
-def patient_speech(d, counselor_label):
-    """What the patient said in a session (transcript lines not by the counselor), else the note."""
+def patient_speech(d, counselor_label, patient_label=None):
+    """What the patient said in a session — the patient's own transcript lines when the patient can be told
+    apart (see map_patient), otherwise everyone but the counselor — else the note."""
     lines = d.get("lines") or []
     roles = d.get("roles") or {}
-    said = [l.get("text", "") for l in lines if roles.get(l.get("speaker"), l.get("speaker")) != counselor_label]
+    label = lambda l: roles.get(l.get("speaker"), l.get("speaker")) or ""
+    names = list(dict.fromkeys(label(l) for l in lines))
+    patient = map_patient([{"label": n} for n in names], counselor_label, patient_label) if names else None
+    if patient:
+        said = [l.get("text", "") for l in lines if label(l) == patient]
+    else:
+        said = [l.get("text", "") for l in lines if not _same_label(label(l), counselor_label)
+                and not any(w in label(l).lower() for w in _CLINICIAN_WORDS)]
     return " ".join(said) if said else (d.get("note") or "")
 
 
-def session_themes(client, sessions, counselor_label, top_words=15):
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]+")
+_THEME_CACHE = collections.OrderedDict()          # (digest of the speech, names to leave out) -> counts
+
+
+def _speech_counts(text, hide_names):
+    """(number of words, {theme: count}, {normalized word: count}, {normalized word: {as said: count}}) for
+    one session's speech. Counted once per distinct word (not once per word said), and remembered, so the
+    Themes tab opens at once the second time and after other sessions change."""
+    key = (hashlib.blake2b(text.encode("utf-8", "replace"), digest_size=12).digest(), hide_names)
+    hit = _THEME_CACHE.get(key)
+    if hit is not None:
+        _THEME_CACHE.move_to_end(key)
+        return hit
+    tokens = _WORD_RE.findall(text)
+    tc, wc, surface = collections.Counter(), collections.Counter(), {}
+    for w, n in collections.Counter(t.lower().strip("'") for t in tokens).items():
+        if w in hide_names:
+            continue
+        theme = _THEME_OF.get(w)
+        if theme:
+            tc[theme] += n
+        if len(w) < 4 or w in STOPWORDS or w.endswith("n't"):
+            continue
+        norm = _norm_word(w)
+        wc[norm] += n
+        surface.setdefault(norm, {})[w] = n
+    out = (len(tokens), tc, wc, surface)
+    _THEME_CACHE[key] = out
+    while len(_THEME_CACHE) > 400:
+        _THEME_CACHE.popitem(last=False)
+    return out
+
+
+def session_themes(client, sessions, counselor_label, top_words=15, patient_label=None):
     """{"columns": [(date, words)], "themes": [(theme, [per-session rate per 1000 words], total)],
     "words": [(word, [counts per session], sessions_with_it)]} — oldest session first."""
-    hide_names = {p.lower() for name, _ in client_name_map(client) for p in name.split() if len(p) > 1}
-    recs = [(d["meta"].get("session_date") or "", d) for _, d in sorted(sessions, key=lambda x: session_sort_key(x[1]))
-            if d.get("meta", {}).get("kind") != "parent" and (patient_speech(d, counselor_label) or "").strip()]
+    hide_names = frozenset(p.lower() for name, _ in client_name_map(client) for p in name.split() if len(p) > 1)
     cols, theme_counts, word_counts, surface = [], [], [], {}
-    for day, d in recs:
-        words = re.findall(r"[A-Za-z][A-Za-z'-]+", patient_speech(d, counselor_label))
-        cols.append((day, len(words)))
-        tc, wc = collections.Counter(), collections.Counter()
-        for w in words:
-            lw = w.lower().strip("'")
-            if lw in hide_names:
-                continue
-            if lw in _THEME_OF:
-                tc[_THEME_OF[lw]] += 1
-            if len(lw) < 4 or lw in STOPWORDS or lw.endswith("n't"):
-                continue
-            n = _norm_word(lw)
-            wc[n] += 1
-            surface.setdefault(n, collections.Counter())[lw] += 1
+    for _, d in sorted(sessions, key=lambda x: session_sort_key(x[1])):
+        if d.get("meta", {}).get("kind") == "parent":
+            continue
+        text = patient_speech(d, counselor_label, patient_label)
+        if not (text or "").strip():
+            continue
+        n, tc, wc, surf = _speech_counts(text, hide_names)
+        cols.append((d["meta"].get("session_date") or "", n))
         theme_counts.append(tc)
         word_counts.append(wc)
+        for norm, forms in surf.items():
+            mine = surface.setdefault(norm, collections.Counter())
+            for form, k in forms.items():
+                mine[form] += k
     themes = []
     for t in THEME_WORDS:
         rates = [round(1000 * tc[t] / max(n, 1), 1) for tc, (_, n) in zip(theme_counts, cols)]
@@ -8585,8 +9074,28 @@ def run_gui():
     vault = Vault(cfg["vault_dir"])
 
     _dpi_aware()
+    if IS_WIN:                       # its own taskbar button and icon (not grouped under "Python")
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("SessionScribe.App")
+        except Exception:
+            pass
     root = tk.Tk()
     root.title(APP_NAME)
+    try:                             # the app's icon on this window and every window it opens
+        root._icons = [tk.PhotoImage(master=root, data="".join(APP_ICON_PNG[n])) for n in (256, 64, 48, 32, 24, 16)]
+        root.iconphoto(True, *root._icons)
+    except Exception:
+        pass
+    if IS_WIN and not cfg.get("shortcut_icon"):
+        def _icon_once():
+            try:
+                if shortcut_icon_fix():
+                    cfg["shortcut_icon"] = 1
+                    save_config(cfg)
+            except Exception:
+                pass
+        threading.Thread(target=_icon_once, daemon=True).start()
     _last_err = {"t": 0.0}
 
     def on_tk_error(exc, val, tb):
@@ -8682,7 +9191,7 @@ def run_gui():
         "dark": dict(bg="#1c1c1c", surface="#2b2b2b", surface2="#232323", sidebar="#202020",
                      border="#3d3d3d", text="#fafafa", muted="#a8a8a8", accent="#57c8ff",
                      accent_soft="#1d3b4f", on_accent="#000000", good="#6ccb5f", good_bg="#1f3a1f",
-                     bad="#ff99a4", bad_bg="#442726", warn="#fce100", warn_bg="#433519",
+                     bad="#ff99a4", bad_bg="#442726", warn="#f0c674", warn_bg="#433519",
                      select="#264f78", lock="#101010", lock_fg="#fafafa"),
     }
     THEME = {"mode": "light", "P": PALETTES["light"], "sv": False}
@@ -8795,11 +9304,38 @@ def run_gui():
         style.configure("Treeview", background=p["surface"], fieldbackground=p["surface"], borderwidth=0)
         style.configure("TProgressbar", background=p["accent"], troughcolor=p["surface2"], bordercolor=p["surface2"],
                         lightcolor=p["accent"], darkcolor=p["accent"], thickness=px(6))
-        style.configure("Card.TFrame", background=p["bg"], relief="solid", borderwidth=1, bordercolor=p["border"])
         style.configure("TLabelframe", background=p["bg"], bordercolor=p["border"])
         style.configure("TCheckbutton", background=p["bg"])
         style.configure("TRadiobutton", background=p["bg"])
         style.configure("Toolbutton", padding=(px(10), px(4)), background=p["bg"])
+
+    _CARD = {"img": None}
+
+    def card_image(p):
+        """The card outline: a hairline with softly rounded corners, painted in the theme's colors (ttk
+        stretches its middle). Repainted in place when the theme changes. Returns the corner size.
+        The middle is 64 px wide, not 1: ttk fills a stretched picture by repeating its middle, so a 1 px
+        middle meant one drawing call per pixel — hundreds of thousands for a wide card, the slowest thing
+        on any page that had one."""
+        r = max(4, px(7))
+        n = 2 * r + 64
+        if _CARD["img"] is None or _CARD["img"].width() != n:
+            _CARD["img"] = tk.PhotoImage(master=root, width=n, height=n)
+        rgb = lambda h: [int(h[i:i + 2], 16) for i in (1, 3, 5)]
+        bg_, line = rgb(p["bg"]), rgb(p["border"])
+        rows = []
+        for y in range(n):
+            row = []
+            for x in range(n):
+                cx, cy = min(x, n - 1 - x), min(y, n - 1 - y)
+                if cx >= r or cy >= r:
+                    a = 1.0 if min(cx, cy) == 0 else 0.0
+                else:
+                    a = max(0.0, 1.0 - abs(math.hypot(r - cx - 0.5, r - cy - 0.5) - (r - 0.5)))
+                row.append("#" + "".join(f"{round(b + (l - b) * a):02x}" for b, l in zip(bg_, line)))
+            rows.append("{" + " ".join(row) + "}")
+        _CARD["img"].put(" ".join(rows))
+        return r
 
     def custom_styles(p):
         bg = p["bg"]
@@ -8869,12 +9405,12 @@ def run_gui():
         t = max(1, px(1))
         img = ROW_IMG.get("line")
         if img is None:
-            img = ROW_IMG["line"] = tk.PhotoImage(master=root, width=3, height=t)
+            img = ROW_IMG["line"] = tk.PhotoImage(master=root, width=66, height=t)   # (wide middle: see card_image)
             try:
                 style.element_create("Divider.line", "image", img, border=(1, 0, 1, 0), sticky="ew")
             except tk.TclError:
                 pass
-        img.put(p["border"], to=(0, 0, 3, t))
+        img.put(p["border"], to=(0, 0, 66, t))
         for sty in ("List.Treeview", "Side.Treeview", "Treeview"):
             try:
                 style.layout(f"{sty}.Row", [("Divider.line", {"side": "bottom", "sticky": "ew"}),
@@ -8918,9 +9454,18 @@ def run_gui():
         style.configure("TLabelframe.Label", foreground=p["muted"], font=F["caption_strong"])
         # Cards: a flat bordered panel in the page color, so text inside never sits in a
         # different-colored box (the theme's card picture is a slightly different shade).
-        style.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
-        style.configure("Card.TFrame", background=bg, relief="solid", borderwidth=1, bordercolor=p["border"],
-                        lightcolor=p["border"], darkcolor=p["border"])
+        try:
+            r = card_image(p)
+            try:
+                style.element_create("Card.border", "image", _CARD["img"], border=r, sticky="nswe")
+            except tk.TclError:
+                pass                                   # this theme already has it (the picture was repainted)
+            style.layout("Card.TFrame", [("Card.border", {"sticky": "nswe"})])
+            style.configure("Card.TFrame", background=bg, borderwidth=0, relief="flat")
+        except tk.TclError:                            # no image support: the plain bordered box
+            style.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
+            style.configure("Card.TFrame", background=bg, relief="solid", borderwidth=1, bordercolor=p["border"],
+                            lightcolor=p["border"], darkcolor=p["border"])
 
     def apply_theme(mode):
         resolved = mode if mode in ("light", "dark") else system_mode()
@@ -9014,7 +9559,17 @@ def run_gui():
         item = canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(item, width=e.width))
-        canvas.configure(yscrollcommand=sb.set)
+        def on_scroll(lo, hi):                     # the scrollbar is only there when there's something to scroll
+            sb.set(lo, hi)
+            try:
+                fits = float(lo) <= 0.0 and float(hi) >= 1.0
+                if fits and sb.winfo_ismapped():
+                    sb.pack_forget()
+                elif not fits and not sb.winfo_ismapped():
+                    sb.pack(side="right", fill="y", before=canvas)
+            except tk.TclError:
+                pass
+        canvas.configure(yscrollcommand=on_scroll)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
@@ -9158,6 +9713,23 @@ def run_gui():
             super().__init__(parent, show="tree", selectmode="browse", style=style_name)
             self.column("#0", stretch=True, width=px(250))
             self._ids, self._prog = [], ()       # _prog: the selection last set from code
+            self._hover = None                   # the row under the mouse gets a soft highlight
+            ttk.Treeview.bind(self, "<Motion>", lambda e: self._set_hover(self.identify_row(e.y)), add="+")
+            ttk.Treeview.bind(self, "<Leave>", lambda e: self._set_hover(None), add="+")
+
+        def _set_hover(self, iid):
+            iid = iid or None
+            if iid == self._hover:
+                return
+            try:
+                if self._hover and self.exists(self._hover):
+                    self.item(self._hover, tags=())
+                if iid:
+                    self.tag_configure("hover", background=P("surface2"))
+                    self.item(iid, tags=("hover",))
+            except tk.TclError:
+                pass
+            self._hover = iid
 
         def insert(self, index, text):                      # noqa: A003  (Listbox-like)
             self._ids.append(super().insert("", "end", text=text))
@@ -9579,7 +10151,7 @@ def run_gui():
     def doc_menu(parent, t=None, items=(), text="⋯"):
         """A small "⋯" menu for a document's less-used actions. items: (label, command) pairs, None for a
         separator, or (label, [(label, command)…]) for a submenu. Find and text size are added for t."""
-        mb = ttk.Menubutton(parent, text=text)
+        mb = ttk.Menubutton(parent, text=text + "  ")
         m = register(tk.Menu(mb, tearoff=False), "menu")
 
         def fill(menu, entries):
@@ -9702,6 +10274,7 @@ def run_gui():
                        if os.path.isdir(os.path.join(LOCAL_DIR, "remote-audio")) else []):
                 _quiet(wipe_file, os.path.join(LOCAL_DIR, "remote-audio", fn))
             self._build_shell()
+            threading.Thread(target=lambda: _quiet(refresh_launcher), daemon=True).start()
             tidied = (0, 0)
             try:
                 tidied = tidy_all_imported(vault)     # once per imported record, all patients
@@ -9807,11 +10380,12 @@ def run_gui():
             r = data_root(cfg)
             threading.Thread(target=lambda: _quiet(write_sync_marker, r), daemon=True).start()
 
-        def sync_now(self, on_result=None):
+        def sync_now(self, on_result=None, redraw=True):
             """Setup → Sync now: pick up everything that's arrived from the other computer, refresh
             the screen, record what this computer has, and report whether both sides match."""
-            if self.wizard is None:
-                self._sig = vault.signature()
+            sig = vault.signature()
+            if self.wizard is None and (redraw or sig != getattr(self, "_sig", None)):
+                self._sig = sig
                 self.settings = vault.load_settings() or self.settings
                 self.refresh_clients()
                 if self.client_id and any(c["id"] == self.client_id for c in self.all_clients):
@@ -10431,17 +11005,8 @@ def run_gui():
             mb = ttk.Menubutton(parent, text="Copy part  ▾")
             m = tk.Menu(mb, tearoff=False)
             mb.config(menu=m)
-
-            def pick(i, label):
-                part = note_sections(get())[i]
-                if not part.strip():
-                    return messagebox.showinfo(APP_NAME, f"This note has no “{label}” section. (Notes written "
-                                                         "before this was added, and imported notes, don't.)")
-                self.copy(part, label)
-            m.add_command(label="Note paragraph only", command=lambda: pick(0, "Note paragraph"))
-            m.add_command(label="Therapeutic Interventions Used", command=lambda: pick(1, "Therapeutic Interventions Used"))
-            m.add_command(label="Planned Interventions (For future sessions)",
-                          command=lambda: pick(2, "Planned Interventions"))
+            for label, command in self.note_copy_items(get):
+                m.add_command(label=label, command=command)
             return mb
 
         def clear_clipboard(self):
@@ -10554,8 +11119,8 @@ def run_gui():
             self.clear_clipboard()
             env = dict(ONLINE_ENV, PATH=os.environ["PATH"], **{RELAUNCH_FLAG: "1"})
             try:
-                subprocess.Popen([_gui_python(sys.executable), script or os.path.abspath(__file__)], env=env,
-                                 cwd=os.path.dirname(script) if script else None)
+                argv, cwd = launch_command(_gui_python(sys.executable), script)
+                subprocess.Popen(argv, env=env, cwd=cwd or (os.path.dirname(script) if script else None))
             except Exception as e:
                 messagebox.showinfo(APP_NAME, f"Please reopen Session Scribe yourself ({e}).")
             root.destroy()
@@ -10599,6 +11164,10 @@ def run_gui():
             return self.wizard is w and self._alive(self.page)
 
         def refresh_clients(self, select_id=None):
+            with vault.one_look():
+                self._refresh_clients(select_id)
+
+        def _refresh_clients(self, select_id=None):
             self.all_clients = vault.list_clients()
             n_arch = sum(1 for c in self.all_clients if c.get("archived"))
             show = self.show_archived.get()
@@ -10772,10 +11341,11 @@ def run_gui():
             except Exception:
                 self.refresh_clients()
                 return self.show_home()
-            sessions = vault.sessions_for(cid)          # oldest first
-            if followups_sync(client, sessions):        # contact notes' "Follow-up:" lists → the checklist
-                _quiet(vault.save_client, client)
-            self._sig = vault.signature()              # what's on screen is current
+            with vault.one_look():                      # each vault folder is listed once for all of this
+                sessions = vault.sessions_for(cid)          # oldest first
+                if followups_sync(client, sessions):        # contact notes' "Follow-up:" lists → the checklist
+                    _quiet(vault.save_client, client)
+                self._sig = vault.signature()              # what's on screen is current
             self.show(lambda f: self._client_page(f, client, sessions, select))
 
         def _client_page(self, f, client, sessions, select):
@@ -10799,7 +11369,7 @@ def run_gui():
                                  command=lambda: self.start_wizard(client)))
             # Everything else lives in two menus, so the header stays calm: "Write" makes something new for
             # this patient; "Patient" is about the record itself.
-            write = ttk.Menubutton(pbtns, text="✎  Write")
+            write = ttk.Menubutton(pbtns, text="✎  Write  ")
             wmenu = register(tk.Menu(write, tearoff=False), "menu")
             wmenu.add_command(label="📝  Prep for next session", command=lambda: self.prep_brief(client))
             wmenu.add_command(label="✉  Letter…", command=lambda: self.letter_dialog(client))
@@ -10809,7 +11379,7 @@ def run_gui():
             write["menu"] = wmenu
             pbtns.add(write)
             nfiles = len(client.get("files") or [])
-            more = ttk.Menubutton(pbtns, text="Patient")
+            more = ttk.Menubutton(pbtns, text="Patient  ")
             menu = register(tk.Menu(more, tearoff=False), "menu")
             menu.add_command(label="Edit patient…", command=lambda: self.edit_client(client))
             menu.add_command(label=f"📎  Files ({nfiles})…" if nfiles else "📎  Files…",
@@ -11092,7 +11662,7 @@ def run_gui():
                 cb.bind("<<ComboboxSelected>>", lambda e: self._ask_open(client, ids[titles.index(pick.get())]))
             if chat:
                 head.add(ttk.Button(head, text="Delete…", command=lambda: self._ask_delete(client, chat)))
-            head.add(ttk.Button(head, text="＋ New conversation", command=lambda: self._ask_open(client, None)))
+            head.add(ttk.Button(head, text="＋  New conversation", command=lambda: self._ask_open(client, None)))
             cap = ttk.Label(v, text="Answers come from the local AI using this patient's notes, overviews, transcripts, "
                                     "treatment plans and case overview, plus the SSC manual. They're drafts — check the "
                                     "cited sessions before relying on them. Nothing leaves this computer.",
@@ -11101,7 +11671,8 @@ def run_gui():
             cap.bind("<Configure>", lambda e: cap.config(wraplength=max(px(200), e.width - px(8))))
 
             # conversation, shown like a document
-            fr, t = scrolled_text(v, readonly=True, doc=True)
+            fr, t = scrolled_text(v, readonly=True, doc=True, tools=False)
+            head.add(doc_menu(head, t))
             P_ = THEME["P"]
             t.tag_configure("who_q", font=F["caption_strong"], foreground=P_["accent"], spacing1=px(14),
                             justify="right", rmargin=px(4))
@@ -11539,7 +12110,7 @@ def run_gui():
 
             first = None
             for label, key, sid, d in day_docs(records):
-                tab = ttk.Frame(nb, padding=(0, 6, 0, 0))
+                tab = ttk.Frame(nb, padding=(px(12), px(10), px(6), 0))
                 nb.add(tab, text=f"  {label}  ")
                 pending[str(tab)] = (lambda tab=tab, label=label, key=key, sid=sid, d=d:
                                      build_tab(tab, label, key, sid, d))
@@ -11548,7 +12119,7 @@ def run_gui():
             reviewable = [(rsid, rd) for rsid, rd in records if (rd.get("transcript") or "").strip()
                           and rd["meta"].get("source") not in ("imported", "messages")]
             for n_, (rsid, rd) in enumerate(reviewable, 1):     # your own review of the session (not the chart)
-                tab = ttk.Frame(nb, padding=(0, 6, 0, 0))
+                tab = ttk.Frame(nb, padding=(px(12), px(10), px(6), 0))
                 nb.add(tab, text="  Session review" + (f" ({n_})" if len(reviewable) > 1 else "") + "  ")
                 pending[str(tab)] = (lambda tab=tab, rsid=rsid, rd=rd:
                                      self._build_review(tab, client, rsid, rd, day))
@@ -12768,12 +13339,27 @@ def run_gui():
             m = session_map(d.get("lines"), d.get("roles") or {}, counselor, patient_label=patient)
             if m:
                 self.draw_session_map(box, m).pack(anchor="w", fill="x", padx=(0, px(8)))
-                ttk.Label(box, text=session_map_text(m), style="Muted.TLabel", wraplength=px(760),
-                          justify="left").pack(anchor="w", pady=(px(6), 0))
+                facts = Flow(box, gap=px(8))             # the numbers as small tiles, not a paragraph
+                facts.pack(fill="x", pady=(px(8), 0))
+                q = m["questions"]
+                tiles = [(fmt_ts(m["duration"]), "length")]
+                tiles += [(f"{s_['pct']}%", f"{s_['label']} talking") for s_ in m["speakers"][:3]]
+                if q["total"]:
+                    tiles.append((f"{q['open']} / {q['closed']}", "open / closed questions"))
+                tiles.append((f"{m['silence_pct']}%", "pauses"))
+                for big, small in tiles:
+                    tl = facts.add(ttk.Frame(facts, style="Card.TFrame", padding=(px(12), px(6))))
+                    ttk.Label(tl, text=big, style="Strong.TLabel").pack(anchor="w")
+                    ttk.Label(tl, text=small, style="Caption.TLabel").pack(anchor="w")
+                if m["heavy"]:
+                    ttk.Label(box, text="Heaviest moments", style="Strong.TLabel").pack(anchor="w", pady=(px(10), 0))
+                    for hv in m["heavy"]:
+                        ttk.Label(box, text=f"{fmt_ts(hv['t'])}   “{hv['quote']}”", style="Muted.TLabel",
+                                  wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), 0))
                 ttk.Label(box, text="Tone follows only what the patient said (not your words or anyone else's): a "
                                     "simple count of feeling words every two minutes — a rough guide to where the "
                                     "session got heavy, not a measurement.",
-                          style="Caption.TLabel", wraplength=px(760), justify="left").pack(anchor="w")
+                          style="Caption.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(8), 0))
             else:
                 ttk.Label(box, text="Only recorded sessions (with timings) have a session map.",
                           style="Muted.TLabel").pack(anchor="w")
@@ -13012,7 +13598,7 @@ def run_gui():
             try:
                 rs = risk_summary(client, sessions)
                 if rs["recent"]:
-                    bits.append(f"⚠ risk {fmt_short(rs['recent'][0]['date'])}")
+                    bits.append("⚠ risk")
             except Exception:
                 pass
             try:
@@ -13026,13 +13612,15 @@ def run_gui():
                 pass
             n_fu = sum(1 for x in client.get("followups") or [] if not x.get("done"))
             if n_fu:
-                bits.append(f"{n_fu} to follow up")
+                bits.append(f"{n_fu} to do")
             try:
                 n = len(goals_summary(client, sessions)["stale"])
                 if n:
                     bits.append(f"{n} goal{'s' if n != 1 else ''} idle")
             except Exception:
                 pass
+            if len(bits) > 2:                         # the list is narrow: the two most important, then a count
+                bits = bits[:2] + [f"+{len(bits) - 2}"]
             return " · ".join(bits)
 
         INSIGHT_TITLES = {"risk": "Risk", "scores": "PHQ-9 / GAD-7", "goals": "Treatment goals",
@@ -13067,7 +13655,7 @@ def run_gui():
             want = tab or getattr(self, "_insight_tab", None)
             want_tab = section_tab.get(want, want)
             for key, title, secs in groups:
-                fr = ttk.Frame(nb, padding=(0, px(6), 0, 0))
+                fr = ttk.Frame(nb, padding=(px(12), px(10), px(6), 0))
                 nb.add(fr, text=f"  {title}  ")
                 frames[str(fr)] = (key, secs, fr)
 
@@ -13999,8 +14587,8 @@ def run_gui():
 
         def _ins_themes(self, fr, client, sessions):
             box = self._ins_box(fr)
-            counselor, _ = self._counselor_patient()
-            th = session_themes(client, sessions, counselor)
+            counselor, patient = self._counselor_patient()
+            th = session_themes(client, sessions, counselor, patient_label=patient)
             ttk.Label(box, text="What the patient talks about, session by session", style="Strong.TLabel").pack(anchor="w")
             ttk.Label(box, text="Counted on this computer from what the patient said in recorded sessions (or the note "
                                 "when there's no recording) — no AI. Darker = talked about more in that session. Names on "
@@ -14145,11 +14733,12 @@ def run_gui():
         # ======================================================== CASELOAD DASHBOARD
         def dashboard_data(self):
             pairs, light = [], vault.light_sessions()
+            stamps = vault.client_stamps()              # one look at the folder, not one per patient
             for c in self.clients:
                 if c.get("archived"):
                     continue
                 try:
-                    full = vault.load_client(c["id"])
+                    full = vault.load_client(c["id"], stamps.get(c["id"]))
                     sessions = light.get(c["id"], [])
                     contacts = [(sid, d) for sid, d in sessions if d["meta"].get("kind") == "parent"]
                     if contacts and followups_sync(full, [(sid, vault.load_session(sid)) for sid, _ in contacts]):
@@ -14195,6 +14784,7 @@ def run_gui():
                     r_.pack(fill="x", pady=px(1))
                     if key == "followups":
                         v = tk.BooleanVar(value=False)
+                        r_._v = v                      # keep it alive, or the box shows as half ticked
                         ttk.Checkbutton(r_, variable=v, command=lambda r=r: (
                             self.set_followup(r["client"], r["fid"], True, reopen=False), self.show_home())).pack(side="left")
                     ttk.Label(r_, text=r["client"].get("code", ""), style="Strong.TLabel", width=8).pack(side="left")
@@ -14386,6 +14976,7 @@ def run_gui():
                 else:
                     paste_fr.grid_remove()
                     toggle.config(text="I have a transcript already — paste it instead")
+                f.rowconfigure(3, weight=1 if on else 0)    # (no empty band where the paste box would be)
             toggle.config(command=lambda: show_paste(not w["pasted"]))
             toggle.grid(row=2, column=0, columnspan=3, sticky="w", pady=(2, 8))
             show_paste(w["pasted"])
@@ -14451,7 +15042,6 @@ def run_gui():
             ofr, obs = scrolled_text(f, height=5)
             ofr.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
             f.rowconfigure(7, weight=1)
-            f.rowconfigure(3, weight=1)                     # the paste box shrinks before the buttons do
             set_text(obs, w["observations"])
             obs.bind("<<Modified>>", lambda e: obs.edit_modified() and w.update(dirty=True))
 
@@ -16509,7 +17099,7 @@ def run_gui():
             """Pull recordings back from the other computer (calling them off there) and run them on this
             one. The handed-over entries are detached: if the other computer confirms the call-off later,
             that lands on the old entry and only tidies the shared folder; it can't touch the new run."""
-            Q, R = self._q(), self._rem()
+            Q = self._q()
             gone = [it for it in its if not os.path.isfile(it["path"])]
             if gone:
                 messagebox.showinfo(APP_NAME, f"{len(gone)} of these can't run here: the original recording "
@@ -16914,10 +17504,10 @@ def run_gui():
                 sync_more.config(text="\n".join("• " + d for d in res["details"]))
                 sync_btn.config(state="normal", text="⟳  Sync now")
 
-            def do_sync():
+            def do_sync(redraw=True):
                 sync_btn.config(state="disabled", text="Syncing…")
                 sync_lbl.config(text="Checking both computers' files…", style="Muted.TLabel")
-                self.sync_now(show_sync)
+                self.sync_now(show_sync, redraw=redraw)
             sync_btn.config(command=do_sync)
 
             # ---- phone: the iPhone page reads the vault from Drive; this computer answers what needs it
@@ -17099,7 +17689,8 @@ def run_gui():
                         if self.wizard and self.wizard.get("dirty") and not messagebox.askyesno(
                                 APP_NAME, "You have an unsaved session. Restart anyway?", parent=win):
                             return
-                        subprocess.Popen([res["runner"], os.path.abspath(__file__)])
+                        argv, cwd = launch_command(res["runner"])
+                        subprocess.Popen(argv, cwd=cwd)
                         self.clear_clipboard()
                         root.destroy()
 
@@ -17319,6 +17910,8 @@ def run_gui():
                 refresh()
 
             def refresh():
+                if not checks.winfo_exists():          # Settings was closed while a step was still running
+                    return
                 for c in checks.winfo_children():
                     c.destroy()
                 ms = models_status(cfg, token_var.get().strip())
@@ -17552,7 +18145,7 @@ def run_gui():
             self.setup_win = {"win": win, "log": log, "refresh": refresh, "sync": do_sync, "run_all": run_all,
                               "plan": plan_steps, "describe": describe}
             refresh()
-            do_sync()
+            do_sync(redraw=False)       # (the screen behind is only redrawn if something actually arrived)
             # first time Setup opens on this computer: detect it and offer to install everything at once
             if not cfg.get("setup_assistant_offered"):
                 cfg["setup_assistant_offered"] = True
