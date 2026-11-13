@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.16"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.17"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3490,6 +3490,7 @@ class Vault:
                 "check": Fernet(key).encrypt(self.CHECK).decode()}
         self._atomic_write(self.meta_path, json.dumps(meta).encode())
         self.fernet = Fernet(key)
+        self._raw_key = key
         set_checkpoint_secret(key)
 
     def _key_for(self, password):
@@ -3507,12 +3508,48 @@ class Vault:
         key = self._key_for(password)
         if key:
             self.fernet = Fernet(key)
+            self._raw_key = key
             set_checkpoint_secret(key)
             self._dirs()
             self._load_local_index()
             self.migrate()
             self.save_local_index()
         return key is not None
+
+    def key_ok(self, key):
+        """Is this the vault's key? (Windows Hello unlock hands back the key, not the password.)"""
+        from cryptography.fernet import Fernet, InvalidToken
+        try:
+            with open(self.meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            return Fernet(key).decrypt(meta["check"].encode()) == self.CHECK
+        except (InvalidToken, ValueError, TypeError, OSError, KeyError):
+            return False
+
+    def unlock_key(self, key):
+        """Unlock with the key itself (from Windows Hello) — the same as unlock() after the password step."""
+        from cryptography.fernet import Fernet
+        if not key or not self.key_ok(key):
+            return False
+        self.fernet = Fernet(key)
+        self._raw_key = key
+        set_checkpoint_secret(key)
+        self._dirs()
+        self._load_local_index()
+        self.migrate()
+        self.save_local_index()
+        return True
+
+    def raw_key(self):
+        return getattr(self, "_raw_key", None)
+
+    def vault_id(self):
+        """Tells vaults apart (a Windows Hello setup belongs to one vault)."""
+        try:
+            with open(self.meta_path, encoding="utf-8") as f:
+                return hashlib.sha256(json.load(f)["salt"].encode()).hexdigest()[:16]
+        except (OSError, ValueError, KeyError):
+            return ""
 
     # --- speed: what's already been decrypted & parsed stays in RAM (512 MB budget)
     CACHE_BUDGET = 512 * 1024 * 1024       # decrypted sessions kept in memory (most recently used)
@@ -11444,6 +11481,197 @@ def doc_labels(meta):
     return KIND_LABELS.get((meta or {}).get("kind"), KIND_LABELS["progress"])
 
 
+# --------------------------------------------------------------------------- #
+# Windows Hello (fingerprint / face / Windows PIN) instead of typing the vault password — per computer.
+# A Windows Hello key (it never leaves Windows; only your fingerprint, face or PIN can use it) signs a fixed
+# random challenge; that signature locks a copy of the vault key, kept only on this computer
+# (%LOCALAPPDATA%\Session Scribe\hello.json), never in the shared data folder. If this PC's Windows Hello
+# doesn't sign the same way twice, it falls back to Windows' per-user encryption (DPAPI) behind a Windows
+# Hello check. The password always still works.
+# --------------------------------------------------------------------------- #
+HELLO_FILE = os.path.join(LOCAL_DIR, "hello.json")
+HELLO_PS1 = r'''param([string]$mode, [string]$name, [string]$arg)
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+  $null = [Windows.Security.Credentials.KeyCredentialManager, Windows.Security.Credentials, ContentType = WindowsRuntime]
+  $null = [Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType = WindowsRuntime]
+  $m = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }
+  $opT = ($m | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+  $actT = ($m | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+  function Await($op, [Type]$t) { $k = $opT.MakeGenericMethod($t).Invoke($null, @($op)); $k.Wait() | Out-Null; $k.Result }
+  $KCM = [Windows.Security.Credentials.KeyCredentialManager]
+  $UCV = [Windows.Security.Credentials.UI.UserConsentVerifier]
+  $BUF = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]
+  switch ($mode) {
+    'available' { "OK:" + (Await ($UCV::CheckAvailabilityAsync()) ([Windows.Security.Credentials.UI.UserConsentVerifierAvailability])) }
+    'create' {
+      $r = Await ($KCM::RequestCreateAsync($name, [Windows.Security.Credentials.KeyCredentialCreationOption]::ReplaceExisting)) ([Windows.Security.Credentials.KeyCredentialRetrievalResult])
+      if ($r.Status -ne 'Success') { "ERR:" + $r.Status } else { "OK:created" } }
+    'sign' {
+      $r = Await ($KCM::OpenAsync($name)) ([Windows.Security.Credentials.KeyCredentialRetrievalResult])
+      if ($r.Status -ne 'Success') { "ERR:" + $r.Status } else {
+        $s = Await ($r.Credential.RequestSignAsync($BUF::AsBuffer([Convert]::FromBase64String($arg)))) ([Windows.Security.Credentials.KeyCredentialOperationResult])
+        if ($s.Status -ne 'Success') { "ERR:" + $s.Status } else { "OK:" + [Convert]::ToBase64String($BUF::ToArray($s.Result)) } } }
+    'verify' { "OK:" + (Await ($UCV::RequestVerificationAsync($arg)) ([Windows.Security.Credentials.UI.UserConsentVerificationResult])) }
+    'delete' { $k = $actT.Invoke($null, @($KCM::DeleteAsync($name))); $k.Wait() | Out-Null; "OK:deleted" }
+  }
+} catch { "ERR:" + $_.Exception.Message }
+'''
+_HELLO_WORDS = {"UserCanceled": "Cancelled.", "Canceled": "Cancelled.", "NotFound": "This computer's Windows Hello key "
+                "is gone (Windows Hello was reset). Turn fingerprint unlock on again in Settings.",
+                "UserPrefersPassword": "Windows Hello wasn't used.", "SecurityDeviceLocked": "Windows Hello is "
+                "locked for now (too many tries). Use your password.", "NotConfiguredForUser": "Windows Hello isn't "
+                "set up for this Windows account (Settings ▸ Accounts ▸ Sign-in options).",
+                "DeviceNotPresent": "No fingerprint reader or camera was found.", "DeviceBusy": "Windows Hello is "
+                "busy — try again.", "RetriesExhausted": "Too many tries. Use your password.",
+                "DisabledByPolicy": "Windows Hello is turned off by policy on this computer."}
+
+
+def _hello_run(mode, name="", arg=""):
+    """Ask Windows Hello (through Windows PowerShell's WinRT access; nothing extra to install)."""
+    if not IS_WIN:
+        raise RuntimeError("Fingerprint unlock uses Windows Hello, which is only on Windows.")
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    path = os.path.join(LOCAL_DIR, "hello.ps1")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            same = f.read() == HELLO_PS1
+    except OSError:
+        same = False
+    if not same:
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write(HELLO_PS1)
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path, mode, name or "_",
+                        arg or "_"], capture_output=True, text=True, timeout=180,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    lines = [l.strip() for l in (r.stdout or "").splitlines() if l.strip()]
+    last = next((l for l in reversed(lines) if l.startswith(("OK:", "ERR:"))), "")
+    if last.startswith("OK:"):
+        return last[3:]
+    why = last[4:] if last else ((r.stderr or "").strip()[-300:] or "no answer")
+    raise RuntimeError(_HELLO_WORDS.get(why, f"Windows Hello didn't work ({why})."))
+
+
+def _hello_front():
+    """Bring the Windows Hello prompt to the front (it can open behind the app)."""
+    if not IS_WIN:
+        return
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        for _ in range(60):
+            for title in ("Windows Security", "Windows-Sicherheit", "Sécurité Windows", "Seguridad de Windows"):
+                h = u.FindWindowW(None, title)
+                if h:
+                    u.ShowWindow(h, 5)
+                    u.SetForegroundWindow(h)
+                    return
+            time.sleep(0.2)
+    except Exception:
+        pass
+
+
+def _dpapi(data, protect=True):
+    """Windows' per-user encryption (only this Windows account on this computer can undo it)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    buf = ctypes.create_string_buffer(data, len(data))
+    inp, out = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), BLOB()
+    fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(inp), None, None, None, None, 0x1, ctypes.byref(out)):   # 0x1: never show UI
+        raise OSError("Windows couldn't " + ("protect" if protect else "read") + " the saved key.")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+
+
+def _hello_wrap_key(signature, challenge):
+    return base64.urlsafe_b64encode(hashlib.sha256(b"session-scribe-hello\0" + challenge + signature).digest())
+
+
+def hello_state(vault_obj=None):
+    """This computer's Windows Hello setup for this vault, or None."""
+    try:
+        with open(HELLO_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if vault_obj is not None and st.get("vault") and st["vault"] != vault_obj.vault_id():
+        return None
+    return st
+
+
+def hello_available():
+    try:
+        return _hello_run("available") == "Available"
+    except Exception:
+        return False
+
+
+def hello_enroll(vault_obj):
+    """Set up fingerprint unlock (three Windows Hello prompts: create the key, then sign twice to check it
+    signs the same way). Returns the mode used."""
+    from cryptography.fernet import Fernet
+    key = vault_obj.raw_key()
+    if not key:
+        raise RuntimeError("Unlock the vault with your password first.")
+    name = "SessionScribe-" + secrets.token_hex(4)
+    _hello_run("create", name)
+    challenge = secrets.token_bytes(32)
+    c64 = base64.b64encode(challenge).decode()
+    s1 = base64.b64decode(_hello_run("sign", name, c64))
+    s2 = base64.b64decode(_hello_run("sign", name, c64))
+    if s1 == s2:
+        st = {"mode": "sign", "wrapped": Fernet(_hello_wrap_key(s1, challenge)).encrypt(key).decode()}
+    else:                                   # this PC's Hello signs differently each time: DPAPI + a Hello check
+        st = {"mode": "consent", "wrapped": base64.b64encode(_dpapi(key, True)).decode()}
+    st.update(version=1, name=name, challenge=c64, vault=vault_obj.vault_id(),
+              created=datetime.now().isoformat(timespec="seconds"))
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    tmp = HELLO_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(tmp, HELLO_FILE)
+    return st["mode"]
+
+
+def hello_key(vault_obj=None):
+    """The vault key, after a Windows Hello check (raises RuntimeError with a plain message if it fails)."""
+    from cryptography.fernet import Fernet, InvalidToken
+    st = hello_state(vault_obj)
+    if not st:
+        raise RuntimeError("Fingerprint unlock isn't set up on this computer.")
+    if st.get("mode") == "sign":
+        sig = base64.b64decode(_hello_run("sign", st["name"], st["challenge"]))
+        try:
+            return Fernet(_hello_wrap_key(sig, base64.b64decode(st["challenge"]))).decrypt(st["wrapped"].encode())
+        except InvalidToken:
+            raise RuntimeError("Windows Hello answered, but the saved key didn't open. Turn fingerprint unlock off "
+                               "and on again in Settings.") from None
+    res = _hello_run("verify", "", "Unlock Session Scribe")
+    if res != "Verified":
+        raise RuntimeError(_HELLO_WORDS.get(res, f"Windows Hello didn't confirm it's you ({res})."))
+    return _dpapi(base64.b64decode(st["wrapped"]), False)
+
+
+def hello_disable():
+    st = hello_state()
+    if st and st.get("name"):
+        try:
+            _hello_run("delete", st["name"])
+        except Exception:
+            pass
+    try:
+        os.remove(HELLO_FILE)
+    except OSError:
+        pass
+
+
 def run_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -12932,6 +13160,46 @@ def run_gui():
         pw1.bind("<Return>", submit)
         pw2.bind("<Return>", submit)
         pw1.focus_set()
+        if not creating and hello_state(vault):
+            def by_finger():
+                msg.config(text="Waiting for Windows Hello…", style="Muted.TLabel")
+                hb.config(state="disabled")
+
+                def done(key, err):
+                    if not frame.winfo_exists():
+                        return
+                    hb.config(state="normal")
+                    if key and vault.unlock_key(key):
+                        frame.destroy()
+                        on_ok()
+                    else:
+                        msg.config(text=err or "That didn't unlock the vault — use your password.", style="Bad.TLabel")
+                hello_async(done)
+            hb = hello_button(frame, by_finger)
+            hb.pack(fill="x", pady=(px(8), 0), ipady=px(3))
+            frame._hello = by_finger
+
+    def hello_button(parent, cmd):
+        return ttk.Button(parent, text="👆  Use fingerprint (Windows Hello)", command=cmd)
+
+    def hello_async(on_done, vault_obj=None):
+        """Ask Windows Hello for the vault key without freezing the window; on_done(key, error_text)."""
+        box = {}
+
+        def work():
+            try:
+                box["key"] = hello_key(vault_obj or vault)
+            except Exception as e:
+                box["err"] = str(e) or e.__class__.__name__
+        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=_hello_front, daemon=True).start()
+
+        def poll():
+            if "key" in box or "err" in box:
+                on_done(box.get("key"), box.get("err"))
+            else:
+                root.after(150, poll)
+        root.after(150, poll)
 
     # ================================================================= App
     class App:
@@ -16337,6 +16605,9 @@ def run_gui():
             def keep_front():
                 if st["closed"] or not W.winfo_exists():
                     return
+                if st.get("hello"):                       # Windows Hello's prompt must be able to come in front
+                    W.after(800, keep_front)
+                    return
                 _quiet(W.lift)
                 _quiet(W.attributes, "-topmost", True)
                 try:
@@ -16517,6 +16788,24 @@ def run_gui():
                 row = tk.Frame(col, background=pal["bg"])
                 row.pack(anchor="w", pady=(px(12), 0))
                 big_btn(row, "Continue", attempt, accent=True).pack(side="left")
+                if hello_state(vault):
+                    def by_finger():
+                        err.config(text="Waiting for Windows Hello…", foreground=pal["muted"])
+                        st["hello"] = True
+                        _quiet(W.attributes, "-topmost", False)
+
+                        def done(key, why):
+                            st["hello"] = False
+                            if st["closed"] or not W.winfo_exists():
+                                return
+                            if key and vault.key_ok(key):
+                                close()
+                            else:
+                                _quiet(W.attributes, "-topmost", True)
+                                err.config(text=why or "That didn't work — use your password.", foreground=pal["bad"])
+                        hello_async(done)
+                    big_btn(row, "👆  Fingerprint", by_finger).pack(side="left", padx=(px(10), 0))
+                    st["hello_fn"] = by_finger
                 small_btn(row, "Back to the patient's screen", handback).pack(side="left", padx=(px(14), 0))
                 W.bind("<Return>", attempt)
                 pw.focus_set()
@@ -22925,6 +23214,96 @@ def run_gui():
                     ttk.Button(r_, text="Remove", command=lambda d=d: remove_phone(d)).pack(side="right")
             show_phone()
 
+            # ---- fingerprint unlock (Windows Hello), per computer
+            if IS_WIN:
+                hw = ttk.LabelFrame(outer, text="Fingerprint unlock (Windows Hello)", padding=px(10))
+                hw.pack(fill="x", pady=(px(10), 0))
+                ttk.Label(hw, text="Unlock with your fingerprint, face or Windows PIN instead of typing the vault "
+                                   "password — at start-up, after auto-lock, and after a patient finishes an "
+                                   "assessment. Set up separately on each computer; the key it uses stays on this "
+                                   "computer (never in the shared folder). Your password always still works.",
+                          style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w")
+                hw_info = ttk.Label(hw, text="", wraplength=px(760), justify="left")
+                hw_info.pack(anchor="w", pady=(px(6), 0))
+                hw_row = Flow(hw, gap=px(8))
+                hw_row.pack(fill="x", pady=(px(6), 0))
+                hw_on_b = hw_row.add(ttk.Button(hw_row, text="Turn on…", style="Accent.TButton"))
+                hw_off_b = hw_row.add(ttk.Button(hw_row, text="Turn off"))
+
+                def hw_show(note=None):
+                    st_ = hello_state(vault)
+                    hw_info.config(style="TLabel", text=note or (
+                        f"On for this computer (set up {fmt_date(st_.get('created', '')[:10])})." if st_ else
+                        "Off on this computer."))
+                    hw_row.show(hw_on_b, not st_)
+                    hw_row.show(hw_off_b, bool(st_))
+
+                def hw_thread(fn, done):
+                    box = {}
+
+                    def work():
+                        try:
+                            box["ok"] = fn()
+                        except Exception as e:
+                            box["err"] = str(e) or e.__class__.__name__
+                    threading.Thread(target=work, daemon=True).start()
+                    threading.Thread(target=_hello_front, daemon=True).start()
+
+                    def poll():
+                        if "ok" in box or "err" in box:
+                            done(box.get("ok"), box.get("err"))
+                        else:
+                            win.after(200, poll)
+                    win.after(200, poll)
+
+                def hw_on():
+                    dlg = new_window(win, "Turn on fingerprint unlock", "460x220")
+                    dlg.grab_set()
+                    df = ttk.Frame(dlg, padding=(px(20), px(16)))
+                    df.pack(fill="both", expand=True)
+                    ttk.Label(df, text="Enter your vault password once more to set this up.",
+                              wraplength=px(400), justify="left").pack(anchor="w")
+                    pe = ttk.Entry(df, show="•", width=34)
+                    pe.pack(anchor="w", pady=(px(8), 0))
+                    em = ttk.Label(df, text="", style="Bad.TLabel")
+                    em.pack(anchor="w", pady=(px(4), 0))
+
+                    def go(*_):
+                        if not vault.verify(pe.get()):
+                            pe.delete(0, "end")
+                            return em.config(text="Incorrect password.")
+                        dlg.destroy()
+                        hw_on_b.config(state="disabled")
+                        hw_show("Follow the Windows Hello prompts — Windows asks three times (to create the key, "
+                                "then twice to check it). Touch the fingerprint reader each time.")
+
+                        def done(mode, why):
+                            hw_on_b.config(state="normal")
+                            if why:
+                                hello_disable()
+                                return hw_show(f"Not turned on: {why}")
+                            hw_show("On for this computer. Next time, click “👆 Use fingerprint” to unlock."
+                                    + ("" if mode == "sign" else " (Using Windows' account encryption with a "
+                                                                 "Windows Hello check on this PC.)"))
+                        hw_thread(lambda: hello_enroll(vault), done)
+                    btns_ = pin_bottom(ttk.Frame(df), pady=(px(10), 0))
+                    ttk.Button(btns_, text="Cancel", command=dlg.destroy).pack(side="right")
+                    ttk.Button(btns_, text="Continue", style="Accent.TButton", command=go).pack(side="right",
+                                                                                               padx=px(8))
+                    pe.bind("<Return>", go)
+                    pe.focus_set()
+                    win._hello_dlg = {"win": dlg, "entry": pe, "go": go}
+
+                def hw_off():
+                    if not messagebox.askyesno(APP_NAME, "Turn off fingerprint unlock on this computer? You'll unlock "
+                                                         "with your password.", parent=win):
+                        return
+                    hw_thread(hello_disable, lambda *_: hw_show("Turned off. (You can turn it on again any time.)"))
+                hw_on_b.config(command=hw_on)
+                hw_off_b.config(command=hw_off)
+                hw_show()
+                win._hello = {"on": hw_on, "off": hw_off, "info": hw_info}
+
             # ---- document types for Write ▸ Import document
             dt = ttk.LabelFrame(outer, text="Document types (for Write ▸ Import document)", padding=px(10))
             dt.pack(fill="x", pady=(px(10), 0))
@@ -24040,6 +24419,27 @@ def run_gui():
             ttk.Button(box, text="Unlock", style="Accent.TButton", command=attempt).pack(fill="x", ipady=px(3))
             pw.bind("<Return>", attempt)
             pw.focus_set()
+            if hello_state(vault):
+                def by_finger():
+                    err.config(text="Waiting for Windows Hello…", style="Muted.TLabel")
+
+                    def done(key, why):
+                        if not f.winfo_exists():
+                            return
+                        if key and vault.key_ok(key):
+                            pw.delete(0, "end")
+                            f.destroy()
+                            self.locked = False
+                            self.last_activity = time.time()
+                            if self.setup_win is not None:
+                                self.setup_win["win"].deiconify()
+                            if q_was_open and self._alive(qwin["win"]):
+                                qwin["win"].deiconify()
+                        else:
+                            err.config(text=why or "That didn't unlock — use your password.", style="Bad.TLabel")
+                    hello_async(done)
+                hello_button(box, by_finger).pack(fill="x", pady=(px(8), 0), ipady=px(3))
+                self._lock_hello = by_finger
 
         def idle_check(self):
             mins = int(cfg.get("autolock_minutes", 0) or 0)
