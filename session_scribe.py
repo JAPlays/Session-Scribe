@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.5"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.6"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2534,7 +2534,7 @@ def collect_export(client, sessions, include, start="", end=""):
         for para in re.split(r"\n\s*\n", (text or "").strip()):
             blocks.append(("p", para.strip()))
     if "case" in include and (client.get("case_overview") or {}).get("text"):
-        section("Case overview", client["case_overview"]["text"])
+        section("Case overview", strip_case_title(client["case_overview"]["text"]))
     plans = client.get("treatment_plans") or []
     cur = current_plan(client)
     if "plan" in include and cur:
@@ -9752,6 +9752,27 @@ DASH_SECTIONS = [("risk", "Risk to look at", "Bad"), ("review", "Drafts to revie
                  ("homework", "Homework to check", "Accent"), ("goals", "Goals not worked on lately", "Muted")]
 
 
+# "CASE OVERVIEW", "# Case Overview — PT-01", "**CASE OVERVIEW: PT-01 (2026-11-13)**", but not a sentence
+_CASE_TITLE_RE = re.compile(r"^[\s#*_=\-]*case\s+overview\s*(?:(?:[:|(\-–—]|for\b)[^\n.!?]{0,40})?[\s#*_=\-)]*$",
+                            re.IGNORECASE)
+
+
+def strip_case_title(text):
+    """Drop the "CASE OVERVIEW" title line the model tends to put above CASE SNAPSHOT. It isn't one of
+    the template's sections, so it showed as an empty heading at the top of the Case overview tab."""
+    lines = (text or "").split("\n")
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and _CASE_TITLE_RE.match(lines[i].strip()):
+        rest = lines[i + 1:]
+        while rest and (not rest[0].strip() or set(rest[0].strip()) <= set("=-_*#")):
+            rest = rest[1:]                      # blank lines or an underline under the title
+        if any(x.strip() for x in rest):         # never leave an overview empty
+            return "\n".join(rest)
+    return text or ""
+
+
 def generate_case_overview(cfg, client, sessions, orientation, progress):
     """sessions: oldest-first list of session dicts."""
     hide = client_hider(client)
@@ -9789,13 +9810,13 @@ def generate_case_overview(cfg, client, sessions, orientation, progress):
     else:
         source, kind = text, "all session documentation, in order"
     dates = [d.get("meta", {}).get("session_date", "") for d in sessions if d.get("meta", {}).get("session_date")]
-    return steps.run(len(groups), cfg, fill(read_template("case_overview.txt"), {
+    return strip_case_title(steps.run(len(groups), cfg, fill(read_template("case_overview.txt"), {
         "client_code": client.get("code", ""), "orientation": orientation or "not specified",
         "background": hide(client.get("background", "")).strip() or "(not provided)",
         "goals": hide(client.get("goals", "")).strip() or "(not provided)",
         "session_count": len(days),
         "date_range": f"{min(dates)} to {max(dates)}" if dates else "",
-        "source_kind": kind, "sessions": source}))
+        "source_kind": kind, "sessions": source})))
 
 
 def case_overview_documented_days(sessions):
@@ -13169,7 +13190,9 @@ def run_gui():
                 self._ask_view["show"]((question, "", self.waiting_text(("ask", client["id"]))))
 
         def _render_case(self, v, client, sessions, query=None):
-            case = client.get("case_overview") or {}
+            case = dict(client.get("case_overview") or {})
+            if case.get("text"):
+                case["text"] = strip_case_title(case["text"])     # overviews saved before the title was dropped
             head = Flow(v, gap=px(8))
             head.pack(fill="x")
             head.add(ttk.Label(head, text="Case overview", style="H2.TLabel"))
