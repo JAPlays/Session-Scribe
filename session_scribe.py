@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.12.4"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.12.5"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -175,6 +175,8 @@ TEMPLATE_DIR = os.path.join(APP_DIR, "templates")     # updated by set_data_path
 DEFAULT_CONFIG = {
     "lmstudio_url": "http://127.0.0.1:1234/v1",
     "model": "",
+    "lm_context": 16384,        # when Session Scribe has LM Studio load the model: context length (tokens)
+    "lm_parallel": 1,           # …and request slots (1 = all the memory for one request at a time: fastest here)
     "whisper_model": "large-v3-turbo",
     "language": "en",
     "batch_size": 8,
@@ -6395,6 +6397,41 @@ def list_models(cfg, timeout=30):
     return [m.get("id") for m in data.get("data", []) if m.get("id")]
 
 
+_LM_LOADED = {"key": None, "at": 0.0}
+
+
+def ensure_model_loaded(cfg, model):
+    """If the chosen model isn't loaded in LM Studio, load it with Session Scribe's settings (context length,
+    one request slot, flash attention) instead of letting LM Studio load it on demand with its defaults —
+    those (several request slots) made reading long transcripts about 3× slower on a laptop GPU.
+    Quietly does nothing on LM Studio versions without the /api/v1 endpoints."""
+    if not model:
+        return
+    base = cfg["lmstudio_url"].rstrip("/")
+    root = base[:-3] if base.endswith("/v1") else base
+    key = (root, model)
+    if _LM_LOADED["key"] == key and time.time() - _LM_LOADED["at"] < 60:
+        return
+    try:
+        models = _http_json(root + "/api/v1/models", timeout=5).get("models") or []
+    except Exception:
+        return
+    entry = next((m for m in models if model in (m.get("key"), *(m.get("variants") or []))), None)
+    if entry is None:
+        return                                   # not a model LM Studio knows by that name: let it report that
+    if not entry.get("loaded_instances"):
+        try:
+            _http_json(root + "/api/v1/models/load",
+                       {"model": entry.get("key") or model, "context_length": int(cfg.get("lm_context") or 16384),
+                        "parallel": max(1, int(cfg.get("lm_parallel") or 1)), "flash_attention": True},
+                       timeout=900)
+        except RuntimeError as e:
+            if "Couldn't reach" in str(e):
+                raise
+            pass                                 # fall back to LM Studio's own on-demand loading
+    _LM_LOADED.update(key=key, at=time.time())
+
+
 LLM_RETRY_WAITS = (5, 15, 30)      # seconds before trying LM Studio again after a dropped connection
 
 
@@ -6434,6 +6471,8 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     model = cfg.get("model") or (list_models(cfg) or [None])[0]
     if not model:
         raise RuntimeError("LM Studio is running but no model is loaded.")
+    if cfg.get("model"):
+        ensure_model_loaded(cfg, model)
     url = cfg["lmstudio_url"].rstrip("/") + "/chat/completions"
     assert_local_url(url)
     body = {"model": model, "temperature": temperature, "stream": True,
