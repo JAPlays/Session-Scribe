@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.12.8"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.12.10"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1958,7 +1958,17 @@ async function showQueue() {
           h("button", { class: "icon", disabled: i <= 0, onclick: () => cmd(st, "up", it.seq) }, "▲"),
           h("button", { class: "icon", disabled: i < 0 || i >= movable.length - 1, onclick: () => cmd(st, "down", it.seq) }, "▼")) : null);
     })) : h("p", { class: "muted small", text: "The queue is empty." });
-    return h("div", { class: "card" }, head, task, btns, list,
+    const tasks = st.tasks || [];
+    const tlist = tasks.length ? h("div", {}, h("div", { class: "muted small", style: "margin-top:10px", text: "Other tasks waiting" }),
+      h("div", { class: "list" }, tasks.map((t, i) => h("div", { class: "item" }, h("div", { class: "grow" },
+        h("div", { class: "t", text: (t.code ? t.code + " · " : "") + t.task }),
+        h("div", { class: "muted small", text: t.status })),
+        h("span", {},
+          h("button", { class: "icon", title: "Pause / resume", onclick: () => cmd(st, "task_toggle", t.key) }, t.status.startsWith("⏸") ? "▶" : "⏸"),
+          h("button", { class: "icon", disabled: i <= 0, onclick: () => cmd(st, "task_up", t.key) }, "▲"),
+          h("button", { class: "icon", disabled: i >= tasks.length - 1, onclick: () => cmd(st, "task_down", t.key) }, "▼"),
+          h("button", { class: "icon", title: "Cancel", onclick: () => cmd(st, "task_cancel", t.key) }, "✕")))))) : null;
+    return h("div", { class: "card" }, head, task, btns, tlist, list,
       Q.left != null && Q.running ? h("p", { class: "muted small", text: "Whole queue: " + fmtLeft(Q.left) }) : null);
   }));
   S.timers.push(setTimeout(() => { if (S.view.name === "queue" && S.keys) showQueue(); }, 15000));
@@ -10886,14 +10896,21 @@ def run_gui():
             line and starts by itself when the one before it finishes (returns "queued"). Automatic
             work (quiet=True: the recording queue, Settings steps) never waits in line — it returns
             False and tries again shortly, letting tasks you asked for go first."""
-            if self.busy or (quiet and (self.waitlist or self.paused_task)):
+            if self.busy or (quiet and (any(not j.get("held") for j in self.waitlist) or self.paused_task)):
                 if quiet:
                     return False
                 if owner is not None and any(j["owner"] == owner for j in self.waitlist):
                     self.set_status(f"That's already waiting in line ({label}).")
                     return "queued"
-                self.waitlist.append({"fn": fn, "on_done": on_done, "on_error": on_error, "label": label,
-                                      "owner": owner, "patient": patient, "on_start": on_start, "pausable": pausable})
+                self._wait_seq = getattr(self, "_wait_seq", 0) + 1
+                job = {"fn": fn, "on_done": on_done, "on_error": on_error, "label": label, "id": self._wait_seq,
+                       "owner": owner, "patient": patient, "on_start": on_start, "pausable": pausable}
+                if owner and owner[0] == "ask":              # questions to the patient AI go first (as before)
+                    at = next((i for i, j in enumerate(self.waitlist) if not (j["owner"] and j["owner"][0] == "ask")),
+                              len(self.waitlist))
+                    self.waitlist.insert(at, job)
+                else:
+                    self.waitlist.append(job)
                 n = len(self.waitlist)
                 self.set_status(f"Waiting in line: {label} — starts by itself after "
                                 f"{self.task_label or 'the current task'}" + (f" (and {n - 1} before it)" if n > 1 else "")
@@ -10984,6 +11001,8 @@ def run_gui():
                                                              else " — click ▶ Resume (bottom right) to carry on."))
             self.refresh_pause()
             self.queue_refresh()
+            if not auto:                                      # the next task in line gets its turn
+                root.after(150, self.pump_waitlist)
             return True
 
         def resume_task(self):
@@ -11042,6 +11061,8 @@ def run_gui():
                 else:
                     btn.pack_forget()
             qw = getattr(self, "queue_win", None)
+            if qw and self._alive(qw["win"]) and qw.get("tasks"):
+                _quiet(qw["tasks"])
             if qw and self._alive(qw["win"]) and qw.get("pause_btn"):
                 qb = qw["pause_btn"]
                 mine = (pt and pt["owner"] == ("queue",)) or (self.can_pause() and self.task_owner == ("queue",))
@@ -11068,14 +11089,15 @@ def run_gui():
             if self.busy:
                 self.refresh_waiting()
                 return
-            ask = next((i for i, j in enumerate(self.waitlist) if j["owner"] and j["owner"][0] == "ask"), None)
+            ready = [i for i, j in enumerate(self.waitlist) if not j.get("held")]
+            ask = next((i for i in ready if self.waitlist[i]["owner"] and self.waitlist[i]["owner"][0] == "ask"), None)
             if ask is None and self.paused_task and self.paused_task.get("auto"):
                 self.resume_task()
                 return
-            if not self.waitlist:
+            if not ready:
                 self.refresh_waiting()
                 return
-            j = self.waitlist.pop(ask or 0)
+            j = self.waitlist.pop(ask if ask is not None else ready[0])
             self._start_bg(j["fn"], j["on_done"], j["on_error"], j["label"], j["owner"], j["patient"], j["on_start"],
                            j.get("pausable", False))
 
@@ -11093,6 +11115,10 @@ def run_gui():
 
         def refresh_waiting(self):
             """The '2 waiting' button in the bottom bar, with a menu to see or cancel each one."""
+            qw = getattr(self, "queue_win", None)
+            if qw and self._alive(qw["win"]) and qw.get("tasks"):
+                _quiet(qw["tasks"])
+            self.update_queue_button()
             btn = getattr(self, "wait_btn", None)
             if not self._alive(btn):
                 return
@@ -11100,17 +11126,107 @@ def run_gui():
             if not n:
                 btn.pack_forget()
                 return
-            btn.config(text=f"⏳  {n} waiting")
+            held = sum(1 for j in self.waitlist if j.get("held"))
+            btn.config(text=f"⏳  {n} waiting" + (f" ({held} paused)" if held else ""))
             m = self.wait_menu
             m.delete(0, "end")
+            m.add_command(label="Open the queue (pause, reorder, cancel)…", command=lambda: self.open_queue(tab="tasks"))
+            m.add_separator()
             for i, j in enumerate(self.waitlist):
-                who = f"{j['patient']}  ·  " if j["patient"] else ""
-                verb = re.sub(r"\s+(for|about)\s+" + re.escape(j["patient"]) + r"$", "", j["label"]) if j["patient"] \
-                    else j["label"]
-                m.add_command(label=f"{i + 1}.  {who}{verb}   —   cancel", command=lambda i=i: self.drop_waiting(
-                    index=i, tell=True) and self.set_status("Removed from the line."))
+                m.add_command(label=f"{i + 1}.  {self.task_words(j)}" + ("  (paused)" if j.get("held") else "")
+                              + "   —   cancel", command=lambda i=i: self.drop_waiting(
+                                  index=i, tell=True) and self.set_status("Removed from the line."))
             if not btn.winfo_ismapped():
                 btn.pack(side="right", padx=(px(6), 0), after=self.pct_label)
+
+        @staticmethod
+        def task_words(j, with_patient=True):
+            """'DS-01  ·  Writing the case overview' for a task in line (without the code: with_patient=False)."""
+            pat, label = j.get("patient") or "", j.get("label") or "task"
+            verb = re.sub(r"\s+((for|about)\s+)?" + re.escape(pat) + r"$", "", label) if pat else label
+            return (f"{pat}  ·  " if pat and with_patient else "") + verb[:1].upper() + verb[1:]
+
+        def task_rows(self):
+            """Everything in line, top to bottom: [(key, patient, task, status)]. key is 'run', 'paused' or
+            'w<id>' (a task waiting to start)."""
+            rows = []
+            job = getattr(self, "task_job", None) or {}
+            if self.busy and job:
+                pct = getattr(self, "_last_pct", None)
+                st = "▶ Running" + (f" · {pct:.0f}%" if isinstance(pct, (int, float)) else "")
+                if not self.can_pause():
+                    st += " (can't pause this step)" if job.get("pausable") or job.get("owner") == ("queue",) else ""
+                rows.append(("run", job.get("patient") or "", self.task_words(job, False), st))
+            pt = self.paused_task
+            if pt:
+                rows.append(("paused", pt.get("patient") or "", self.task_words(pt, False),
+                             "⏸ Paused — carries on after the current task" if pt.get("auto") and self.busy
+                             else "⏸ Paused"))
+            n = 0
+            for j in self.waitlist:
+                if j.get("held"):
+                    st = "⏸ Paused — won't start until you resume it"
+                else:
+                    n += 1
+                    st = "Next" if n == 1 and not self.busy else f"Waiting · #{n} in line"
+                rows.append((f"w{j['id']}", j.get("patient") or "", self.task_words(j, False), st))
+            return rows
+
+        def _wait_index(self, key):
+            return next((i for i, j in enumerate(self.waitlist) if f"w{j['id']}" == key), None)
+
+        def task_toggle(self, key):
+            """Pause or resume one task: the running one (paused in place), the paused one, or one still
+            waiting (it keeps its place but is skipped until resumed)."""
+            if key == "run":
+                if not self.pause_task():
+                    self.set_status("This step can't be paused — it'll finish shortly, or use Cancel.")
+            elif key == "paused":
+                self.resume_task()
+            else:
+                i = self._wait_index(key)
+                if i is None:
+                    return
+                j = self.waitlist[i]
+                j["held"] = not j.get("held")
+                self.set_status(("Paused: " if j["held"] else "Resumed: ") + self.task_words(j)
+                                + (" — it won't start until you resume it." if j["held"] else "."))
+                if not j["held"] and not self.busy:
+                    root.after(50, self.pump_waitlist)
+            self.refresh_waiting()
+
+        def task_move(self, key, step=None, to=None):
+            """Move a waiting task up/down (step ±1) or to a place in line (to=0: run it next)."""
+            i = self._wait_index(key)
+            if i is None:
+                return False
+            j = self.waitlist.pop(i)
+            at = to if to is not None else max(0, min(len(self.waitlist), i + step))
+            self.waitlist.insert(at, j)
+            self.refresh_waiting()
+            return at != i
+
+        def task_cancel(self, key, ask=True, parent=None):
+            if key in ("run", "paused"):
+                job = (self.task_job if key == "run" else self.paused_task) or {}
+                if ask and not messagebox.askyesno(APP_NAME, f"Stop “{self.task_words(job)}”? Anything it hasn't "
+                                                             "finished won't be saved.", parent=parent or root):
+                    return False
+                if job.get("owner") == ("queue",):
+                    self.queue_halt()
+                elif key == "paused":
+                    self.cancel_task(job.get("owner"), "Cancelled.")
+                else:
+                    self.cancel_task(None, "Stopped.")
+            else:
+                i = self._wait_index(key)
+                if i is None:
+                    return False
+                self.drop_waiting(index=i, tell=True)
+                self.set_status("Removed from the line.")
+            self.refresh_waiting()
+            self.refresh_pause()
+            return True
 
         def cancel_task(self, owner=None, why="Stopped."):
             """Stop the background task for real (if it belongs to `owner`): the transcription
@@ -11182,6 +11298,9 @@ def run_gui():
                 self._eta_live = (m[3], time.time()) if len(m) == 5 and m[3] is not None else None
                 self.set_status(m[1], m[2] if len(m) > 2 else None, from_task=True)
                 qw = getattr(self, "queue_win", None)          # the running queue row moves with the bar
+                if qw and self._alive(qw["win"]) and qw.get("tasks") and time.time() - getattr(self, "_qtask_at", 0) > 0.5:
+                    self._qtask_at = time.time()
+                    _quiet(qw["tasks"])
                 if self.task_owner == ("queue",) and qw and self._alive(qw["win"]) and qw.get("rows") \
                         and time.time() - getattr(self, "_qrow_at", 0) > 0.4:
                     self._qrow_at = time.time()
@@ -12138,6 +12257,10 @@ def run_gui():
                            gap=px(16))
             if not sessions:
                 btn.config(state="disabled")
+            all_btn = head.add(ttk.Button(head, text="↻  Refresh all",
+                                          command=lambda: self.refresh_all_patients(only_client=client, select="case")))
+            if not sessions:
+                all_btn.config(state="disabled")
             head.add(ttk.Button(head, text="Copy", command=lambda: self.copy(case.get("text", ""), "Case overview")))
             if case.get("text"):
                 covered = case.get("session_count", 0)
@@ -14028,6 +14151,10 @@ def run_gui():
             )
             if not sessions:
                 btn_here.config(state="disabled")
+            all_btn = head.add(ttk.Button(head, text="↻  Refresh all",
+                                          command=lambda: self.refresh_all_patients(only_client=client, select="insights")))
+            if not sessions:
+                all_btn.config(state="disabled")
             top_prog = ttk.Frame(v)
             top_prog.pack(anchor="w", fill="x", pady=(px(4), 0))
             nb = ttk.Notebook(v)
@@ -15287,13 +15414,18 @@ def run_gui():
                 self.open_client(self.client_id, select="insights")
             return r
 
-        def refresh_all_patients(self, force=False):
+        def refresh_all_patients(self, force=False, only_client=None, select=None):
             """Refresh both Progress & risk (risk, treatment goals, follow-ups) AND Case overviews
-            for every active patient at once."""
-            clients = [c for c in vault.list_clients() if not c.get("archived")]
+            for every active patient at once, or for one patient when only_client is given."""
+            if only_client is not None:
+                clients = [vault.load_client(only_client["id"])]
+            else:
+                clients = [c for c in vault.list_clients() if not c.get("archived")]
             if not clients:
                 self.set_status("No active patients to refresh yet.")
                 return False
+            single = clients[0].get("code", "") if only_client is not None else ""
+            scope = single or f"All {len(clients)} active patient(s)"
             bundles, ins_plan, total_ins = self._collect_insights_work(clients, force=force)
             case_todo = []
             with_docs = []
@@ -15310,11 +15442,13 @@ def run_gui():
                     return False
                 if not messagebox.askyesno(
                     APP_NAME,
-                    f"All {len(with_docs)} active patient(s) already have up-to-date Progress & risk checks and Case overviews.\n\n"
-                    "Refresh everything for all patients anyway?",
+                    (f"{single} already has an up-to-date Progress & risk and Case overview.\n\nRefresh everything anyway?"
+                     if single else
+                     f"All {len(with_docs)} active patient(s) already have up-to-date Progress & risk checks and Case overviews.\n\n"
+                     "Refresh everything for all patients anyway?"),
                     parent=root,
                 ):
-                    self.set_status("All patients' Progress & risk checks and Case overviews are already up to date.")
+                    self.set_status(f"{scope}: Progress & risk and Case overview are already up to date.")
                     return False
                 bundles, ins_plan, total_ins = self._collect_insights_work(clients, force=True)
                 case_todo = list(with_docs)
@@ -15361,11 +15495,11 @@ def run_gui():
                 n_pat, n_risk, n_goals, n_fu, done_cases = res
                 self._sig = vault.signature()
                 if self.client_id and not self.wizard:
-                    self.open_client(self.client_id)
+                    self.open_client(self.client_id, select=select) if select else self.open_client(self.client_id)
                 elif not self.client_id and not self.wizard:
                     self.show_home()
                 self.set_status(
-                    f"Refreshed all patients: {done_cases} case overview{'s' if done_cases != 1 else ''}, "
+                    f"Refreshed {single or 'all patients'}: {done_cases} case overview{'s' if done_cases != 1 else ''}, "
                     f"{n_risk} risk record{'s' if n_risk != 1 else ''}, "
                     f"{n_goals} goal note{'s' if n_goals != 1 else ''}, "
                     f"{n_fu} follow-up{'s' if n_fu != 1 else ''}."
@@ -15374,12 +15508,14 @@ def run_gui():
             r = self.run_bg(
                 job,
                 done,
-                label="refreshing progress, risk & case overviews for all patients",
-                owner=("all", "*"),
+                label=(f"refreshing progress, risk & case overview for {single}" if single
+                       else "refreshing progress, risk & case overviews for all patients"),
+                owner=("all", clients[0]["id"]) if single else ("all", "*"),
+                patient=single,
                 pausable=True,
             )
             if r and self.client_id and not self.wizard:
-                self.open_client(self.client_id)
+                self.open_client(self.client_id, select=select) if select else self.open_client(self.client_id)
             elif r and not self.client_id and not self.wizard:
                 self.show_home()
             return r
@@ -16782,20 +16918,151 @@ def run_gui():
                         n += 1
                         it["number"] = str(n)
 
-        def open_queue(self, default_cid=None):
+        def open_queue(self, default_cid=None, tab=None):
+            """The Queue window: a Tasks tab (everything running, paused or waiting its turn) and a
+            Recordings tab. tab='tasks' / 'recordings' picks one; otherwise whichever has something going on."""
             if self.locked:
                 return
             if getattr(self, "queue_win", None) is not None and self._alive(self.queue_win["win"]):
                 win = self.queue_win["win"]
                 win.deiconify()
                 win.lift()
+                _quiet(self.queue_win["tasks"])
+                _quiet(self.queue_win["pick_tab"], tab)
                 return
             Q = self._q()
-            win = new_window(root, "Recording queue", "1080x700")
-            win.minsize(min(px(720), root.winfo_screenwidth()), min(px(600), int(root.winfo_screenheight() * 0.88)))
+            win = new_window(root, "Queue", "1080x760")
+            win.minsize(min(px(720), root.winfo_screenwidth()), min(px(640), int(root.winfo_screenheight() * 0.88)))
             f = ttk.Frame(win, padding=(px(24), px(18)))
             f.pack(fill="both", expand=True)
-            ttk.Label(f, text="Recording queue", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Queue", style="Title.TLabel").pack(anchor="w")
+
+            qnb = ttk.Notebook(f)
+            qnb.pack(fill="both", expand=True, pady=(px(8), 0))
+            tf = ttk.Frame(qnb, padding=(px(4), px(10), px(4), 0))
+            rec = ttk.Frame(qnb, padding=(px(4), px(10), px(4), 0))
+            qnb.add(tf, text="  Tasks  ")
+            qnb.add(rec, text="  Recordings  ")
+            # ---- other tasks: everything you started that's running, paused or waiting its turn
+            t_head = Flow(tf, gap=px(8))
+            t_head.pack(fill="x", pady=(px(6), 0))
+            t_head.add(ttk.Label(t_head, text="Tasks", style="Section.TLabel"))
+            t_count = t_head.add(ttk.Label(t_head, text="", style="Muted.TLabel"))
+            ttk.Label(tf, text="Case overviews, refreshes, checks and anything else you start run one at a time, "
+                              "top to bottom. Select one to pause it, move it, or cancel it — a paused task keeps "
+                              "its place and is skipped until you resume it.", style="Caption.TLabel",
+                      wraplength=px(1000), justify="left").pack(anchor="w")
+            t_box, ttv = tree_box(tf, columns=("patient", "task", "status"), show="headings", height=6,
+                                  selectmode="browse")
+            for c, title, wdt in (("patient", "Patient", 110), ("task", "Task", 470), ("status", "Status", 330)):
+                ttv.heading(c, text=title, anchor="w")
+                ttv.column(c, width=px(wdt), minwidth=px(70), stretch=(c != "patient"), anchor="w")
+            t_box.pack(fill="both", expand=True, pady=(px(6), px(2)))
+            t_bar = ttk.Frame(tf)
+            t_bar.pack(fill="x", pady=(px(4), px(4)))
+            t_pause = ttk.Button(t_bar, text="⏸  Pause", width=12)
+            t_pause.pack(side="left")
+            t_up = ttk.Button(t_bar, text="▲", width=3)
+            t_up.pack(side="left", padx=(px(14), 0))
+            t_down = ttk.Button(t_bar, text="▼", width=3)
+            t_down.pack(side="left", padx=(px(4), 0))
+            t_next = ttk.Button(t_bar, text="Run next")
+            t_next.pack(side="left", padx=px(8))
+            t_cancel = ttk.Button(t_bar, text="Cancel")
+            t_cancel.pack(side="left")
+            t_empty = ttk.Label(t_bar, text="", style="Muted.TLabel")
+            t_empty.pack(side="left", padx=px(14))
+
+            def t_key():
+                sel = ttv.selection()
+                return sel[0] if sel else None
+
+            def t_buttons(_=None):
+                k = t_key()
+                waiting = bool(k and k.startswith("w"))
+                i = self._wait_index(k) if waiting else None
+                if k == "run":
+                    t_pause.config(text="⏸  Pause", state="normal" if self.can_pause() else "disabled")
+                elif k == "paused":
+                    t_pause.config(text="▶  Resume", state="normal")
+                elif waiting and i is not None:
+                    t_pause.config(text="▶  Resume" if self.waitlist[i].get("held") else "⏸  Pause", state="normal")
+                else:
+                    t_pause.config(text="⏸  Pause", state="disabled")
+                t_up.config(state="normal" if waiting and i else "disabled")
+                t_down.config(state="normal" if waiting and i is not None and i < len(self.waitlist) - 1 else "disabled")
+                t_next.config(state="normal" if waiting and i else "disabled")
+                t_cancel.config(text="Stop" if k == "run" else "Cancel", state="normal" if k else "disabled")
+
+            def t_fill():
+                if not self._alive(ttv):
+                    return
+                keep = t_key()
+                rows = self.task_rows()
+                have = list(ttv.get_children())
+                want = [r[0] for r in rows]
+                if have != want:
+                    ttv.delete(*have)
+                    for k, pat, task, st in rows:
+                        ttv.insert("", "end", iid=k, values=(pat or "—", task, st))
+                else:
+                    for k, pat, task, st in rows:
+                        ttv.item(k, values=(pat or "—", task, st))
+                if keep and ttv.exists(keep):
+                    ttv.selection_set(keep)
+                elif keep == "run" and ttv.exists("paused"):     # the one you just paused stays selected
+                    ttv.selection_set("paused")
+                elif keep == "paused" and ttv.exists("run"):
+                    ttv.selection_set("run")
+                h_ = max(6, min(14, len(rows)))
+                if int(ttv.cget("height")) != h_:
+                    ttv.config(height=h_)
+                n_wait = sum(1 for k in want if k.startswith("w"))
+                t_count.config(text=(("1 running" if "run" in want else "")
+                                     + (" · 1 paused" if "paused" in want else "")
+                                     + (f" · {n_wait} waiting" if n_wait else "")).strip(" ·"))
+                t_empty.config(text="" if rows else "Nothing running or waiting.")
+                _quiet(lambda: qnb.tab(tf, text=f"  Tasks  ·  {len(rows)}  " if rows else "  Tasks  "))
+                t_buttons()
+
+            def t_do(fn):
+                k = t_key()
+                if k:
+                    fn(k)
+                t_fill()
+            t_pause.config(command=lambda: t_do(self.task_toggle))
+            t_up.config(command=lambda: t_do(lambda k: self.task_move(k, -1)))
+            t_down.config(command=lambda: t_do(lambda k: self.task_move(k, 1)))
+            t_next.config(command=lambda: t_do(lambda k: self.task_move(k, to=0)))
+            t_cancel.config(command=lambda: t_do(lambda k: self.task_cancel(k, parent=win)))
+            ttv.bind("<<TreeviewSelect>>", t_buttons)
+
+            # drag a waiting task to a new place in line
+            t_drag = {"key": None, "y": 0}
+
+            def t_press(e):
+                k = ttv.identify_row(e.y)
+                t_drag.update(key=k if k and k.startswith("w") else None, y=e.y)
+
+            def t_release(e):
+                k, t_drag["key"] = t_drag["key"], None
+                if not k or abs(e.y - t_drag["y"]) < px(6):
+                    return
+                target = ttv.identify_row(e.y)
+                if not target or target == k:
+                    return
+                if not target.startswith("w"):
+                    self.task_move(k, to=0)
+                else:
+                    ti = self._wait_index(target)
+                    if ti is not None:
+                        self.task_move(k, to=ti)
+                ttv.selection_set(k) if ttv.exists(k) else None
+                t_fill()
+            ttv.bind("<ButtonPress-1>", t_press, add="+")
+            ttv.bind("<ButtonRelease-1>", t_release, add="+")
+
+            f = rec                                         # everything below lives on the Recordings tab
             ttk.Label(f, text="Add several recordings, check the patient, date, type and session # for each, then "
                               "press Start and leave the computer. Each one is transcribed and its notes are written, top to "
                               "bottom — oldest first unless you drag rows (or use ▲ ▼) to change the order. "
@@ -17222,15 +17489,26 @@ def run_gui():
             tv.bind("<ButtonPress-1>", drag_start, add="+")
             tv.bind("<B1-Motion>", drag_move, add="+")
             tv.bind("<ButtonRelease-1>", drag_end, add="+")
+            def pick_tab(which=None):
+                if which is None:
+                    recs = any(it["status"] not in ("done", "transcribed") for it in Q["items"])
+                    others = bool(self.waitlist or self.paused_task
+                                  or (self.busy and getattr(self, "task_owner", None) != ("queue",)))
+                    which = "tasks" if others and not (recs and Q["running"]) else "recordings" if recs or \
+                        default_cid else "tasks" if others else "recordings"
+                qnb.select(tf if which == "tasks" else rec)
             self.queue_win = {"win": win, "refresh": refresh, "tv": tv, "add": add, "apply": apply,
                               "vars": (p_var, d_var, n_var, k_var, o_var), "write": write_var,
                               "hosts": fill_hosts, "run": (run_var, run_ids, pick_host), "nudge": nudge,
                               "sort": sort_by_date, "order_note": order_note, "pause_btn": q_pause_btn,
+                              "tasks": t_fill, "ttv": ttv, "pick_tab": pick_tab, "nb": qnb,
                               "rows": lambda: [tv.item(str(it["seq"]), values=row(it)) for it in Q["items"]
                                                if tv.exists(str(it["seq"]))]}
             win.protocol("WM_DELETE_WINDOW", win.withdraw)
             refresh()
             fill_hosts()
+            t_fill()
+            pick_tab(tab)
 
         def queue_refresh(self):
             if getattr(self, "queue_win", None) is not None and self._alive(self.queue_win["win"]):
@@ -17243,8 +17521,11 @@ def run_gui():
             done, total = self.queue_counts()
             Q = self._q()
             away = any(it.get("remote_to") and it["status"] not in REMOTE_FINAL for it in Q["items"])
-            self.queue_btn.config(text=f"🎙  Queue  {done}/{total}" if (Q["running"] or away) else
-                                  ("🎙  Queue  ·  " + str(total)) if total else "🎙  Queue recordings")
+            n_tasks = len(getattr(self, "waitlist", []) or []) + (1 if self.paused_task else 0)
+            extra = f"  ·  {n_tasks} task{'s' if n_tasks != 1 else ''} waiting" if n_tasks else ""
+            self.queue_btn.config(text=(f"🎙  Queue  {done}/{total}" if (Q["running"] or away) else
+                                        ("🎙  Queue  ·  " + str(total)) if total else
+                                        "🎙  Queue" if n_tasks else "🎙  Queue recordings") + extra)
 
         def stay_awake(self, on):
             """Stop the computer from sleeping while the queue runs (you're away from it).
@@ -19271,6 +19552,8 @@ def run_gui():
                     "pct": round(self._last_pct, 1) if self.busy and getattr(self, "_last_pct", None) is not None else None,
                     "left": round(left) if left is not None else None,
                     "paused": bool(pt), "can_pause": bool(self.can_pause()),
+                    "tasks": [{"key": k, "code": c_, "task": t_, "status": st_} for k, c_, t_, st_ in self.task_rows()
+                              if k.startswith("w")],
                     "queue": {"running": bool(Q["running"]), "stop": bool(Q["stop"]), "items": items,
                               "left": round(total) if known and total else None}}
 
@@ -19422,6 +19705,20 @@ def run_gui():
                     return False, f"Another task is running ({self.task_label}). Start the queue when it finishes."
                 self.queue_start()
                 return (True, "Queue started.") if Q["running"] else (False, "The queue didn't start.")
+            if action in ("task_toggle", "task_up", "task_down", "task_next", "task_cancel"):
+                key = str(seq or "")
+                if self._wait_index(key) is None:
+                    return False, "That task isn't waiting anymore."
+                if action == "task_toggle":
+                    self.task_toggle(key)
+                    i = self._wait_index(key)
+                    return True, "Paused." if i is not None and self.waitlist[i].get("held") else "Resumed."
+                if action == "task_cancel":
+                    self.task_cancel(key, ask=False)
+                    return True, "Cancelled."
+                moved = self.task_move(key, to=0) if action == "task_next" else \
+                    self.task_move(key, -1 if action == "task_up" else 1)
+                return (True, "Moved.") if moved else (False, "It's already there.")
             if action in ("up", "down"):
                 order = sorted(Q["items"], key=self.queue_order_key())
                 movable = [it for it in order if it["status"] in ("waiting", "failed")
