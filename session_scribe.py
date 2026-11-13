@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.15"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.16"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -9394,6 +9394,25 @@ DEFAULT_DOC_TYPES = ["Psychological assessment", "Psychiatric evaluation", "Disc
                      "School / IEP records", "Medical records", "Letter or correspondence", "Other document"]
 
 
+_DOC_GUESS = [(r"\bneuro\s*psych|psycho\s*-?\s*educational|psycholog\w*\s+(assessment|evaluation|testing|report)|"
+               r"\b(WAIS|WISC|WIAT|WPPSI|MMPI|PAI|RBANS|WJ-?IV)\b|cognitive\s+(testing|assessment)",
+               "Psychological assessment"),
+              (r"psychiatric\s+(evaluation|assessment|consultation)", "Psychiatric evaluation"),
+              (r"discharge\s+summary", "Discharge summary"),
+              (r"\bIEP\b|individuali[sz]ed\s+education|504\s+plan", "School / IEP records")]
+
+
+def guess_doc_type(text, types):
+    """A likely document type from the top of an imported document (its title area), or "" — only types the
+    counselor has (Settings ▸ Document types)."""
+    lines = [l.strip() for l in (text or "")[:1500].splitlines() if l.strip()][:12]
+    head = "\n".join(l for l in lines if len(l.split()) <= 10)        # headings and short lines, not sentences
+    for pat, name in _DOC_GUESS:
+        if name in types and re.search(pat, head, re.I):
+            return name
+    return ""
+
+
 def documents_blocks(client, hide):
     """Imported documents (psychological assessments, records…) as material for the AI, oldest first."""
     out = []
@@ -14989,6 +15008,9 @@ def run_gui():
                 bar.add(ttk.Button(bar, text=f"Copy {label.split(' (')[0].lower()}", style="Accent.TButton",
                                    command=lambda: self.copy(d.get(key, ""), label)))
                 bar.add(ttk.Button(bar, text="Edit", command=lambda: self.start_wizard(client, sid, d)))
+                if key == "note" and d["meta"].get("source") == "imported":
+                    bar.add(ttk.Button(bar, text="📁  Move to Documents…",
+                                       command=lambda: self.move_to_documents(client, sid, d)))
                 if key == "note" and d.get("context_used"):
                     ttk.Label(tab, text="Built on: " + ", ".join(d["context_used"]),
                               style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(4, 0))
@@ -16929,6 +16951,44 @@ def run_gui():
                         pass
             return changed
 
+        def move_to_documents(self, client, sid, d):
+            """An imported entry that isn't a session (a psychological assessment, records…): take it out of the
+            session list and put it on the Documents tab."""
+            types = self.doc_types() or list(DEFAULT_DOC_TYPES)
+            text = d.get("note", "")
+            win = new_window(root, f"{client.get('code', '')} — move to Documents", "520x240")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(20), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Move to Documents", style="H2.TLabel").pack(anchor="w")
+            ttk.Label(f, text=f"From {fmt_date(d['meta'].get('session_date', ''))}. It leaves the session list and "
+                              "goes on the patient's Documents tab.", style="Muted.TLabel", wraplength=px(460),
+                      justify="left").pack(anchor="w", pady=(px(2), px(8)))
+            var = tk.StringVar(value=guess_doc_type(text, types) or types[0])
+            row = Flow(f, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="Type"))
+            row.add(ttk.Combobox(row, textvariable=var, values=types, state="readonly", width=30))
+
+            def go():
+                now = datetime.now().isoformat(timespec="seconds")
+                c = vault.load_client(client["id"])
+                c.setdefault("documents", []).append({
+                    "id": uuid.uuid4().hex[:12], "type": var.get(), "date": d["meta"].get("session_date", ""),
+                    "title": "", "text": strip_word_xml(text).strip(), "file_id": "", "added": now,
+                    "moved_from": "imported note"})
+                vault.save_client(c)
+                vault.delete_session(sid)
+                self._sig = vault.signature()
+                win.destroy()
+                self.set_status(f"{client.get('code', '')}: moved to Documents as {var.get().lower()}.")
+                self.open_client(client["id"], select="docs")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Move", style="Accent.TButton", command=go).pack(side="right", padx=px(8))
+            self._move_doc_win = {"win": win, "type": var, "go": go}
+            return win
+
         def doc_types(self):
             """Document types for Import document (Settings ▸ Document types)."""
             t = self.settings.get("doc_types")
@@ -17446,6 +17506,10 @@ def run_gui():
                         n["source"] = source
                         if paths and len(parts_) == 1:      # one document from one file: keep the original too
                             n["path"] = paths[k_]
+                        if n["kind"] == "progress":         # a report, not a note? (title says so)
+                            g_ = guess_doc_type(n["text"], self.doc_types())
+                            if g_:
+                                n["kind"] = "doc:" + g_
                         items.append(n)
                 items.sort(key=lambda it: it["date"] or "9999")
                 refresh(len(items) - 1 if items else None)

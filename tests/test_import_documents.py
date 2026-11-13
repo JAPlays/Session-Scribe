@@ -106,6 +106,32 @@ def script(app, root, V, h):
          and "Diagnosis: ADHD & anxiety" in fixed["text"], fixed["text"][:200])
     old = next(d for _, d in V.sessions_for(cid) if d["meta"].get("session_date") == "2024-02-01")
     h.ok("…and strips the XML out of an imported note", old["note"] == "Old note text", old["note"])
+
+    # the import window recognizes a report from its title
+    h.action(app.page, "Import document").invoke(); h.pump(root, 0.5)
+    iw = app._import_win
+    iw._test["add_texts"]([("eval.txt", "Confidential\nPSYCHOLOGICAL EVALUATION\nTests administered: WISC-V.\n"
+                                        "The client was cooperative.")]); h.pump(root, 0.2)
+    h.ok("a psychological evaluation is typed as one automatically (not a progress note)",
+         iw._test["items"][-1]["kind"] == "doc:Psychological assessment", iw._test["items"][-1]["kind"])
+    iw._test["add_texts"]([("note.txt", "Session focused on sleep. Client was referred for psychological testing "
+                                        "later this year by her doctor, and we discussed coping skills at length.")])
+    h.ok("…but a note that only mentions testing stays a note", iw._test["items"][-1]["kind"] == "progress")
+    iw.destroy()
+
+    # an assessment imported earlier as a session: move it to Documents
+    sid = V.save_session({"meta": {"client_id": cid, "session_date": "2023-05-05", "session_number": "",
+                                   "kind": "progress", "source": "imported", "created": "x"},
+                          "note": "PSYCHOLOGICAL ASSESSMENT\nWISC-V results...", "transcript": ""})
+    app.open_client(cid, select="day:2023-05-05"); h.pump(root, 1)
+    h.ok("an imported entry has Move to Documents", h.button(app.page, "Move to Documents") is not None)
+    h.button(app.page, "Move to Documents").invoke(); h.pump(root, 0.4)
+    mw = app._move_doc_win
+    h.ok("…which guesses the type", mw["type"].get() == "Psychological assessment", mw["type"].get())
+    mw["go"](); h.pump(root, 1)
+    c = V.load_client(cid)
+    h.ok("it leaves the session list and is on the Documents tab", sid not in [s for s, _ in V.sessions_for(cid)]
+         and any(d.get("date") == "2023-05-05" and "WISC-V results" in d["text"] for d in c["documents"]))
     h.ok("no errors", not errors, errors[-1:] if errors else "")
 
 
