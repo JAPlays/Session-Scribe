@@ -1,0 +1,12 @@
+# Session Scribe runs on Python 3.10+ with tkinter (included with the python.org installer).
+# The app offers to install what's missing from Settings; this file is for setting up by hand.
+
+cryptography>=42      # required: the encrypted vault (Fernet + scrypt)
+
+# Transcription (optional — needed to turn recordings into transcripts).
+# whisperx brings torch, numpy and pandas with it; install torch first from pytorch.org
+# if you want the CUDA build for your GPU.
+whisperx
+
+# Optional
+pypdf                 # reading PDF worksheets in the worksheet folder

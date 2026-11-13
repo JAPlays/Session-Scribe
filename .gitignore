@@ -1,0 +1,48 @@
+# ---- Never commit patient data -------------------------------------------
+# The encrypted vault and everything the app writes at run time stay out of git,
+# even though they're encrypted. Keep them in the data folder chosen in Settings.
+vault/
+sessions/
+clients/
+files/
+reports/
+*.enc
+checkpoints/
+cache/
+logs/
+backups/
+queue.enc
+timing.json
+config.json
+error-log.txt
+audit_log.txt
+
+# Recordings, transcripts and exports
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.opus
+*.aac
+*.wma
+*.mp4
+*.webm
+*.docx
+*.pdf
+*.csv
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+tests/screenshots/
+
+# Installers and other downloads that end up in this folder
+*.exe
+*.msi
+*.zip
+
+# LM Studio tuning leftovers
+lm_tune*
