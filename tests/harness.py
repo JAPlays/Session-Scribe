@@ -64,7 +64,8 @@ class H:
         ss = importlib.util.module_from_spec(spec); sys.modules["ss"] = ss; spec.loader.exec_module(ss)
         cls.ss = ss
         ss.save_config(dict(ss.DEFAULT_CONFIG, data_dir=data, vault_dir=os.path.join(data, "vault"),
-                            lmstudio_url=f"http://127.0.0.1:{srv.server_port}/v1", model="mock-model"))
+                            lmstudio_url=f"http://127.0.0.1:{srv.server_port}/v1", model="mock-model",
+                            ai_names=False))   # most tests check the hidden-names path; test_names.py the other
         import tkinter as tk
         from tkinter import messagebox
         for n in ("showinfo", "showerror", "showwarning"):

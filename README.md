@@ -18,7 +18,7 @@ at the top of the file. Every build is a commit in this repository, so the histo
   The **Queue** window runs a batch of recordings unattended. It can also send them to your other
   computer through the shared data folder, encrypted.
 - **Patients.** Each patient has a case overview, treatment plan, Ask-AI chat about their record, and
-  day-by-day sessions. Names are hidden from the AI by default.
+  day-by-day sessions. The local AI reads patients' names (they never leave the computer), which keeps notes clear about who said what; Settings or a patient's profile can hide them instead.
 - **Progress & risk.** Risk timeline and safety-plan flags, scores, treatment-goal coverage, homework,
   follow-ups and recurring themes. **↻ Refresh all** brings one patient's checks and case overview
   up to date in one go.
@@ -81,6 +81,7 @@ python tests/test_task_queue.py
 python tests/test_refresh_one.py
 python tests/test_builtin_ai.py     # installer builds: built-in AI, hardware fitting (fake llama-server)
 python tests/test_touch_and_map.py  # finger scrolling, session maps from transcript timestamps, Themes labels
+python tests/test_names.py          # patient names for the AI: on by default, hidden per patient or for all
 ```
 
 Each test opens the app window briefly and prints `N/N checks passed`. On Linux, run them under

@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.2"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.3"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -190,7 +190,7 @@ LEGACY_CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 SHARED_SETTINGS = "settings.json"            # in the data folder; contains no patient data
 SHARED_KEYS = {"language", "min_speakers", "max_speakers", "max_chars", "previous_notes",
                "smooth_flicker", "delete_audio", "autolock_minutes", "role_labels", "date_format",
-               "phone_page_url", "phone_client_id"}
+               "phone_page_url", "phone_client_id", "ai_names"}
 TEMPLATE_DIR = os.path.join(APP_DIR, "templates")     # updated by set_data_paths()
 DEFAULT_CONFIG = {
     "lmstudio_url": "http://127.0.0.1:1234/v1",
@@ -201,6 +201,7 @@ DEFAULT_CONFIG = {
     "gpu_layers": "",           # built-in AI: model layers on the graphics chip (set by auto_tune for this computer)
     "whisper_threads": 0,       # processor threads for the speech model (0 = its default)
     "tuned_for": "",            # the hardware the settings were last fitted to (auto_tune)
+    "ai_names": True,           # the local AI reads patients' real names (per patient: "Keep names hidden")
     "touch_scroll": "auto",     # finger drags scroll: auto (touchscreens, Windows) / on (every drag) / off
     "whisper_model": "large-v3-turbo",
     "language": "en",
@@ -289,12 +290,14 @@ def load_config():
         cfg.update({k: v for k, v in shared.items() if k in SHARED_KEYS})
     derived = not cfg.get("vault_dir")
     set_date_format(cfg.get("date_format"))
+    set_ai_names(cfg.get("ai_names", True))
     set_data_paths(cfg)
     cfg["_vault_derived"] = derived
     return cfg
 
 
 def save_config(cfg):
+    set_ai_names(cfg.get("ai_names", True))
     os.makedirs(LOCAL_DIR, exist_ok=True)
     local = {k: v for k, v in cfg.items() if k in DEFAULT_CONFIG and not k.startswith("_")}
     if cfg.get("_vault_derived", True) and cfg.get("vault_dir") == os.path.join(data_root(cfg), "vault"):
@@ -470,9 +473,11 @@ Rules you must follow:
 Never invent quotes, history, symptoms, diagnoses, interventions, or plans. (The one exception is a \
 "Planned Interventions" list, where you may propose next steps that follow from this session and the \
 treatment plan, for the clinician to review.)
-- Use the term "patient", never "client". Refer to the clinician as "Counselor". Names have been \
-replaced with bracketed placeholders such as [Patient] or [Husband]. Write "patient" for [Patient] \
-and keep other placeholders as roles (e.g. "patient's husband"); never guess at real names.
+- Use the term "patient", never "client". Refer to the clinician as "Counselor". Refer to the patient \
+and the people in their life by the names used in the material, so it's clear who said and did what. \
+Where a name has been replaced by a bracketed placeholder such as [Patient] or [Husband], write \
+"patient" for [Patient] and keep other placeholders as roles (e.g. "patient's husband"). Never guess \
+at a name that isn't in the material.
 - If something is unclear or missing, write [VERIFY: ...] instead of guessing.
 - Never minimize risk. Any mention of suicidal ideation, self-harm, homicidal ideation, abuse or \
 neglect, or other safety concerns must be documented. Never state that risk was assessed or denied \
@@ -1938,7 +1943,7 @@ async function showAsk(cid, chatId) {
     if (S.keys && S.view.name === "ask" && S.view.cid === cid && !q.value.trim()) showAsk(cid, chatId);
   }, 10000));
   screen("Ask · " + clientCode(cid), { back: () => go({ name: "patient", cid }) }, pickRow, thread, live, q, send, where,
-    h("p", { class: "muted small", text: "Answers are saved with the patient (as on the computer). Names are hidden from the AI as usual." }));
+    h("p", { class: "muted small", text: "Answers are saved with the patient (as on the computer). Names are handled as set on the computer." }));
 }
 
 // --- the recording queue on each computer
@@ -2768,7 +2773,8 @@ history, quotes, diagnoses, dates or scores.
 clinician's orientation ({orientation}); you are not making decisions for them.
 - If anything suggests risk (self-harm, harm to others, abuse, neglect), point it out first and \
 recommend discussing it with the supervisor promptly.
-- Names are replaced by placeholders like [Patient]; keep them as they are.
+- Use names as they appear in the material; where a name was replaced by a placeholder like [Patient], \
+keep the placeholder as it is. Never guess at a name.
 - Be concise: short paragraphs or bullet points, plain text (no markdown tables)."""
 
 ASK_STOP = set("""a an the and or but if of to in on at for from with about into over after before is are was
@@ -6918,7 +6924,31 @@ def client_name_map(client):
     return parse_name_map(client.get("names_to_hide", ""), legacy=client.get("names_format") != 2)
 
 
-def client_hider(client):
+_AI_NAMES = {"on": True}
+
+
+def set_ai_names(on):
+    _AI_NAMES["on"] = bool(on)
+
+
+def names_to_ai(client=None):
+    """Whether the local AI reads this patient's real names: Settings › "Patient names for the AI" (on
+    unless turned off), unless the patient is set to keep names hidden. The AI runs on this computer, so
+    names never leave it either way; names help it keep straight who said and did what."""
+    return _AI_NAMES["on"] and not (client or {}).get("hide_names")
+
+
+def names_note(client=None):
+    return "names included" if names_to_ai(client) else "names hidden"
+
+
+def client_hider(client, always=False):
+    """What every AI step passes the patient's material through: names → placeholders ([Patient],
+    [Husband]…) when names are hidden, the text as it is when the AI may read them. always=True hides
+    regardless — for what's shared beyond you (the supervision packet) or kept for every patient (the
+    preferences learned from your edits)."""
+    if not always and names_to_ai(client):
+        return lambda s: s or ""
     pairs = client_name_map(client)
     return lambda s: apply_name_map(s or "", pairs)
 
@@ -8485,8 +8515,8 @@ Documentation for this period (oldest first):
 
 
 def supervision_inputs(client, sessions, start, end):
-    """The documentation one patient contributes to a supervision packet (names hidden)."""
-    hide = client_hider(client)
+    """The documentation one patient contributes to a supervision packet (names always hidden: it's shared)."""
+    hide = client_hider(client, always=True)
     docs = []
     for sid, d in sessions:
         day = d.get("meta", {}).get("session_date") or ""
@@ -8524,7 +8554,7 @@ def generate_supervision_packet(cfg, patients, start, end, questions, orientatio
                               for c, _, docs in work])
     sections, practice = [], []
     for i, (client, sessions, docs) in enumerate(work):
-        hide = client_hider(client)
+        hide = client_hider(client, always=True)
         text = steps.run(i, cfg, fill(SUPERVISION_PATIENT_PROMPT, {
             "code": client.get("code", ""), "start": fmt_date(start), "end": fmt_date(end),
             "orientation": orientation or "not specified", "goals": hide(client.get("goals", "")) or "(none listed)",
@@ -9245,10 +9275,11 @@ def edit_changed(draft, final):
 
 
 def record_edit(settings, client, kind, doc_key, draft, final):
-    """Remember one draft→final pair (names hidden). Returns True if it was new."""
+    """Remember one draft→final pair (names always hidden: what's learned applies to every patient).
+    Returns True if it was new."""
     if not edit_changed(draft, final):
         return False
-    hide = client_hider(client)
+    hide = client_hider(client, always=True)
     key = hashlib.sha256((draft + "\0" + final).encode("utf-8")).hexdigest()[:16]
     pairs = settings.setdefault("edit_pairs", [])
     if any(p.get("key") == key for p in pairs):
@@ -12536,10 +12567,20 @@ def run_gui():
             ttk.Label(f, text="Something like initials + number (e.g. JD-07). Avoid full names.",
                       style="Muted.TLabel").grid(row=1, column=0, sticky="w")
             ttk.Entry(f, textvariable=code_var).grid(row=2, column=0, sticky="ew", pady=(2, 10))
-            ttk.Label(f, text="Names to hide from the AI", style="H2.TLabel").grid(row=3, column=0, sticky="w")
-            ttk.Label(f, text="One per line (or separated by ;) as  Name, Placeholder  — e.g.  Danielle, Patient  "
-                              "and  John, Husband.  Danielle becomes [Patient] and John becomes [Husband] before "
-                              "the AI sees anything. Include schools, workplaces and towns too.",
+            nhead = ttk.Frame(f)
+            nhead.grid(row=3, column=0, sticky="ew")
+            ttk.Label(nhead, text="Names", style="H2.TLabel").pack(side="left")
+            hide_var = tk.BooleanVar(value=bool(c.get("hide_names")) or not _AI_NAMES["on"])
+            hide_cb = ttk.Checkbutton(nhead, text="Keep names hidden from the AI for this patient", variable=hide_var)
+            hide_cb.pack(side="right")
+            if not _AI_NAMES["on"]:
+                hide_cb.config(state="disabled")         # hidden for everyone (Settings)
+            ttk.Label(f, text="One per line (or separated by ;) as  Name, Role  — e.g.  Danielle, Patient  and  "
+                              "John, Husband.  The AI on this computer reads names as they are, so notes say who "
+                              "said and did what" + ("" if _AI_NAMES["on"] else " (now off for everyone: Settings › "
+                              "Patient names for the AI)") + ". When names are hidden, Danielle becomes [Patient] and "
+                              "John [Husband] before the AI sees anything — include schools, workplaces and towns "
+                              "then. Names are always hidden in the supervision packet.",
                       style="Muted.TLabel", wraplength=px(580), justify="left").grid(row=4, column=0, sticky="w")
             nfr, names_txt = scrolled_text(f, height=4)
             nfr.grid(row=5, column=0, sticky="ew", pady=(2, 0))
@@ -12549,10 +12590,12 @@ def run_gui():
 
             def update_preview(_=None):
                 pairs = parse_name_map(get_text(names_txt))
-                preview.config(text=("Will replace:  " + "   ·   ".join(f"{n} → {p}" for n, p in pairs))
-                               if pairs else "Nothing to replace yet.")
+                verb = "When hidden, replaces" if not hide_var.get() else "Will replace"
+                preview.config(text=(f"{verb}:  " + "   ·   ".join(f"{n} → {p}" for n, p in pairs))
+                               if pairs else "No names listed yet.")
                 names_txt.edit_modified(False)
             names_txt.bind("<<Modified>>", update_preview)
+            hide_cb.config(command=update_preview)
             update_preview()
             ttk.Label(f, text="Treatment goals", style="H2.TLabel").grid(row=7, column=0, sticky="w")
             gfr, goals = scrolled_text(f, height=3)
@@ -12577,6 +12620,8 @@ def run_gui():
                        for x in vault.list_clients()):
                     return messagebox.showinfo(APP_NAME, "Another patient already uses that code.", parent=win)
                 pairs = parse_name_map(get_text(names_txt))
+                if _AI_NAMES["on"]:
+                    c["hide_names"] = bool(hide_var.get())
                 c.update(code=code, names_format=2,
                          names_to_hide="\n".join(f"{n}, {p.strip('[]')}" for n, p in pairs),
                          goals=get_text(goals).strip(), background=get_text(bg).strip())
@@ -14677,7 +14722,7 @@ def run_gui():
             if rv.get("generated"):
                 head.add(ttk.Label(head, text=f"Written {fmt_date(rv['generated'][:10])}", style="Muted.TLabel"))
             ttk.Label(box, text="For your own learning and supervision — not part of the patient's note. Read on "
-                                "this computer only; names are hidden from the AI.",
+                                f"this computer only ({names_note(client)}).",
                       style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(box, owner=("review", sid)).pack(anchor="w", fill="x", pady=(px(4), 0))
 
@@ -15119,7 +15164,7 @@ def run_gui():
             if not todo:
                 btn.config(state="disabled")
             src = "treatment plan" if current_plan(client) and plan_goals(current_plan(client)["text"]) else "profile"
-            ttk.Label(box, text=f"Goals from the {src}. Each note is read by the local AI (names hidden); results are "
+            ttk.Label(box, text=f"Goals from the {src}. Each note is read by the local AI ({names_note(client)}); results are "
                                 "saved with the session. New notes are checked when you click the button.",
                       style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(box, owner=("goals", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
@@ -15203,7 +15248,7 @@ def run_gui():
             if not todo:
                 btn.config(state="disabled")
             ttk.Label(box, text="Notes, overviews and the transcript lines that mention risk are read by the local AI "
-                                "(names hidden). This helps you find things — it doesn't replace your own risk "
+                                f"({names_note(client)}). This helps you find things — it doesn't replace your own risk "
                                 "assessment or your site's procedures.", style="Caption.TLabel", wraplength=px(720),
                       justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(box, owner=("risk", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
@@ -15688,8 +15733,10 @@ def run_gui():
             f = ttk.Frame(win, padding=(px(24), px(18)))
             f.pack(fill="both", expand=True)
             ttk.Label(f, text="Letter or document", style="Title.TLabel").pack(anchor="w")
-            ttk.Label(f, text="Drafted by the local AI from only what you tick below (names hidden while it writes, then "
-                              "filled back in on this computer). Review it before it leaves your hands.",
+            ttk.Label(f, text="Drafted by the local AI from only what you tick below (" + (
+                              "it reads names as they are" if names_to_ai(client) else
+                              "names hidden while it writes, then filled back in on this computer")
+                              + "). Review it before it leaves your hands.",
                       style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), px(8)))
             kind_var = tk.StringVar(value="attendance")
             krow = Flow(f, gap=px(12))
@@ -15872,7 +15919,7 @@ def run_gui():
                 if not ins:
                     return status.config(text="Type what to change (or pick one of the buttons).", style="Bad.TLabel")
                 job_cfg = dict(cfg)
-                record_instruction(self.settings, client_hider(client)(ins))
+                record_instruction(self.settings, client_hider(client, always=True)(ins))
                 _quiet(vault.save_settings, self.settings)
 
                 def done(new):
@@ -16051,7 +16098,7 @@ def run_gui():
             if not todo:
                 fb.config(state="disabled")
             ttk.Label(box, text="Contact notes' “Follow-up:” lists are added by themselves; “Find follow-ups” has the local "
-                                "AI read sessions for things you said you'd do (names hidden). Tick them off as you go.",
+                                f"AI read sessions for things you said you'd do ({names_note(client)}). Tick them off as you go.",
                       style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(box, owner=("followups", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
             fus = client.get("followups") or []
@@ -20089,7 +20136,8 @@ def run_gui():
                            "appearance": next((k for k, v in APPEARANCE.items() if v == appear_var.get()), "system"),
                            "date_format": next((k for k, v in DATE_FORMATS.items() if v == datefmt_var.get()), "iso"),
                            "remote_accept": remote_var.get(),
-                           "touch_scroll": next((k for k, v in TOUCH_MODES.items() if v == touch_var.get()), "auto")}
+                           "touch_scroll": next((k for k, v in TOUCH_MODES.items() if v == touch_var.get()), "auto"),
+                           "ai_names": bool(names_var.get())}
                 except NetworkBlocked as e:
                     return messagebox.showerror(APP_NAME, str(e), parent=win)
                 except ValueError:
@@ -20364,6 +20412,14 @@ def run_gui():
             pr(7, 2, None, ttk.Label(pg, text="Comma-separated, e.g. Parent/Guardian, Partner, Other. Used in Who's who and "
                                   "transcripts; earlier transcripts keep their labels.",
                       style="Caption.TLabel", wraplength=px(360), justify="left"))
+            names_var = tk.BooleanVar(value=bool(cfg.get("ai_names", True)))
+            pr(9, 0, "Patient names for the AI", ttk.Checkbutton(pg, text="The local AI reads real names",
+                                                                variable=names_var))
+            pr(9, 2, None, ttk.Label(pg, text="The AI runs on this computer, so names never leave it either way. With "
+                                              "names, notes say who said and did what. Turn off to replace names with "
+                                              "placeholders for every patient; a single patient can be set to keep "
+                                              "names hidden in their profile. The supervision packet always hides them.",
+                                     style="Caption.TLabel", wraplength=px(360), justify="left"))
             TOUCH_MODES = {"auto": "Automatic (finger or pen)", "on": "Every drag scrolls", "off": "Off"}
             touch_var = tk.StringVar(value=TOUCH_MODES.get(cfg.get("touch_scroll") or "auto", TOUCH_MODES["auto"]))
             pr(8, 0, "Touchscreen scrolling", ttk.Combobox(pg, textvariable=touch_var, values=list(TOUCH_MODES.values()),
