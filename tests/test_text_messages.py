@@ -38,14 +38,42 @@ def script(app, root, V, h):
          ss.scrub_contact_details("call 5 5 5 2 0 1 0 9 9 9 today") == "call [PHONE] today"
          and ss.scrub_contact_details("PHQ 1 2 3") == "PHQ 1 2 3")
 
-    # through the window: what the AI is given and what's saved
+    # through the window, default: straight into the External communication log, no AI
     cid = V.save_client({"code": "TM1"})
     app.refresh_clients(); app.open_client(cid); h.pump(root, 1)
+    lb = app.page._search["list"]
+    h.ok("no External communication entry in the list until something is logged",
+         not any("External communication" in lb.get(i) for i in range(lb.size())))
     h.RESP[:] = [("", "Contact note text.")]
     app.external_comm(V.load_client(cid)); h.pump(root, 0.5)
     w = app.parent_win
     w["mode"].set("messages"); w["method"].set("Text messages"); w["date"].set("2026-11-13")
     w["msgs"].insert("1.0", PASTED)
+    h.ok("the button says Save to log", "Save to log" in str(w["go"].cget("text")))
+    n0 = len(h.PROMPTS)
+    w["go"].invoke(); h.pump(root, 1)
+    log = V.load_client(cid).get("communications") or []
+    h.ok("the messages are logged as they are, tidied, with nothing sent to the AI",
+         len(log) == 1 and "Patient: Actually can we move to 4" in log[0]["text"] and log[0]["method"] == "Text messages"
+         and log[0]["date"] == "2026-11-13" and len(h.PROMPTS) == n0, log)
+    h.ok("…and no contact note is made", not any(d["meta"].get("source") == "messages" for _, d in V.sessions_for(cid)))
+    lb = app.page._search["list"]
+    rows = [lb.get(i) for i in range(lb.size())]
+    h.ok("the patient now has an External communication log, open on it", "✉  External communication  · 1" in rows
+         and "External communication" in h.texts(app.page) and h.button(app.page, "View (") is not None, rows)
+    vw = app.comm_view(V.load_client(cid), log[0]); h.pump(root, 0.3)
+    h.ok("View shows the whole thread", "Never mind 3 is fine" in h.texts(vw)); vw.destroy()
+    ask = ss.build_ask_prompt(V.load_client(cid), V.sessions_for(cid), "What did they text about moving the time?",
+                              [], {}, "")
+    h.ok("Ask AI can use the logged messages (phone number still removed)",
+         "Actually can we move to 4" in str(ask) and "201-0999" not in str(ask), str(ask)[:300])
+
+    # with "Also draft a contact note": the AI gets the tidy version
+    app.external_comm(V.load_client(cid)); h.pump(root, 0.5)
+    w = app.parent_win
+    w["mode"].set("messages"); w["method"].set("Text messages"); w["date"].set("2026-11-13")
+    w["msgs"].insert("1.0", PASTED)
+    w["draft"].set(True)
     n0 = len(h.PROMPTS)
     w["go"].invoke()
     h.pump(root, 20, lambda: not app.busy and any(d["meta"].get("source") == "messages" for _, d in V.sessions_for(cid)))

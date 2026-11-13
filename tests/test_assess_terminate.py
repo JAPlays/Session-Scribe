@@ -28,8 +28,8 @@ def script(app, root, V, h):
     app.open_client(cid, select="assess"); h.pump(root, 1)
     lb = app.page._search["list"]
     rows = [lb.get(i) for i in range(lb.size())]
-    h.ok("the patient list has Assessments and Termination", "🧾  Assessments  · 1" in rows
-         and "📄  Termination" in rows, rows)
+    h.ok("the patient list has Assessments", "🧾  Assessments  · 1" in rows, rows)
+    h.ok("…and no Termination until a letter is filled out", not any("Termination" in r for r in rows), rows)
     h.ok("Assessments shows the PHQ-9 score", "PHQ-9" in lines() and "12  (moderate)" in lines())
     app.assessment_dialog(V.load_client(cid)); h.pump(root, 0.5)
     w = app._assess_win
@@ -63,10 +63,9 @@ def script(app, root, V, h):
         t.destroy()
 
     # ---- Termination
-    app.open_client(cid, select="term"); h.pump(root, 1)
-    h.ok("Termination starts empty with a button to fill out the letter",
-         h.button(app.page, "Fill out termination letter") is not None)
-    app.termination_dialog(V.load_client(cid)); h.pump(root, 0.5)
+    app.open_client(cid); h.pump(root, 1)
+    h.ok("the Patient menu has Termination letter…", h.action(app.page, "Termination letter") is not None)
+    h.action(app.page, "Termination letter").invoke(); h.pump(root, 0.5)
     t = app._term_win
     h.ok("the patient's name is filled in from the names on file", t["name"].get() == "Jordan Lee", t["name"].get())
     t["date"].set("2026-11-13")
@@ -101,8 +100,11 @@ def script(app, root, V, h):
     h.ok("nothing about the termination went to the AI", not any("Jordan" in p or "concluding" in p for p in h.PROMPTS))
 
     # ---- a patient with no sessions can still open these tabs; the therapist name is remembered
+    lb = app.page._search["list"]
+    h.ok("once saved, the Termination tab appears", any(lb.get(i).startswith("📄  Termination") for i in range(lb.size())))
     app.open_client(bare, select="term"); h.pump(root, 1)
-    h.ok("a patient without sessions opens on Termination", h.button(app.page, "Fill out termination letter") is not None)
+    h.ok("a patient without a letter (or sessions) has no Termination tab and doesn't fail",
+         not any("Termination" in app.page._search["list"].get(i) for i in range(app.page._search["list"].size())))
     app.termination_dialog(V.load_client(bare)); h.pump(root, 0.3)
     h.ok("the therapist's name is filled in from last time", app._term_win["therapist"].get().startswith("Jake W."))
     app._term_win["win"].destroy()

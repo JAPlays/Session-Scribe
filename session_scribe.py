@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.10"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.11"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2867,6 +2867,22 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
                 cands.append({"day": day, "num": num, "label": label + (f" (part {ci + 1})" if len(chunks) > 1 else ""),
                               "key": key, "text": chunk, "rank": (1000 if focus else 0) + score * 5 + base,
                               "recent": day})
+    # the External communication log (texts/emails kept as they are): in when the question is about them,
+    # mentions their words, or names their date
+    about_msgs = re.search(r"\b(texts?|texted|messages?|emails?|emailed|contact|reached out|communication)\b",
+                           question, re.I) is not None
+    for cm in client.get("communications") or []:
+        text = scrub_contact_details(cm.get("text") or "")
+        if not text.strip():
+            continue
+        low = text.lower()
+        score = sum(low.count(w) for w in words)
+        focus = bool(want_day and cm.get("date") == want_day)
+        cands.append({"day": cm.get("date", ""), "num": None,
+                      "label": f"{cm.get('method', 'Messages')} (external communication)", "key": "comm",
+                      "text": text[:4000] + (" …[shortened]" if len(text) > 4000 else ""),
+                      "rank": (1000 if focus else 0) + score * 5 + (6 if about_msgs else 0),
+                      "recent": cm.get("date", "")})
     picked = []
     room = budget - used - 4000                       # leave space for the manual + conversation
     notes = sorted([c for c in cands if c["key"] == "note"], key=lambda c: c["recent"], reverse=True)
@@ -2894,6 +2910,9 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
         sources.append(f"{n_ov} overview{'s' if n_ov != 1 else ''}")
     if n_tr:
         sources.append(f"{n_tr} transcript excerpt{'s' if n_tr != 1 else ''}")
+    n_cm = sum(1 for c in picked if c["key"] == "comm")
+    if n_cm:
+        sources.append(f"{n_cm} logged message thread{'s' if n_cm != 1 else ''}")
 
     ref = reference or {}
     manual = []
@@ -13170,6 +13189,7 @@ def run_gui():
             menu.add_command(label="Edit patient…", command=lambda: self.edit_client(client))
             menu.add_command(label=f"📎  Files ({nfiles})…" if nfiles else "📎  Files…",
                              command=lambda: self.patient_files(client))
+            menu.add_command(label="📄  Termination letter…", command=lambda: self.termination_dialog(client))
             menu.add_command(label="⤓  Export…", command=lambda: self.export_all(client))
             menu.add_separator()
             menu.add_command(label="Queue recordings for this patient…", command=lambda: self.open_queue(client["id"]))
@@ -13304,9 +13324,15 @@ def run_gui():
                 items.append(("assess", None))
                 n_as = len(client.get("measures") or []) + len(client.get("assessments") or [])
                 lb.insert("end", "🧾  Assessments" + (f"  · {n_as}" if n_as else ""))
-                items.append(("term", None))
+                comms = client.get("communications") or []
+                n_legacy = sum(1 for _, d in sessions if d["meta"].get("source") == "messages")
+                if comms or n_legacy:
+                    items.append(("comms", None))
+                    lb.insert("end", f"✉  External communication  · {len(comms) + n_legacy}")
                 term = client.get("termination")
-                lb.insert("end", "📄  Termination" + (f"  · {fmt_date(term.get('date', ''))}" if term else ""))
+                if term:                                     # only once a letter has been filled out
+                    items.append(("term", None))
+                    lb.insert("end", f"📄  Termination  · {fmt_date(term.get('date', ''))}")
                 for day, records in (reversed(days) if newest_first() else days):
                     items.append(("day", day))
                     n_docs = len(day_docs(records))
@@ -13335,8 +13361,11 @@ def run_gui():
                         self._render_day(viewer, client, val["day"], dict(days)[val["day"]],
                                          focus=(val["sid"], val["key"]), query=q)
                     return
-                self.view_select = kind if kind in ("case", "plan", "ask", "insights", "assess", "term") else f"day:{val}"
-                if kind == "assess":
+                self.view_select = kind if kind in ("case", "plan", "ask", "insights", "assess", "term", "comms") \
+                    else f"day:{val}"
+                if kind == "comms":
+                    self._render_comms(viewer, client, sessions)
+                elif kind == "assess":
                     self._render_assessments(viewer, client, sessions)
                 elif kind == "term":
                     self._render_termination(viewer, client, sessions)
@@ -13402,7 +13431,7 @@ def run_gui():
             f._search = {"var": q_var, "run": do_search, "list": lb, "items": items, "state": state}
             fill_list()
 
-            if not sessions and select in ("assess", "term"):
+            if not sessions and any(it[0] == select for it in items if select in ("assess", "term", "comms")):
                 idx = next(i for i, it in enumerate(items) if it[0] == select)
                 lb.selection_set(idx)
                 lb.see(idx)
@@ -13426,8 +13455,8 @@ def run_gui():
                 if isinstance(select, str) and select.startswith("insights:"):
                     self._insight_tab = select[9:]
                 idx = 3
-            elif select in ("assess", "term"):
-                idx = next(i for i, it in enumerate(items) if it[0] == select)
+            elif select in ("assess", "term", "comms"):
+                idx = next((i for i, it in enumerate(items) if it[0] == select), idx)
             elif select == "case" or (select is None and client.get("case_overview")):
                 idx = 0
             elif select:
@@ -14347,19 +14376,30 @@ def run_gui():
 
             obs_lbl = ttk.Label(f, text="Anything else to note? (optional)", style="H2.TLabel")
             ofr, obs = scrolled_text(f, height=3)
-            hint = ttk.Label(f, text=f"Before the AI sees anything, names on {code}'s “names to hide” list are replaced "
-                                     "and email addresses, phone numbers and links are removed. If the other person's "
-                                     "name (a parent, a teacher…) isn't on that list yet, add it under Edit patient first.",
+            draft_var = tk.BooleanVar(value=False)
+            draft_cb = ttk.Checkbutton(f, text="Also draft a contact note with the AI (otherwise it's just logged)",
+                                       variable=draft_var)
+            hint = ttk.Label(f, text=f"Texts and emails go into {code}'s External communication log as they are. If you "
+                                     "also draft a contact note, names on the “names to hide” list are replaced and email "
+                                     "addresses, phone numbers and links are removed before the AI sees anything.",
                              style="Muted.TLabel", wraplength=px(820), justify="left")
             btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
             status = ttk.Label(btns, text="", style="Muted.TLabel")
             status.pack(side="left")
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
-            go = ttk.Button(btns, text="Write the note", style="Accent.TButton")
+            go = ttk.Button(btns, text="Save to log", style="Accent.TButton")
             go.pack(side="right", padx=px(8))
-            hint.pack(side="bottom", anchor="w", pady=(px(8), 0))      # bottom-up: hint, notes box, its heading
+            hint.pack(side="bottom", anchor="w", pady=(px(8), 0))      # bottom-up: hint, checkbox, notes box, heading
+            draft_cb.pack(side="bottom", anchor="w", pady=(px(6), 0))
             ofr.pack(side="bottom", fill="x", pady=(px(4), 0))
             obs_lbl.pack(side="bottom", anchor="w", pady=(px(8), 0))
+
+            def go_label(*_):
+                if mode_var.get() == "messages":
+                    go.config(text="Save and draft note" if draft_var.get() else "Save to log")
+                else:
+                    go.config(text="Add to queue and start")
+            draft_var.trace_add("write", go_label)
 
             def mode_changed(*_):
                 msgs_mode = mode_var.get() == "messages"
@@ -14367,7 +14407,9 @@ def run_gui():
                 (msg_fr if msgs_mode else call_fr).pack(fill="both", expand=msgs_mode, pady=(px(4), 0))
                 row.show(m_lbl, msgs_mode)
                 row.show(m_cb, msgs_mode)
-                go.config(text="Write the note" if msgs_mode else "Add to queue and start")
+                (draft_cb.pack(side="bottom", anchor="w", pady=(px(6), 0), before=ofr) if msgs_mode
+                 else draft_cb.pack_forget())
+                go_label()
             mode_var.trace_add("write", mode_changed)
             mode_changed()
 
@@ -14413,6 +14455,15 @@ def run_gui():
                     other = "Patient" if w_ == "patient" else ((who_ or "").strip().capitalize() or
                                                                ("Contact" if w_ == "other" else "Parent"))
                     text = tidy_message_thread(text, other=other) or text
+                # always: into the patient's External communication log, as they are (no AI)
+                self.comm_save(cid, {"date": day, "with": w_, "who": who_, "method": method, "text": text,
+                                     "notes": note_txt})
+                if not draft_var.get():
+                    win.destroy()
+                    self.set_status(f"{code}: {method.lower()} added to the External communication log.")
+                    if self.client_id == cid and not self.wizard:
+                        self.open_client(cid, select="comms")
+                    return
                 values.update(contact_method=method, contact_with=w_, contact_who=who_, source_kind=(
                     f"the text messages between the Counselor and {party}, copied by the clinician (oldest first)"
                     if method == "Text messages" else
@@ -14439,11 +14490,11 @@ def run_gui():
 
                 def failed(msg):
                     if self._alive(win):
-                        go.config(state="normal")
-                        status.config(text="")
-                    messagebox.showerror(APP_NAME, f"Couldn't write the note: {msg}\n\nNothing was saved; your "
-                                                   "messages are still in the window.",
-                                         parent=win if self._alive(win) else None)
+                        win.destroy()
+                    messagebox.showerror(APP_NAME, f"Couldn't write the contact note: {msg}\n\nThe messages are "
+                                                   "saved in the External communication log.")
+                    if self.client_id == cid and not self.wizard:
+                        self.open_client(cid, select="comms")
                 r = self.run_bg(lambda p: generate_documents(job_cfg, values, transcript, context, p, kind="parent",
                                                              reference=reference),
                                 done, failed, label=f"writing the contact note for {code}", patient=code,
@@ -14454,7 +14505,7 @@ def run_gui():
                                   else "Waiting in line — it starts when the current task finishes.")
             go.config(command=lambda: go_messages() if mode_var.get() == "messages" else go_call())
             self.parent_win = {"win": win, "with": with_var, "who": who_var, "mode": mode_var, "date": date_var,
-                               "method": method_var, "msgs": msgs,
+                               "method": method_var, "msgs": msgs, "draft": draft_var,
                                "obs": obs, "audio": audio_var, "go": go, "load": load_files, "status": status}
 
         parent_comm = external_comm                     # (its earlier name)
@@ -15047,6 +15098,109 @@ def run_gui():
             ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
             self._term_win = {"win": win, "date": day_var, "name": name_var, "therapist": ther_var, "reasons": rvars,
                               "other": other, "pick": picked, "archive": arch_var, "save": save}
+
+        # ---------------------------------------------------------------- External communication log
+        def comm_save(self, cid, entry):
+            """Add (or update, by id) one texts/emails entry in the patient's External communication log."""
+            c = vault.load_client(cid)
+            lst = c.setdefault("communications", [])
+            now = datetime.now().isoformat(timespec="seconds")
+            entry = dict(entry, id=entry.get("id") or uuid.uuid4().hex[:12], added=entry.get("added") or now,
+                         updated=now)
+            for i, x in enumerate(lst):
+                if x.get("id") == entry["id"]:
+                    lst[i] = entry
+                    break
+            else:
+                lst.append(entry)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            return entry
+
+        def comm_remove(self, client, entry):
+            if not messagebox.askyesno(APP_NAME, f"Remove the {entry.get('method', 'messages').lower()} from "
+                                                 f"{fmt_date(entry.get('date', ''))} from the log?"):
+                return
+            c = vault.load_client(client["id"])
+            c["communications"] = [x for x in c.get("communications") or [] if x.get("id") != entry.get("id")]
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.open_client(client["id"], select="comms")
+
+        @staticmethod
+        def comm_party(entry):
+            w, who = entry.get("with", "patient"), (entry.get("who") or "").strip()
+            return {"patient": "Patient", "parent": "Parent / guardian"}.get(w, who.capitalize() or "Other contact")
+
+        def comm_view(self, client, entry):
+            win = new_window(root, f"{client.get('code', '')} — {entry.get('method', 'Messages')} "
+                                   f"{fmt_date(entry.get('date', ''))}", "780x680")
+            f = ttk.Frame(win, padding=px(16))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=f"{entry.get('method', 'Messages')} with {self.comm_party(entry).lower()}",
+                      style="H2.TLabel").pack(anchor="w")
+            ttk.Label(f, text=fmt_date(entry.get("date", "")), style="Muted.TLabel").pack(anchor="w")
+            if entry.get("notes"):
+                ttk.Label(f, text="Note: " + entry["notes"], wraplength=px(700), justify="left").pack(
+                    anchor="w", pady=(px(6), 0))
+            bar = Flow(f, gap=px(8))
+            bar.pack(fill="x", pady=(px(8), 0))
+            bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(entry.get("text", ""), "Messages")))
+            fr, tb = scrolled_text(f, readonly=True)
+            fr.pack(fill="both", expand=True, pady=(px(8), 0))
+            set_text(tb, entry.get("text", ""))
+            return win
+
+        def _render_comms(self, v, client, sessions):
+            client = vault.load_client(client["id"])
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="External communication", style="H2.TLabel"))
+            head.add(ttk.Button(head, text="＋  Add…", style="Accent.TButton",
+                                command=lambda: self.external_comm(client)), gap=px(16))
+            ttk.Label(v, text="Texts, emails and other contacts outside sessions, newest first — kept for reference "
+                              "as they are.", style="Muted.TLabel", wraplength=px(520), justify="left").pack(
+                anchor="w", pady=(px(2), 0))
+            sc, box = scrollable(v)
+            sc.pack(fill="both", expand=True, pady=(px(8), 0))
+            rows = [("log", x.get("date", ""), x) for x in client.get("communications") or []]
+            rows += [("note", d["meta"].get("session_date", ""), (sid, d)) for sid, d in sessions
+                     if d["meta"].get("source") == "messages"]
+            if not rows:
+                ttk.Label(box, text="Nothing logged yet. Use “Add…” (or Write ▸ External communication) to paste texts "
+                                    "or emails.", style="Muted.TLabel", wraplength=px(520), justify="left").pack(anchor="w")
+                return
+            for kind, day, x in sorted(rows, key=lambda r: (r[1], (r[2].get("added", "") if r[0] == "log"
+                                                                   else r[2][1]["meta"].get("created", ""))),
+                                       reverse=True):
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(0, px(6)), padx=(0, px(8)))
+                acts = Flow(card, gap=px(6))
+                if kind == "log":
+                    text = x.get("text", "")
+                    n_lines = len([l_ for l_ in text.splitlines() if l_.strip()])
+                    ttk.Label(card, text=f"{fmt_date(day)}   {x.get('method', 'Messages')}  ·  {self.comm_party(x)}",
+                              style="Strong.TLabel").pack(anchor="w")
+                    preview = " ".join(text.split())[:180] + ("…" if len(" ".join(text.split())) > 180 else "")
+                    ttk.Label(card, text=preview, style="Muted.TLabel", wraplength=px(500), justify="left").pack(
+                        anchor="w", pady=(px(2), 0))
+                    if x.get("notes"):
+                        ttk.Label(card, text="Note: " + x["notes"], wraplength=px(500), justify="left").pack(
+                            anchor="w", pady=(px(2), 0))
+                    acts.add(ttk.Button(acts, text=f"View ({n_lines} line{'s' if n_lines != 1 else ''})",
+                                        command=lambda e=x: self.comm_view(client, e)))
+                    acts.add(ttk.Button(acts, text="Copy", command=lambda e=x: self.copy(e.get("text", ""), "Messages")))
+                    acts.add(ttk.Button(acts, text="Remove", command=lambda e=x: self.comm_remove(client, e)), gap=px(12))
+                else:
+                    sid, d = x
+                    m = d["meta"]
+                    ttk.Label(card, text=f"{fmt_date(day)}   {m.get('contact_method', 'Messages')}  ·  contact note",
+                              style="Strong.TLabel").pack(anchor="w")
+                    ttk.Label(card, text="Drafted into a contact note (on that date in the session list).",
+                              style="Muted.TLabel").pack(anchor="w", pady=(px(2), 0))
+                    acts.add(ttk.Button(acts, text="Open", command=lambda s=sid: self.open_client(client["id"], select=s)))
+                acts.pack(fill="x", pady=(px(6), 0))
+            box.realize_all()
 
         def edit_client(self, client):
             if self.client_dialog(client):
