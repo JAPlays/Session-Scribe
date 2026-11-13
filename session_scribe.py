@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.12.5"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.12.6"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -4521,6 +4521,22 @@ def fmt_date(s):
     return _fmt_ymd(int(m[1]), int(m[2]), int(m[3])) + rest
 
 
+def fmt_short(s):
+    """Month and day only, in the chosen format (for chart labels): '11/12', '12/11', 'Nov 12' or '11-12'."""
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(s or ""))
+    if not m:
+        return str(s or "")
+    mo, d = int(m[2]), int(m[3])
+    f = _DATE_PREF["fmt"]
+    if f == "us":
+        return f"{mo}/{d}"
+    if f == "eu":
+        return f"{d}/{mo}"
+    if f == "long" and 1 <= mo <= 12:
+        return f"{_MON_ABBR[mo - 1]} {d}"
+    return f"{mo:02d}-{d:02d}"
+
+
 def fmt_dates_in(text):
     """Every YYYY-MM-DD inside a piece of text, in the chosen format."""
     if _DATE_PREF["fmt"] == "iso" or not text:
@@ -7018,9 +7034,44 @@ def question_kind(sentence):
     return "other"
 
 
-def session_map(lines, roles, counselor_label, window=120.0):
+def _same_label(a, b):
+    return bool(a) and bool(b) and a.strip().lower() == b.strip().lower()
+
+
+_CLINICIAN_WORDS = ("clinician", "counselor", "counsellor", "therapist", "interviewer", "provider", "extern",
+                    "intern", "trainee", "social worker", "psychologist")
+_PATIENT_WORDS = ("patient", "client")
+_NOT_PATIENT_WORDS = ("other", "parent", "guardian", "mother", "father", "mom", "dad", "caregiver", "teacher",
+                      "sibling", "partner", "spouse")
+
+
+def map_patient(speakers, counselor_label, patient_label=None):
+    """Which speaker in this transcript is the patient: the one labelled as the patient (Settings → speaker
+    labels, or simply "Patient"/"Client"); otherwise, when the counselor can be told (your label, or e.g.
+    "Therapist"/"Clinician"), whoever else talked most — never a parent, "Other", or an unlabelled speaker.
+    None when it can't be told, so no one else's tone is shown by mistake."""
+    names = [s["label"] for s in speakers]           # most talk first
+    low = lambda n: (n or "").strip().lower()
+    for n in names:
+        if _same_label(n, patient_label):
+            return n
+    for n in names:
+        if low(n) in _PATIENT_WORDS:
+            return n
+    is_counselor = lambda n: _same_label(n, counselor_label) or any(w in low(n) for w in _CLINICIAN_WORDS)
+    if not any(is_counselor(n) for n in names):
+        return None
+    for n in names:
+        if is_counselor(n) or any(w in low(n) for w in _NOT_PATIENT_WORDS) or re.match(r"(?i)speaker[ _]?\d+$", n):
+            continue
+        return n
+    return None
+
+
+def session_map(lines, roles, counselor_label, window=120.0, patient_label=None):
     """Who talked when, how much, and how the patient's words felt over the session — computed on this
-    computer from the transcript (no AI). Returns None when there's no timed transcript."""
+    computer from the transcript (no AI). Tone and the heaviest moments follow the patient's speech only (never
+    the counselor's or a third person's). Returns None when there's no timed transcript."""
     lines = [l for l in lines or [] if l.get("end") is not None and l.get("start") is not None
              and (l.get("text") or "").strip()]
     if not lines:
@@ -7040,13 +7091,12 @@ def session_map(lines, roles, counselor_label, window=120.0):
     for s in speakers:
         s["pct"] = round(100 * s["secs"] / talk)
         s["avg_turn"] = s["secs"] / max(s["turns"], 1)
-    others = [s["label"] for s in speakers if s["label"] != counselor_label]
-    patient = others[0] if others else None
+    patient = map_patient(speakers, counselor_label, patient_label)
     tone, heavy = [], []
     n_win = max(1, int(math.ceil(dur / window)))
     for k in range(n_win):
         a, b = k * window, (k + 1) * window
-        said = [l for l in lines if label(l) != counselor_label and a <= float(l["start"]) < b]
+        said = [l for l in lines if patient and label(l) == patient and a <= float(l["start"]) < b]
         text = " ".join(l["text"] for l in said)
         score, neg, pos = _tone_of(text)
         tone.append({"t": min(b, dur) - (min(b, dur) - a) / 2, "score": round(score, 3), "neg": neg, "pos": pos,
@@ -7057,7 +7107,8 @@ def session_map(lines, roles, counselor_label, window=120.0):
     heavy = sorted(sorted(heavy, key=lambda h: -h["neg"])[:3], key=lambda h: h["t"])
     q = {"open": 0, "closed": 0, "other": 0}
     for l in lines:
-        if label(l) == counselor_label:
+        if _same_label(label(l), counselor_label) or (not any(_same_label(x["label"], counselor_label) for x in speakers)
+                                                       and any(w in label(l).lower() for w in _CLINICIAN_WORDS)):
             for sent in re.findall(r"[^.?!]*\?", l["text"]):
                 q[question_kind(sent)] += 1
     gaps = sum(max(0.0, float(b["start"]) - float(a["end"])) for a, b in zip(lines, lines[1:]))
@@ -7150,7 +7201,7 @@ def generate_session_review(cfg, client, d, counselor, patient, orientation, ref
     session is read in parts (each part's feedback is kept, labelled)."""
     hide = client_hider(client)
     transcript = hide(review_transcript(d))
-    smap = session_map(d.get("lines"), d.get("roles") or {}, counselor)
+    smap = session_map(d.get("lines"), d.get("roles") or {}, counselor, patient_label=patient)
     max_chars = int(cfg.get("max_chars", 24000))
     parts = split_chunks(transcript, max_chars) if len(transcript) > max_chars else [transcript]
     vocab = (reference or {}).get("vocabulary") or BUILTIN_REFERENCE.get("vocabulary", "")
@@ -8756,6 +8807,7 @@ def run_gui():
         style.configure("Hero.TLabel", font=F["hero"], foreground=p["text"])
         style.configure("H2.TLabel", font=F["sub"], foreground=p["text"])
         style.configure("Strong.TLabel", font=F["strong"], foreground=p["text"])
+        style.configure("Section.TLabel", font=F["sub"], foreground=p["accent"])
         style.configure("Muted.TLabel", foreground=p["muted"])
         style.configure("Caption.TLabel", font=F["caption"], foreground=p["muted"])
         style.configure("Warn.TLabel", foreground=p["warn"])
@@ -9278,9 +9330,9 @@ def run_gui():
         if cnt is not None and cnt.winfo_exists():
             cnt.config(text=f"{words:,} word{'s' if words != 1 else ''}")
 
-    def scrolled_text(parent, height=10, readonly=False, font_size=10, doc=False):
+    def scrolled_text(parent, height=10, readonly=False, font_size=10, doc=False, tools=True):
         if doc:
-            return doc_text(parent, height, readonly)
+            return doc_text(parent, height, readonly, tools)
         fr = ttk.Frame(parent)
         inner = ttk.Frame(fr)
         inner.pack(fill="both", expand=True)
@@ -9305,12 +9357,14 @@ def run_gui():
             t.bind("<1>", lambda e: t.focus_set())          # so Ctrl+F works after clicking
         return fr, t
 
-    def doc_text(parent, height=10, readonly=False):
+    def doc_text(parent, height=10, readonly=False, tools=True):
         """A document view that feels like a word processor: a centered page on a soft backdrop,
-        comfortable type and spacing, auto-styled headings, zoom, and a live word count."""
+        comfortable type and spacing, auto-styled headings, zoom, and a live word count.
+        tools=False leaves out the A-/A+ row (the page's own menu has Text size; Ctrl +/- work too)."""
         fr = ttk.Frame(parent)
         tb = ttk.Frame(fr)
-        tb.pack(fill="x", pady=(0, px(4)))
+        if tools or not readonly:
+            tb.pack(fill="x", pady=(0, px(4)))
         inner = ttk.Frame(fr)
         inner.pack(fill="both", expand=True)
         back = register(tk.Frame(inner, borderwidth=0, highlightthickness=0), "backdrop")
@@ -9340,6 +9394,8 @@ def run_gui():
         t.bind(f"<{MOD}-f>", open_find)
         t.bind(f"<{MOD}-F>", open_find)
         t.bind("<F3>", lambda e: (t.finder.step(1), "break")[1])
+        for k_, st_ in (("plus", 1), ("equal", 1), ("minus", -1), ("KP_Add", 1), ("KP_Subtract", -1)):
+            t.bind(f"<{MOD}-{k_}>", lambda e, st_=st_: (set_doc_zoom(st_), "break")[1])
         # toolbar: undo/redo (editable), zoom, word count
         if not readonly:
             ttk.Button(tb, text="↶", width=3, style="Toolbutton",
@@ -9519,6 +9575,35 @@ def run_gui():
         b.pack(side="left", padx=(px(2), 0))
         fr.entry, fr.button = e, b
         return fr
+
+    def doc_menu(parent, t=None, items=(), text="⋯"):
+        """A small "⋯" menu for a document's less-used actions. items: (label, command) pairs, None for a
+        separator, or (label, [(label, command)…]) for a submenu. Find and text size are added for t."""
+        mb = ttk.Menubutton(parent, text=text)
+        m = register(tk.Menu(mb, tearoff=False), "menu")
+
+        def fill(menu, entries):
+            for it in entries:
+                if it is None:
+                    menu.add_separator()
+                elif isinstance(it[1], (list, tuple)):
+                    sub = register(tk.Menu(menu, tearoff=False), "menu")
+                    fill(sub, it[1])
+                    menu.add_cascade(label=it[0], menu=sub)
+                else:
+                    menu.add_command(label=it[0], command=it[1])
+        entries = list(items)
+        if t is not None:
+            key = "⌘" if IS_MAC else "Ctrl+"
+            std = [(f"🔍  Find…   ({key}F)", lambda: t.finder.show()),
+                   ("Text size", [(f"Bigger   ({key}+)", lambda: set_doc_zoom(1)),
+                                  (f"Smaller   ({key}−)", lambda: set_doc_zoom(-1))])]
+            cut = entries.index(None) if None in entries else len(entries)
+            entries = entries[:cut] + ([None] if entries[:cut] else []) + std + entries[cut:]
+        fill(m, entries)
+        mb["menu"] = m
+        mb._entries = entries
+        return mb
 
     def find_button(parent, t, text="🔍 Find"):
         return ttk.Button(parent, text=text, command=lambda: t.finder.show())
@@ -9764,7 +9849,6 @@ def run_gui():
             hdr_btns.pack(side="right", fill="x", expand=True)
             self.queue_btn = hdr_btns.add(ttk.Button(hdr_btns, text="🎙  Queue recordings",
                                                      command=lambda: self.open_queue(self.client_id)))
-            hdr_btns.add(ttk.Button(hdr_btns, text="📋  Supervision prep", command=self.supervision_prep))
             hdr_btns.add(ttk.Button(hdr_btns, text="⚙  Settings", command=self.open_setup))
             hdr_btns.add(ttk.Button(hdr_btns, text="🔒  Lock", command=self.lock))
 
@@ -10330,6 +10414,18 @@ def run_gui():
                 _quiet(root.after_cancel, self._clip_after)
             self._clip_after = root.after(120_000, self.clear_clipboard)
 
+        def note_copy_items(self, get):
+            """The 'Copy part' choices as (label, command) pairs, for a menu."""
+            def pick(i, label):
+                part = note_sections(get())[i]
+                if not part.strip():
+                    return messagebox.showinfo(APP_NAME, f"This note has no “{label}” section. (Notes written "
+                                                         "before this was added, and imported notes, don't.)")
+                self.copy(part, label)
+            return [("Note paragraph only", lambda: pick(0, "Note paragraph")),
+                    ("Therapeutic Interventions Used", lambda: pick(1, "Therapeutic Interventions Used")),
+                    ("Planned Interventions (For future sessions)", lambda: pick(2, "Planned Interventions"))]
+
         def note_copy_menu(self, parent, get):
             """'Copy part ▾': the paragraph, or either interventions list, for TheraNest's separate boxes."""
             mb = ttk.Menubutton(parent, text="Copy part  ▾")
@@ -10701,19 +10797,27 @@ def run_gui():
             pbtns.pack(side="right", fill="x", expand=True, anchor="n", padx=(px(16), 0))
             pbtns.add(ttk.Button(pbtns, text="＋  New session", style="Accent.TButton",
                                  command=lambda: self.start_wizard(client)))
-            pbtns.add(ttk.Button(pbtns, text="📝  Prep for next session", command=lambda: self.prep_brief(client)))
-            pbtns.add(ttk.Button(pbtns, text="✉  Letter…", command=lambda: self.letter_dialog(client)))
-            pbtns.add(ttk.Button(pbtns, text="＋  External communication…", command=lambda: self.external_comm(client)))
-            pbtns.add(ttk.Button(pbtns, text="Import past notes…", command=lambda: self.import_dialog(client)))
+            # Everything else lives in two menus, so the header stays calm: "Write" makes something new for
+            # this patient; "Patient" is about the record itself.
+            write = ttk.Menubutton(pbtns, text="✎  Write")
+            wmenu = register(tk.Menu(write, tearoff=False), "menu")
+            wmenu.add_command(label="📝  Prep for next session", command=lambda: self.prep_brief(client))
+            wmenu.add_command(label="✉  Letter…", command=lambda: self.letter_dialog(client))
+            wmenu.add_command(label="＋  External communication…", command=lambda: self.external_comm(client))
+            wmenu.add_separator()
+            wmenu.add_command(label="Import past notes…", command=lambda: self.import_dialog(client))
+            write["menu"] = wmenu
+            pbtns.add(write)
             nfiles = len(client.get("files") or [])
-            pbtns.add(ttk.Button(pbtns, text=f"📎  Files ({nfiles})" if nfiles else "📎  Files",
-                                 command=lambda: self.patient_files(client)))
-            pbtns.add(ttk.Button(pbtns, text="⤓  Export…", command=lambda: self.export_all(client)))
-            pbtns.add(ttk.Button(pbtns, text="Edit patient", command=lambda: self.edit_client(client)))
-            more = ttk.Menubutton(pbtns, text="More")
+            more = ttk.Menubutton(pbtns, text="Patient")
             menu = register(tk.Menu(more, tearoff=False), "menu")
-            menu.add_command(label="Tidy imported notes…", command=lambda: self.tidy_imported(client))
+            menu.add_command(label="Edit patient…", command=lambda: self.edit_client(client))
+            menu.add_command(label=f"📎  Files ({nfiles})…" if nfiles else "📎  Files…",
+                             command=lambda: self.patient_files(client))
+            menu.add_command(label="⤓  Export…", command=lambda: self.export_all(client))
+            menu.add_separator()
             menu.add_command(label="Queue recordings for this patient…", command=lambda: self.open_queue(client["id"]))
+            menu.add_command(label="Tidy imported notes…", command=lambda: self.tidy_imported(client))
             menu.add_command(label="Check dates & session #s against TheraNest…",
                              command=lambda: self.appointment_check(client))
             menu.add_separator()
@@ -10936,7 +11040,7 @@ def run_gui():
                 for w in viewer.winfo_children():
                     w.destroy()
                 ttk.Label(viewer, text="No sessions yet", style="H2.TLabel").pack(anchor="w", pady=(20, 4))
-                ttk.Label(viewer, text="Click ＋ New session to add the first recording, or Import past notes… "
+                ttk.Label(viewer, text="Click ＋ New session to add the first recording, or Write ▸ Import past notes… "
                                        "to bring in notes you've already written.", wraplength=px(560), justify="left",
                           style="Muted.TLabel").pack(anchor="w")
                 return
@@ -11188,10 +11292,10 @@ def run_gui():
                                   "supervision. Once created, new session notes use it for continuity.",
                           style="Muted.TLabel", wraplength=px(640), justify="left").pack(anchor="w", pady=(2, 0))
             self.progress_panel(v, owner=("case", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
-            fr, t = scrolled_text(v, readonly=True, doc=True)
+            fr, t = scrolled_text(v, readonly=True, doc=True, tools=False)
             fr.pack(fill="both", expand=True, pady=(6, 0))
             set_text(t, case.get("text", ""))
-            head.add(find_button(head, t))
+            head.add(doc_menu(head, t))
             if query:
                 t.finder.show(query, focus=False)
 
@@ -11203,7 +11307,7 @@ def run_gui():
             head.pack(fill="x")
             head.add(ttk.Label(head, text="Treatment plan", style="H2.TLabel"))
             head.add(ttk.Button(head, text="Update treatment plan…" if plans else "Create treatment plan…",
-                                style="Accent.TButton", command=lambda: self.plan_dialog(client)))
+                                style="TButton" if plans else "Accent.TButton", command=lambda: self.plan_dialog(client)))
             if not plans:
                 ttk.Label(v, text="Drafts a plan in SSC's format (diagnosis, presenting problem, behavioral "
                                   "definitions, goals with measurable objectives and interventions, and the patient "
@@ -11239,19 +11343,19 @@ def run_gui():
             self.progress_panel(v, owner=("plan", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
             bar = Flow(v)
             bar.pack(fill="x", pady=(px(6), 0))
-            fr, t = scrolled_text(v, readonly=True, doc=True)
+            fr, t = scrolled_text(v, readonly=True, doc=True, tools=False)
             fr.pack(fill="both", expand=True, pady=(px(6), 0))
             set_text(t, plan["text"])
             bar.add(ttk.Button(bar, text="Copy plan for TheraNest", style="Accent.TButton",
                                command=lambda: self.copy(plan_for_ehr(plan["text"]), "Treatment plan")))
             edit_btn = bar.add(ttk.Button(bar, text="Edit"))
             goals = plan_goals(plan["text"])
+            items = []
             if goals:
-                bar.add(ttk.Button(bar, text="Goals → patient profile",
-                                   command=lambda: self.goals_to_profile(client, goals)))
-            bar.add(find_button(bar, t))
+                items.append(("Copy goals to the patient profile", lambda: self.goals_to_profile(client, goals)))
             if i == len(plans) - 1:
-                bar.add(ttk.Button(bar, text="Delete…", command=lambda: self.delete_plan(client, i)))
+                items += [None, ("🗑  Delete this version…", lambda: self.delete_plan(client, i))]
+            bar.add(doc_menu(bar, t, items))
 
             def toggle_edit():
                 if str(t.cget("state")) == "disabled":
@@ -11375,8 +11479,6 @@ def run_gui():
             head = Flow(v, gap=px(16))
             head.pack(fill="x")
             head.add(ttk.Label(head, text=f"{day_title(records)} — {fmt_date(day)}", style="H2.TLabel"))
-            head.add(ttk.Button(head, text="Change date / session #…",
-                                command=lambda: self.redate(client, records, day)))
             for rsid, rd in records:
                 if rd["meta"].get("needs_review"):
                     ban = ttk.Frame(v, style="Card.TFrame", padding=(px(12), px(8)))
@@ -11400,27 +11502,34 @@ def run_gui():
             pending = {}                       # tab -> builder: a tab's contents are made when it's first shown
 
             def build_tab(tab, label, key, sid, d):
-                bar = Flow(tab)
+                # Two buttons you use every time; everything else is under ⋯
+                bar = ttk.Frame(tab)
                 bar.pack(fill="x")
+                bar.add = lambda w, **k: (w.pack(side="left", padx=(0, px(8))), w)[1]     # (tests look for .add)
                 bar.add(ttk.Button(bar, text=f"Copy {label.split(' (')[0].lower()}", style="Accent.TButton",
                                    command=lambda: self.copy(d.get(key, ""), label)))
                 bar.add(ttk.Button(bar, text="Edit", command=lambda: self.start_wizard(client, sid, d)))
-                if key != "transcript" and (d.get(key) or "").strip():
-                    bar.add(ttk.Button(bar, text="✎  Revise with AI…",
-                                       command=lambda: self.revise_dialog(client, sid, key, label, day)))
-                if key == "note":
-                    bar.add(self.note_copy_menu(bar, lambda: d.get("note", "")))
-                if len(records) > 1:
-                    bar.add(ttk.Button(bar, text="Move to another date…",
-                                       command=lambda: self.redate(client, [(sid, d)], day)))
                 if key == "note" and d.get("context_used"):
                     ttk.Label(tab, text="Built on: " + ", ".join(d["context_used"]),
                               style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(4, 0))
-                fr, t = scrolled_text(tab, readonly=True, doc=True)
+                fr, t = scrolled_text(tab, readonly=True, doc=True, tools=False)
                 fr.pack(fill="both", expand=True, pady=(6, 0))
                 set_text(t, d.get(key, ""))
-                bar.add(find_button(bar, t))
-                bar.add(ttk.Button(bar, text="Delete…", command=lambda: self.delete_session(client, sid, d)))
+                items = []
+                if key != "transcript" and (d.get(key) or "").strip():
+                    items.append(("✎  Revise with AI…", lambda: self.revise_dialog(client, sid, key, label, day)))
+                if key == "note":
+                    items.append(("Copy part", self.note_copy_items(lambda: d.get("note", ""))))
+                items.append(None)
+                items.append(("Change date / session #…", lambda: self.redate(client, records, day)))
+                if len(records) > 1:
+                    items.append(("Move this document to another date…",
+                                  lambda: self.redate(client, [(sid, d)], day)))
+                items += [None, ("🗑  Delete…", lambda: self.delete_session(client, sid, d))]
+                bar.add(doc_menu(bar, t, items))
+                t.count_label = ttk.Label(bar, text="", style="Caption.TLabel")
+                t.count_label.pack(side="right", padx=(0, px(4)))
+                t.restyle()
                 v._tabs[(sid, key)] = (tab, t)
                 return t
 
@@ -12610,6 +12719,9 @@ def run_gui():
                 c.create_line(left, mid, right, mid, fill=P("border"), dash=(2, 3))
                 c.create_text(right, ty, text="lighter ▲", anchor="ne", fill=P("muted"), font=F["caption"])
                 c.create_text(right, ty + tone_h, text="heavier ▼", anchor="se", fill=P("muted"), font=F["caption"])
+                if not m.get("patient"):
+                    c.create_text((left + right) / 2, mid, text="Label the speakers in the transcript (who's the "
+                                  "patient) to see the patient's tone.", fill=P("muted"), font=F["caption"])
                 pts = [(X(t["t"]), mid - t["score"] * (tone_h / 2 - px(4))) for t in m["tone"] if t["words"] >= 15]
                 if len(pts) >= 2:
                     c.create_line(*[v for p_ in pts for v in p_], fill=P("accent"), width=2, smooth=True)
@@ -12653,13 +12765,14 @@ def run_gui():
             self.progress_panel(box, owner=("review", sid)).pack(anchor="w", fill="x", pady=(px(4), 0))
 
             ttk.Label(box, text="Session map", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(4)))
-            m = session_map(d.get("lines"), d.get("roles") or {}, counselor)
+            m = session_map(d.get("lines"), d.get("roles") or {}, counselor, patient_label=patient)
             if m:
                 self.draw_session_map(box, m).pack(anchor="w", fill="x", padx=(0, px(8)))
                 ttk.Label(box, text=session_map_text(m), style="Muted.TLabel", wraplength=px(760),
                           justify="left").pack(anchor="w", pady=(px(6), 0))
-                ttk.Label(box, text="Tone is a simple count of feeling words in what the patient said, every two "
-                                    "minutes — a rough guide to where the session got heavy, not a measurement.",
+                ttk.Label(box, text="Tone follows only what the patient said (not your words or anyone else's): a "
+                                    "simple count of feeling words every two minutes — a rough guide to where the "
+                                    "session got heavy, not a measurement.",
                           style="Caption.TLabel", wraplength=px(760), justify="left").pack(anchor="w")
             else:
                 ttk.Label(box, text="Only recorded sessions (with timings) have a session map.",
@@ -12899,7 +13012,7 @@ def run_gui():
             try:
                 rs = risk_summary(client, sessions)
                 if rs["recent"]:
-                    bits.append(f"⚠ risk {fmt_date(rs['recent'][0]['date'])[5:]}")
+                    bits.append(f"⚠ risk {fmt_short(rs['recent'][0]['date'])}")
             except Exception:
                 pass
             try:
@@ -12922,11 +13035,25 @@ def run_gui():
                 pass
             return " · ".join(bits)
 
+        INSIGHT_TITLES = {"risk": "Risk", "scores": "PHQ-9 / GAD-7", "goals": "Treatment goals",
+                          "homework": "Homework", "followups": "Follow-ups", "themes": "Themes"}
+
         def insight_tabs(self):
-            """[(key, tab title, builder(frame, client, sessions))] — each feature adds its tab here."""
-            return [("goals", "Goals check", self._ins_goals), ("risk", "Risk timeline", self._ins_risk),
-                    ("scores", "PHQ-9 / GAD-7", self._ins_scores), ("homework", "Homework", self._ins_homework),
-                    ("followups", "Follow-ups", self._ins_followups), ("themes", "Themes", self._ins_themes)]
+            """[(tab key, tab title, [(section key, builder(frame, client, sessions))])] — related sections share
+            a tab and are stacked on one scrolling page, so there are fewer tabs to hunt through."""
+            return [("risk", "Risk & scores", [("risk", self._ins_risk), ("scores", self._ins_scores)]),
+                    ("goals", "Goals & homework", [("goals", self._ins_goals), ("homework", self._ins_homework),
+                                                   ("followups", self._ins_followups)]),
+                    ("themes", "Themes", [("themes", self._ins_themes)])]
+
+        def _ins_box(self, fr):
+            """Where an insights section draws: straight into the tab's shared scrolling page when it's one of
+            several sections on that tab, else its own scrolling area."""
+            if getattr(fr, "_inline", False):
+                return fr
+            sc, box = scrollable(fr)
+            sc.pack(fill="both", expand=True)
+            return box
 
         def _render_insights(self, v, client, sessions, tab=None):
             head = Flow(v, gap=px(8))
@@ -12935,33 +13062,74 @@ def run_gui():
             nb = ttk.Notebook(v)
             nb.pack(fill="both", expand=True, pady=(px(6), 0))
             built, frames = set(), {}
-            tabs = self.insight_tabs()
-            for key, title, builder in tabs:
+            groups = self.insight_tabs()
+            section_tab = {sk: key for key, _, secs in groups for sk, _ in secs}
+            want = tab or getattr(self, "_insight_tab", None)
+            want_tab = section_tab.get(want, want)
+            for key, title, secs in groups:
                 fr = ttk.Frame(nb, padding=(0, px(6), 0, 0))
                 nb.add(fr, text=f"  {title}  ")
-                frames[str(fr)] = (key, builder, fr)
+                frames[str(fr)] = (key, secs, fr)
 
             def show(_e=None):
                 cur = nb.select()
                 if not cur or cur in built:
                     return
                 built.add(cur)
-                key, builder, fr = frames[cur]
-                self._insight_tab = key
-                builder(fr, client, sessions)
-            nb.bind("<<NotebookTabChanged>>", lambda e: (show(), setattr(self, "_insight_tab", frames[nb.select()][0])
-                                                          if nb.select() else None))
-            want = tab or getattr(self, "_insight_tab", None)
+                key, secs, fr = frames[cur]
+                if len(secs) == 1:
+                    secs[0][1](fr, client, sessions)
+                    return
+                sc, box = scrollable(fr)
+                sc.pack(fill="both", expand=True)
+                parts = {}
+                for i, (sk, builder) in enumerate(secs):
+                    if i:
+                        ttk.Separator(box).pack(fill="x", pady=(px(18), px(12)))
+                    ttk.Label(box, text=self.INSIGHT_TITLES.get(sk, sk.title()), style="Section.TLabel").pack(
+                        anchor="w", pady=(0, px(6)))
+                    part = ttk.Frame(box)
+                    part._inline = True
+                    part.pack(fill="x", anchor="n", padx=(0, px(10)))
+                    parts[sk] = part
+                    try:
+                        builder(part, client, sessions)
+                    except Exception as e:                    # one broken section mustn't hide the others
+                        ttk.Label(part, text=f"Couldn't show this part: {friendly_error(e)}",
+                                  style="Bad.TLabel").pack(anchor="w")
+                target = parts.get(want) if want != secs[0][0] else None
+                if target is not None:
+                    canvas = sc.winfo_children()[0]
+
+                    def jump(tries=[0]):
+                        if not (box.winfo_exists() and target.winfo_exists()):
+                            return                       # the page was redrawn in the meantime
+                        try:
+                            box.update_idletasks()
+                            total = max(box.winfo_height(), 1)
+                            if total <= 1 and tries[0] < 10:
+                                tries[0] += 1
+                                return root.after(50, jump)
+                            canvas.configure(scrollregion=canvas.bbox("all"))
+                            canvas.yview_moveto(max(0.0, (target.winfo_y() - px(8)) / total))
+                        except tk.TclError:
+                            pass
+                    root.after(80, jump)
+
+            def changed(_e=None):
+                show()
+                if nb.select():
+                    self._insight_tab = frames[nb.select()][0]
+            nb.bind("<<NotebookTabChanged>>", changed)
             for t_ in nb.tabs():
-                if frames[t_][0] == want:
+                if frames[t_][0] == want_tab:
                     nb.select(t_)
                     break
             show()
             v._insights = nb
 
         def _ins_goals(self, fr, client, sessions):
-            sc, box = scrollable(fr)
-            sc.pack(fill="both", expand=True)
+            box = self._ins_box(fr)
             goals, todo = goals_todo(client, sessions)
             row = Flow(box, gap=px(8))
             row.pack(fill="x")
@@ -12991,7 +13159,7 @@ def run_gui():
             grid.pack(anchor="w", fill="x", pady=(px(10), 0))
             ttk.Label(grid, text="Goal", style="Strong.TLabel").grid(row=0, column=0, sticky="w")
             for j, (day, sid, hits) in enumerate(cols, 1):
-                ttk.Label(grid, text=fmt_date(day)[5:] if len(fmt_date(day)) >= 10 else fmt_date(day),
+                ttk.Label(grid, text=fmt_short(day),
                           style="Caption.TLabel").grid(row=0, column=j, padx=px(4))
             ttk.Label(grid, text="Last worked on", style="Strong.TLabel").grid(row=0, column=len(cols) + 1, sticky="w",
                                                                                padx=(px(10), 0))
@@ -13050,8 +13218,7 @@ def run_gui():
                 self.open_client(client["id"], select="insights")
 
         def _ins_risk(self, fr, client, sessions):
-            sc, box = scrollable(fr)
-            sc.pack(fill="both", expand=True)
+            box = self._ins_box(fr)
             todo = risk_todo(sessions)
             row = Flow(box, gap=px(8))
             row.pack(fill="x")
@@ -13164,8 +13331,7 @@ def run_gui():
             return c
 
         def _ins_scores(self, fr, client, sessions):
-            sc, box = scrollable(fr)
-            sc.pack(fill="both", expand=True)
+            box = self._ins_box(fr)
             client = vault.load_client(client["id"])
             row = Flow(box, gap=px(8))
             row.pack(fill="x")
@@ -13500,8 +13666,7 @@ def run_gui():
                 self.open_client(client["id"], select="insights")
 
         def _ins_homework(self, fr, client, sessions):
-            sc, box = scrollable(fr)
-            sc.pack(fill="both", expand=True)
+            box = self._ins_box(fr)
             client = vault.load_client(client["id"])
             row = Flow(box, gap=px(8))
             row.pack(fill="x")
@@ -13817,7 +13982,7 @@ def run_gui():
                 cw = (w - left - px(12)) / n
                 for j, day in enumerate(cols):
                     if n <= 12 or j % max(1, n // 8) == 0 or j == n - 1:
-                        c.create_text(left + cw * (j + 0.5), top - px(6), text=fmt_date(day)[5:] or "?",
+                        c.create_text(left + cw * (j + 0.5), top - px(6), text=fmt_short(day) or "?",
                                       fill=P("muted"), font=F["caption"])
                 for i, (name, vals) in enumerate(rows):
                     y = top + i * row_h
@@ -13833,8 +13998,7 @@ def run_gui():
             return c
 
         def _ins_themes(self, fr, client, sessions):
-            sc, box = scrollable(fr)
-            sc.pack(fill="both", expand=True)
+            box = self._ins_box(fr)
             counselor, _ = self._counselor_patient()
             th = session_themes(client, sessions, counselor)
             ttk.Label(box, text="What the patient talks about, session by session", style="Strong.TLabel").pack(anchor="w")
@@ -13893,8 +14057,7 @@ def run_gui():
             vault.save_client(c)
 
         def _ins_followups(self, fr, client, sessions):
-            sc, box = scrollable(fr)
-            sc.pack(fill="both", expand=True)
+            box = self._ins_box(fr)
             client = self.followups_refresh(client, sessions)
             todo = followups_todo(sessions)
             row = Flow(box, gap=px(8))
@@ -14005,19 +14168,12 @@ def run_gui():
             bar = Flow(top_, align="right", gap=px(8))
             bar.pack(side="right", fill="x", expand=True)
             bar.add(ttk.Button(bar, text="📋  Supervision prep", command=self.supervision_prep))
-            bar.add(ttk.Button(bar, text="🎙  Queue recordings", command=lambda: self.open_queue()))
-            bar.add(ttk.Button(bar, text="＋  New patient", style="Accent.TButton", command=self.new_client))
             data = self.dashboard_data()
             n_pat = sum(1 for c in self.clients if not c.get("archived"))
             total = sum(len(v) for k, v in data.items())
             ttk.Label(f, text=f"Your caseload · {n_pat} active patient{'s' if n_pat != 1 else ''}"
                               + (" · everything's up to date" if not total else ""), style="Muted.TLabel").pack(
                 anchor="w", pady=(px(2), px(12)))
-            if not self.setup_ok:
-                card = ttk.Frame(f, style="Card.TFrame", padding=(px(16), px(10)))
-                card.pack(fill="x", pady=(0, px(10)))
-                ttk.Label(card, text="Some pieces of the setup are missing.", style="Warn.TLabel").pack(side="left")
-                ttk.Button(card, text="Open Settings", command=self.open_setup).pack(side="right")
             tiles = Flow(f, gap=px(10))
             tiles.pack(fill="x")
             for key, title, tone in DASH_SECTIONS:
