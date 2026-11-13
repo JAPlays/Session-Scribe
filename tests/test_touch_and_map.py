@@ -90,6 +90,31 @@ def script(app, root, V, h):
     root.update()
     h.ok("a tap (no drag) still presses the button", calls == [1], calls)
 
+    # ---- a burst of finger moves (a touchscreen sends many per frame) moves the page once, not per move
+    for i in range(14):
+        V.save_client({"code": f"TS{i:02d}", "followups": [{"id": f"t{i}", "text": f"Call back {i}", "date": "2026-11-01",
+                                                            "done": False}]})
+    app.refresh_clients(); app.client_id = None; app.show_home(); h.pump(root, 1.5)
+    home = next((w for w in h.widgets(app.page) if getattr(w, "_touch_view", None) is w and w.yview()[1] < 1.0), None)
+    h.ok("the Home page scrolls", home is not None)
+    if home is not None:
+        moves = []
+        real = home.yview_moveto
+        home.yview_moveto = lambda f: (moves.append(f), real(f))
+        target = next(w for w in h.widgets(home, "TLabel") if w.winfo_viewable())
+        rx, ry = target.winfo_rootx() + 5, target.winfo_rooty() + 5
+        top = home.yview()[0]
+        target.event_generate("<ButtonPress-1>", x=5, y=5, rootx=rx, rooty=ry)
+        for k in range(1, 31):                           # 30 moves arrive before the screen gets to redraw
+            target.event_generate("<Motion>", x=5, y=5 - 4 * k, rootx=rx, rooty=ry - 4 * k, state=0x100)
+        root.update()
+        target.event_generate("<ButtonRelease-1>", x=5, y=5 - 120, rootx=rx, rooty=ry - 120, state=0x100)
+        root.update()
+        h.ok("a burst of finger moves scrolls the Home page", home.yview()[0] > top + 0.01, (top, home.yview()))
+        h.ok(f"…moving it once per redraw, not once per touch event ({len(moves)} move(s) for 30 events)",
+             1 <= len(moves) <= 3, moves)
+        del home.yview_moveto
+
     # ---- touch scrolling the patient list: scrolling doesn't open anyone, a tap does
     import tkinter as tk
     for w in [w for w in root.winfo_children() if isinstance(w, tk.Toplevel)]:
