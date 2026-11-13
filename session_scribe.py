@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.3"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.4"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -8567,7 +8567,7 @@ def generate_supervision_packet(cfg, patients, start, end, questions, orientatio
             f"{fmt_date(date.today().isoformat())} · {len(work)} patient{'s' if len(work) != 1 else ''}")
     out = [head]
     if (questions or "").strip():
-        out.append("MY QUESTIONS\n" + "\n".join(("- " + q.strip().lstrip("-• ").strip())
+        out.append("WHAT I'D LIKE TO FOCUS ON\n" + "\n".join(("- " + q.strip().lstrip("-• ").strip())
                                                   for q in questions.splitlines() if q.strip()))
     if practice:
         out.append("SKILLS I'M WORKING ON (from my session reviews)\n" + "\n".join(
@@ -8575,6 +8575,11 @@ def generate_supervision_packet(cfg, patients, start, end, questions, orientatio
     out.append("PATIENTS\n\n" + ("\n\n".join(sections) if sections else "No sessions or contacts in this period."))
     progress("Done.", 100)
     return "\n\n".join(out)
+
+
+def _capwords(s):
+    import string
+    return string.capwords(s)
 
 
 def text_to_blocks(title, text):
@@ -8590,7 +8595,7 @@ def text_to_blocks(title, text):
         s_ = line.strip()
         if s_ and len(s_) <= 90 and s_.upper() == s_ and re.search(r"[A-Z]", s_) and not s_.startswith("-"):
             flush()
-            blocks.append(("h1", s_.title() if len(s_) > 3 else s_))
+            blocks.append(("h1", _capwords(s_.lower()) if len(s_) > 3 else s_))   # "I'd", not "I'D"
         elif not s_:
             flush()
         else:
@@ -14865,7 +14870,7 @@ def run_gui():
             f.pack(fill="both", expand=True)
             ttk.Label(f, text="Supervision prep", style="Title.TLabel").pack(anchor="w")
             ttk.Label(f, text="A page for your next supervision meeting: for each patient, what happened, any risk, "
-                              "progress toward goals and questions to bring — plus the skills from your session "
+                              "progress toward goals and what to bring up — plus the skills from your session "
                               "reviews. Drafted by the local AI from your notes (names hidden); saved encrypted.",
                       style="Muted.TLabel", wraplength=px(800), justify="left").pack(anchor="w", pady=(px(2), px(10)))
             past = vault.list_reports("supervision")
@@ -14882,10 +14887,15 @@ def run_gui():
             plist = ttk.Frame(f)
             plist.pack(fill="x")
             picks = {}
-            ttk.Label(f, text="Questions you already want to bring (optional, one per line)", style="Strong.TLabel").pack(
-                anchor="w", pady=(px(12), px(2)))
-            qfr, qtxt = scrolled_text(f, height=4)
+            ttk.Label(f, text="What you'd like to focus on in this supervision session", style="Strong.TLabel").pack(
+                anchor="w", pady=(px(12), 0))
+            ttk.Label(f, text="Not just questions: cases you're stuck on, skills you want feedback on, reactions you "
+                              "noticed in yourself, anything else. Optional, one item per line; it goes at the top "
+                              "of the packet as you wrote it.", style="Caption.TLabel", wraplength=px(800),
+                      justify="left").pack(anchor="w", pady=(0, px(4)))
+            qfr, qtxt = scrolled_text(f, height=5)
             qfr.pack(fill="x")
+            win.after(300, lambda: _quiet(qtxt.focus_set))     # ready to type as soon as it opens
             info = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(800), justify="left")
             info.pack(anchor="w", pady=(px(8), 0))
             prev_fr = ttk.Frame(f)
