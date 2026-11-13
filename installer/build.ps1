@@ -16,9 +16,11 @@
 param(
   [string]$Edition = "mistral-24b",
   [string]$HfToken = $env:HF_TOKEN,
-  [string]$LlamaTag = "latest",        # a llama.cpp release tag, e.g. b6500, to pin the engine version
-  [string]$PythonTag = "latest",       # a python-build-standalone release tag, e.g. 20250918
-  [string]$PythonMinor = "3.12",
+  # Pinned, tested-together versions (checked against their release workflows). "latest" asks GitHub instead.
+  [string]$LlamaTag = "b11900",            # llama.cpp release, 2026-10-26
+  [string]$PythonTag = "20261026",         # python-build-standalone release, 2026-10-26 ...
+  [string]$PythonVersion = "3.12.16",      # ... and the CPython 3.12 it ships
+  [string]$PythonMinor = "3.12",           # (only used with -PythonTag latest)
   [string]$Iscc = ""
 )
 $ErrorActionPreference = "Stop"
@@ -63,12 +65,18 @@ Write-Host "  build $AppBuild"
 
 # ---------------------------------------------------------------- Python (with tkinter)
 Step "Python $PythonMinor"
-$rel = GitHubRelease "astral-sh/python-build-standalone" $PythonTag
-$pat = "^cpython-$([regex]::Escape($PythonMinor))\.\d+\+\d+-x86_64-pc-windows-msvc-install_only\.tar\.gz$"
-$asset = $rel.assets | Where-Object { $_.name -match $pat } | Select-Object -First 1
-if (-not $asset) { throw "No Windows Python $PythonMinor build in python-build-standalone $($rel.tag_name)." }
-$pyTar = Join-Path $Cache $asset.name
-Fetch $asset.browser_download_url $pyTar
+if ($PythonTag -eq "latest") {
+  $rel = GitHubRelease "astral-sh/python-build-standalone" "latest"
+  $pat = "^cpython-$([regex]::Escape($PythonMinor))\.\d+\+\d+-x86_64-pc-windows-msvc-install_only\.tar\.gz$"
+  $asset = $rel.assets | Where-Object { $_.name -match $pat } | Select-Object -First 1
+  if (-not $asset) { throw "No Windows Python $PythonMinor build in python-build-standalone $($rel.tag_name)." }
+  $pyName, $pyUrl = $asset.name, $asset.browser_download_url
+} else {
+  $pyName = "cpython-$PythonVersion+$PythonTag-x86_64-pc-windows-msvc-install_only.tar.gz"
+  $pyUrl = "https://github.com/astral-sh/python-build-standalone/releases/download/$PythonTag/$([uri]::EscapeDataString($pyName))"
+}
+$pyTar = Join-Path $Cache $pyName
+Fetch $pyUrl $pyTar
 tar -xzf $pyTar -C $Stage                         # makes $Stage\python
 $Py = Join-Path $Stage "python\python.exe"
 $PyVersion = (& $Py -c "import sys;print(sys.version.split()[0])")
@@ -90,16 +98,16 @@ Copy-Item $ff (Join-Path $Stage "bin\ffmpeg.exe")
 
 # ---------------------------------------------------------------- the built-in AI
 Step "llama.cpp ($($Ed.llama_backend))"
-$rel = GitHubRelease "ggml-org/llama.cpp" $LlamaTag
-$LlamaVersion = $rel.tag_name
-$asset = $rel.assets | Where-Object { $_.name -match "^llama-.*-bin-win-$($Ed.llama_backend)-x64\.zip$" } | Select-Object -First 1
-if (-not $asset) { throw "No win-$($Ed.llama_backend)-x64 build in llama.cpp $LlamaVersion." }
-$zip = Join-Path $Cache $asset.name
-Fetch $asset.browser_download_url $zip
+# The win-<backend> zip has the whole toolset (llama-server, llama-gguf-split, the CPU backend) plus that
+# backend; without a working Vulkan driver it simply runs on the processor.
+if ($LlamaTag -eq "latest") { $LlamaVersion = (GitHubRelease "ggml-org/llama.cpp" "latest").tag_name } else { $LlamaVersion = $LlamaTag }
+$zipName = "llama-$LlamaVersion-bin-win-$($Ed.llama_backend)-x64.zip"
+$zip = Join-Path $Cache $zipName
+Fetch "https://github.com/ggml-org/llama.cpp/releases/download/$LlamaVersion/$zipName" $zip
 $Engine = Join-Path $Stage "engine"
 Expand-Archive $zip -DestinationPath $Engine -Force
 $inner = Get-ChildItem $Engine -Recurse -Filter "llama-server.exe" | Select-Object -First 1
-if (-not $inner) { throw "llama-server.exe isn't in $($asset.name)." }
+if (-not $inner) { throw "llama-server.exe isn't in $zipName." }
 if ($inner.DirectoryName -ne $Engine) { Get-ChildItem $inner.DirectoryName | Move-Item -Destination $Engine -Force }
 Write-Host "  llama.cpp $LlamaVersion"
 

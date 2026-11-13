@@ -80,6 +80,7 @@ mock LM Studio, so no real data or model is needed.
 python tests/test_task_queue.py
 python tests/test_refresh_one.py
 python tests/test_builtin_ai.py     # installer builds: built-in AI, hardware fitting (fake llama-server)
+python tests/test_touch_and_map.py  # finger scrolling, session maps from transcript timestamps, Themes labels
 ```
 
 Each test opens the app window briefly and prints `N/N checks passed`. On Linux, run them under

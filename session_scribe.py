@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.1"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.2"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -201,6 +201,7 @@ DEFAULT_CONFIG = {
     "gpu_layers": "",           # built-in AI: model layers on the graphics chip (set by auto_tune for this computer)
     "whisper_threads": 0,       # processor threads for the speech model (0 = its default)
     "tuned_for": "",            # the hardware the settings were last fitted to (auto_tune)
+    "touch_scroll": "auto",     # finger drags scroll: auto (touchscreens, Windows) / on (every drag) / off
     "whisper_model": "large-v3-turbo",
     "language": "en",
     "batch_size": 8,
@@ -8234,6 +8235,63 @@ def map_patient(speakers, counselor_label, patient_label=None):
     return None
 
 
+_TS = r"((?:\d{1,2}:)?\d{1,2}:\d{2})(?:[.,]\d+)?"
+_TS_FIRST = re.compile(r"^\s*[\[(]?" + _TS + r"[\])]?\s*[-–—]?\s*([^:\[\]()]{1,40}?)\s*:\s*(.*)$")   # [00:01:23] Patient: …
+_TS_AFTER = re.compile(r"^\s*([^:\[\]()\d][^:\[\]()]{0,39}?)\s*[\[(]" + _TS + r"[\])]\s*:?\s*(.*)$")  # Patient (00:01:23): …
+
+
+def _ts_secs(ts):
+    secs = 0
+    for part in ts.split(":"):
+        secs = secs * 60 + int(part)
+    return float(secs)
+
+
+def lines_from_transcript(text):
+    """Timed lines read back from a transcript's own timestamps — for sessions saved without the
+    transcription's timings (pasted or imported transcripts, older sessions). Each line lasts until the next
+    one starts, so pauses count as talk; [] when the text has fewer than two timestamped lines or the times
+    run backwards."""
+    out = []
+    for raw in (text or "").splitlines():
+        m = _TS_FIRST.match(raw)
+        if m:
+            ts, who, said = m.groups()
+        else:
+            m = _TS_AFTER.match(raw)
+            if m:
+                who, ts, said = m.groups()
+        if m:
+            out.append({"start": _ts_secs(ts), "speaker": who.strip(), "text": said.strip()})
+        elif out and raw.strip():
+            out[-1]["text"] = (out[-1]["text"] + " " + raw.strip()).strip()   # a line that wrapped
+    if len(out) < 2:
+        return []
+    for a, b in zip(out, out[1:]):
+        if b["start"] < a["start"]:
+            return []
+        a["end"] = b["start"]
+    out[-1]["end"] = out[-1]["start"] + max(2.0, len(out[-1]["text"].split()) / 2.5)
+    return [dict(l, approx=True) for l in out if l["text"]]
+
+
+def timed_lines(d):
+    """A session's transcript lines with start and end times: the transcription's own when it has them,
+    else read from the timestamps in the transcript text."""
+    lines = [l for l in d.get("lines") or [] if l.get("start") is not None]
+    if lines and all(l.get("end") is not None for l in lines):
+        return d["lines"]
+    if lines:                                       # starts only: each line ends where the next begins
+        lines = sorted((dict(l) for l in lines), key=lambda l: float(l["start"]))
+        for a, b in zip(lines, lines[1:]):
+            if a.get("end") is None:
+                a["end"] = b["start"]
+        if lines[-1].get("end") is None:
+            lines[-1]["end"] = float(lines[-1]["start"]) + max(2.0, len((lines[-1].get("text") or "").split()) / 2.5)
+        return lines
+    return lines_from_transcript(d.get("transcript") or "")
+
+
 def session_map(lines, roles, counselor_label, window=120.0, patient_label=None):
     """Who talked when, how much, and how the patient's words felt over the session — computed on this
     computer from the transcript (no AI). Tone and the heaviest moments follow the patient's speech only (never
@@ -8278,7 +8336,8 @@ def session_map(lines, roles, counselor_label, window=120.0, patient_label=None)
             for sent in re.findall(r"[^.?!]*\?", l["text"]):
                 q[question_kind(sent)] += 1
     gaps = sum(max(0.0, float(b["start"]) - float(a["end"])) for a, b in zip(lines, lines[1:]))
-    return {"duration": dur, "speakers": speakers, "counselor": counselor_label, "patient": patient,
+    approx = any(l.get("approx") for l in lines)      # timings read from the transcript's timestamps
+    return {"duration": dur, "approx": approx, "speakers": speakers, "counselor": counselor_label, "patient": patient,
             "timeline": [(float(l["start"]), float(l["end"]), label(l)) for l in lines],
             "tone": tone, "heavy": heavy, "questions": dict(q, total=sum(q.values())),
             "silence_pct": round(100 * gaps / dur) if dur else 0}
@@ -8290,7 +8349,7 @@ def session_map_text(m):
         return ""
     out = [f"Length {fmt_ts(m['duration'])}. Talk time: " + ", ".join(
         f"{s['label']} {s['pct']}% ({s['turns']} turns, longest {round(s['longest'])} s)" for s in m["speakers"])
-        + f". Pauses between turns: {m['silence_pct']}% of the session."]
+        + ("" if m.get("approx") else f". Pauses between turns: {m['silence_pct']}% of the session.")]
     q = m["questions"]
     if q["total"]:
         out.append(f"{m['counselor']}'s questions: {q['total']} — {q['open']} open, {q['closed']} closed"
@@ -8367,7 +8426,7 @@ def generate_session_review(cfg, client, d, counselor, patient, orientation, ref
     session is read in parts (each part's feedback is kept, labelled)."""
     hide = client_hider(client)
     transcript = hide(review_transcript(d))
-    smap = session_map(d.get("lines"), d.get("roles") or {}, counselor, patient_label=patient)
+    smap = session_map(timed_lines(d), d.get("roles") or {}, counselor, patient_label=patient)
     max_chars = int(cfg.get("max_chars", 24000))
     parts = split_chunks(transcript, max_chars) if len(transcript) > max_chars else [transcript]
     vocab = (reference or {}).get("vocabulary") or BUILTIN_REFERENCE.get("vocabulary", "")
@@ -9353,7 +9412,7 @@ def _norm_word(w):
 def patient_speech(d, counselor_label, patient_label=None):
     """What the patient said in a session — the patient's own transcript lines when the patient can be told
     apart (see map_patient), otherwise everyone but the counselor — else the note."""
-    lines = d.get("lines") or []
+    lines = timed_lines(d) or d.get("lines") or []
     roles = d.get("roles") or {}
     label = lambda l: roles.get(l.get("speaker"), l.get("speaker")) or ""
     names = list(dict.fromkeys(label(l) for l in lines))
@@ -9399,10 +9458,17 @@ def _speech_counts(text, hide_names):
     return out
 
 
+_LABEL_WORDS = frozenset(w for phrase in _CLINICIAN_WORDS + _PATIENT_WORDS + ("patients", "clients", "speaker")
+                         for w in re.findall(r"[a-z]+", phrase.lower()))
+
+
 def session_themes(client, sessions, counselor_label, top_words=15, patient_label=None):
     """{"columns": [(date, words)], "themes": [(theme, [per-session rate per 1000 words], total)],
-    "words": [(word, [counts per session], sessions_with_it)]} — oldest session first."""
+    "words": [(word, [counts per session], sessions_with_it)]} — oldest session first. Speaker labels
+    ("Patient", "Therapist", your own labels) are never counted as words the patient used."""
     hide_names = frozenset(p.lower() for name, _ in client_name_map(client) for p in name.split() if len(p) > 1)
+    hide_names |= _LABEL_WORDS | frozenset(w for lab in (counselor_label, patient_label) if lab
+                                           for w in re.findall(r"[a-z]+", lab.lower()))
     cols, theme_counts, word_counts, surface = [], [], [], {}
     for _, d in sorted(sessions, key=lambda x: session_sort_key(x[1])):
         if d.get("meta", {}).get("kind") == "parent":
@@ -10329,6 +10395,168 @@ def run_gui():
     root.bind_all("<Button-4>", _global_wheel, add="+")
     root.bind_all("<Button-5>", _global_wheel, add="+")
 
+    # ---- touchscreens: drag with a finger to scroll, flick to keep it gliding --------------------------
+    # Windows hands Tk a finger as a mouse, so a drag would select text or press buttons instead of
+    # scrolling. Mouse events that came from a finger or pen carry a mark (GetMessageExtraInfo); those
+    # drags scroll the nearest scrollable area instead. Settings › Touchscreen scrolling can also make
+    # every drag scroll (if a screen isn't recognized) or turn this off.
+    TOUCH = {"on": False, "pan": False, "w": None, "view": None, "y0": 0, "y": 0, "pos": 0.0, "v": 0.0,
+             "t": 0.0, "job": None, "replay": False, "press": None}
+    _NO_PAN = {"TScrollbar", "Scrollbar", "TScale", "Scale", "Panedwindow", "TPanedwindow", "Menu"}
+
+    def _from_finger():
+        mode = cfg.get("touch_scroll") or "auto"
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+        if not IS_WIN:
+            return False
+        try:
+            import ctypes
+            f = ctypes.windll.user32.GetMessageExtraInfo
+            f.restype = ctypes.c_ssize_t
+            return (f() & 0xFFFFFF00) == 0xFF515700        # MI_WP_SIGNATURE: touch or pen
+        except Exception:
+            return False
+
+    def _pan_view(w):
+        """The nearest area under w that can scroll (vertically) right now."""
+        cur = w
+        while cur is not None:
+            view = getattr(cur, "_touch_view", None)
+            try:
+                if view is None and cur.winfo_class() in ("Text", "Listbox", "Treeview"):
+                    view = cur
+                if view is not None:
+                    a, b = view.yview()
+                    if a > 0.0 or b < 1.0:
+                        return view
+            except (tk.TclError, AttributeError, TypeError):
+                pass
+            cur = getattr(cur, "master", None)
+        return None
+
+    def _glide_stop():
+        if TOUCH["job"] is not None:
+            _quiet(root.after_cancel, TOUCH["job"])
+            TOUCH["job"] = None
+
+    def _pan_to(view, pos):
+        a, b = view.yview()
+        TOUCH["pos"] = max(0.0, min(pos, 1.0 - (b - a)))
+        view.yview_moveto(TOUCH["pos"])
+        _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+
+    def _pan_by(view, dy):
+        """Move the content with the finger: dy pixels down shows what's above."""
+        a, b = view.yview()
+        _pan_to(view, TOUCH["pos"] - (b - a) * dy / max(1, view.winfo_height()))
+
+    def _touch_begin(w, e):
+        _glide_stop()
+        if TOUCH["replay"] or not isinstance(w, tk.Misc) or not _from_finger():
+            TOUCH["on"] = False
+            return False
+        try:
+            if w.winfo_class() in _NO_PAN:
+                return False
+        except tk.TclError:
+            return False
+        view = _pan_view(w)
+        if view is None:
+            return False
+        TOUCH.update(on=True, pan=False, w=w, view=view, y0=e.y_root, y=e.y_root, v=0.0, t=time.monotonic(),
+                     pos=view.yview()[0], press=None)
+        tags = w.bindtags()
+        if "TouchPan" not in tags:                    # its motion/release go to TouchPan first (below)
+            w.bindtags(("TouchPan",) + tags)
+            w._touch_tag_added = True
+        return True
+
+    def _touch_press_any(e):                          # any widget: the press itself goes through as usual
+        _touch_begin(e.widget, e)
+    root.bind_all("<ButtonPress-1>", _touch_press_any, add="+")
+
+    def _touch_press_list(e):
+        """Lists: a finger only selects a row when it lifts without scrolling (so scrolling the patient
+        list doesn't open whoever was under the finger)."""
+        if TOUCH["replay"]:
+            return None
+        if _touch_begin(e.widget, e):
+            TOUCH["press"] = (e.x, e.y)
+            return "break"
+        return None
+
+    def _touch_motion(e):
+        if not TOUCH["on"] or e.widget is not TOUCH["w"]:
+            return None
+        if not TOUCH["pan"]:
+            if abs(e.y_root - TOUCH["y0"]) < px(10):
+                return "break" if TOUCH["press"] else None
+            TOUCH["pan"] = True                        # it's a scroll, not a tap: undo the press
+            w = TOUCH["w"]
+            _quiet(lambda: w.state(["!pressed", "!active"]))
+            try:
+                if w.winfo_class() == "Text":
+                    w.tag_remove("sel", "1.0", "end")
+            except tk.TclError:
+                pass
+            TOUCH["y"] = e.y_root
+        dy = e.y_root - TOUCH["y"]
+        now = time.monotonic()
+        dt = max(now - TOUCH["t"], 1e-3)
+        TOUCH["v"] = 0.6 * TOUCH["v"] + 0.4 * (dy / dt)      # pixels a second, smoothed
+        TOUCH["y"], TOUCH["t"] = e.y_root, now
+        _quiet(_pan_by, TOUCH["view"], dy)
+        return "break"
+
+    def _glide():
+        TOUCH["job"] = None
+        view = TOUCH["view"]
+        TOUCH["v"] *= 0.94
+        if abs(TOUCH["v"]) < px(40) or view is None or not view.winfo_exists():
+            return
+        _quiet(_pan_by, view, TOUCH["v"] * 0.016)
+        TOUCH["job"] = root.after(16, _glide)
+
+    def _touch_release(e):
+        if TOUCH["replay"] or not TOUCH["on"] or e.widget is not TOUCH["w"]:
+            return None
+        w, panned, press = TOUCH["w"], TOUCH["pan"], TOUCH["press"]
+        TOUCH.update(on=False, pan=False, press=None)
+        if getattr(w, "_touch_tag_added", False):     # put its bindings back as they were
+            w._touch_tag_added = False
+            root.after_idle(lambda: _quiet(lambda: w.bindtags(tuple(t for t in w.bindtags() if t != "TouchPan"))))
+        if panned:
+            if time.monotonic() - TOUCH["t"] < 0.08 and abs(TOUCH["v"]) > px(250):
+                TOUCH["job"] = root.after(16, _glide)
+            return "break"
+        if press:                                     # a tap on a list: select the row now
+            TOUCH["replay"] = True
+            try:
+                w.event_generate("<ButtonPress-1>", x=press[0], y=press[1])
+                w.event_generate("<ButtonRelease-1>", x=press[0], y=press[1])
+            finally:
+                TOUCH["replay"] = False
+            return "break"
+        return None
+
+    root.bind_class("TouchPan", "<B1-Motion>", _touch_motion)
+    root.bind_class("TouchPan", "<ButtonRelease-1>", _touch_release)
+    root.bind_class("TouchPan", "<ButtonPress-1>", _touch_press_list)
+
+    def _lists_take_touch(e):                         # lists get TouchPan first from the start (see above)
+        w = e.widget
+        try:
+            tags = w.bindtags()
+            if "TouchPan" not in tags:
+                w.bindtags(("TouchPan",) + tags)
+        except (tk.TclError, AttributeError):
+            pass
+    root.bind_class("Treeview", "<Map>", _lists_take_touch, add="+")
+    root.bind_class("Listbox", "<Map>", _lists_take_touch, add="+")
+
     def _realize_tree(widget, width_hint):
         """Synchronously realize all Flow layouts and wraplengths inside widget before first paint."""
         for ch in widget.winfo_children():
@@ -10411,6 +10639,7 @@ def run_gui():
         outer._scroll_wheel = wheel
         canvas._scroll_wheel = wheel
         inner._scroll_wheel = wheel
+        outer._touch_view = canvas._touch_view = inner._touch_view = canvas      # finger scrolling (below)
 
         def realize_all():
             """Force Tk to lay out, map, and rasterize the entire page (including offscreen sections
@@ -14453,7 +14682,7 @@ def run_gui():
             self.progress_panel(box, owner=("review", sid)).pack(anchor="w", fill="x", pady=(px(4), 0))
 
             ttk.Label(box, text="Session map", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(4)))
-            m = session_map(d.get("lines"), d.get("roles") or {}, counselor, patient_label=patient)
+            m = session_map(timed_lines(d), d.get("roles") or {}, counselor, patient_label=patient)
             if m:
                 self.draw_session_map(box, m).pack(anchor="w", fill="x", padx=(0, px(8)))
                 facts = Flow(box, gap=px(8))             # the numbers as small tiles, not a paragraph
@@ -14463,7 +14692,8 @@ def run_gui():
                 tiles += [(f"{s_['pct']}%", f"{s_['label']} talking") for s_ in m["speakers"][:3]]
                 if q["total"]:
                     tiles.append((f"{q['open']} / {q['closed']}", "open / closed questions"))
-                tiles.append((f"{m['silence_pct']}%", "pauses"))
+                if not m.get("approx"):
+                    tiles.append((f"{m['silence_pct']}%", "pauses"))
                 for big, small in tiles:
                     tl = facts.add(ttk.Frame(facts, style="Card.TFrame", padding=(px(12), px(6))))
                     ttk.Label(tl, text=big, style="Strong.TLabel").pack(anchor="w")
@@ -14473,12 +14703,16 @@ def run_gui():
                     for hv in m["heavy"]:
                         ttk.Label(box, text=f"{fmt_ts(hv['t'])}   “{hv['quote']}”", style="Muted.TLabel",
                                   wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), 0))
+                if m.get("approx"):
+                    ttk.Label(box, text="Timings come from the transcript's timestamps, so talk time includes the "
+                                        "pauses after each turn.", style="Caption.TLabel", wraplength=px(760),
+                              justify="left").pack(anchor="w", pady=(px(8), 0))
                 ttk.Label(box, text="Tone follows only what the patient said (not your words or anyone else's): a "
                                     "simple count of feeling words every two minutes — a rough guide to where the "
                                     "session got heavy, not a measurement.",
                           style="Caption.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(8), 0))
             else:
-                ttk.Label(box, text="Only recorded sessions (with timings) have a session map.",
+                ttk.Label(box, text="Only sessions whose transcript has timestamps have a session map.",
                           style="Muted.TLabel").pack(anchor="w")
 
             for key, title, empty in (("feedback", "Skills feedback", "Click “Write feedback & find techniques” "
@@ -19854,7 +20088,8 @@ def run_gui():
                                                     + [x.strip() for x in extra_var.get().split(",") if x.strip()]),
                            "appearance": next((k for k, v in APPEARANCE.items() if v == appear_var.get()), "system"),
                            "date_format": next((k for k, v in DATE_FORMATS.items() if v == datefmt_var.get()), "iso"),
-                           "remote_accept": remote_var.get()}
+                           "remote_accept": remote_var.get(),
+                           "touch_scroll": next((k for k, v in TOUCH_MODES.items() if v == touch_var.get()), "auto")}
                 except NetworkBlocked as e:
                     return messagebox.showerror(APP_NAME, str(e), parent=win)
                 except ValueError:
@@ -20129,6 +20364,13 @@ def run_gui():
             pr(7, 2, None, ttk.Label(pg, text="Comma-separated, e.g. Parent/Guardian, Partner, Other. Used in Who's who and "
                                   "transcripts; earlier transcripts keep their labels.",
                       style="Caption.TLabel", wraplength=px(360), justify="left"))
+            TOUCH_MODES = {"auto": "Automatic (finger or pen)", "on": "Every drag scrolls", "off": "Off"}
+            touch_var = tk.StringVar(value=TOUCH_MODES.get(cfg.get("touch_scroll") or "auto", TOUCH_MODES["auto"]))
+            pr(8, 0, "Touchscreen scrolling", ttk.Combobox(pg, textvariable=touch_var, values=list(TOUCH_MODES.values()),
+                                                         state="readonly", width=22))
+            pr(8, 2, None, ttk.Label(pg, text="Drag with a finger to scroll pages, lists and notes; flick to keep "
+                                              "going. Choose “Every drag scrolls” if your screen isn't recognized.",
+                                     style="Caption.TLabel", wraplength=px(360), justify="left"))
             lay_prefs()
             ttk.Separator(prefs).grid(row=15, column=0, columnspan=4, sticky="ew", pady=px(2))
             ttk.Checkbutton(prefs, text="Offer to delete the recording after saving a session",

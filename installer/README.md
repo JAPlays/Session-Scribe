@@ -48,8 +48,10 @@ The result is in `dist\`: `SessionScribe-mistral-24b-<build>-setup.exe` plus sev
 Windows program can't be larger than 4 GB, so the installer comes in pieces. Keep them in one folder,
 and to hand it to someone, copy the whole folder (a 32 GB USB drive is enough).
 
-`-LlamaTag b6500` or `-PythonTag 20250918` pin the engine or Python version. By default the build uses
-the newest release, and `bundle.json` in the installed folder records which versions went in.
+The engine and Python versions are pinned: llama.cpp `b11900` and Python 3.12.16 (python-build-standalone
+`20261026`), both from 26 October 2026. To change them, pass `-LlamaTag`, or `-PythonTag` with
+`-PythonVersion`. `-LlamaTag latest` and `-PythonTag latest` use the newest release instead.
+`bundle.json` in the installed folder records which versions went in.
 
 ## How the app fits itself to a computer
 
