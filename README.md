@@ -20,10 +20,11 @@ at the top of the file. Every build is a commit in this repository, so the histo
 - **Patients.** Each patient has a case overview, treatment plan, Ask-AI chat about their record, and
   day-by-day sessions. The local AI reads patients' names (they never leave the computer), which keeps notes clear about who said what; Settings or a patient's profile can hide them instead.
 - **Progress & risk.** Risk timeline and safety-plan flags, scores, treatment-goal coverage, homework,
-  follow-ups and recurring themes. **↻ Refresh all** brings one patient's checks and case overview
-  up to date in one go.
+  follow-ups and recurring themes. **↻ Refresh &lt;patient code&gt;** brings that one patient's checks and
+  case overview up to date in one go.
 - **Home dashboard.** What needs attention across the caseload: risk, drafts to review, missing
-  notes, plans, scores, follow-ups, homework, goals. **↻ Refresh all patients** updates everyone.
+  notes, plans, scores, follow-ups, homework, goals. **↻ Refresh all patients** updates everyone,
+  as one task per patient in the queue.
 - **Tasks queue.** Everything you start (case overviews, refreshes, checks) runs one at a time.
   The Queue window's **Tasks** tab shows what's running, paused or waiting. From there you can
   pause, reorder or cancel any task.

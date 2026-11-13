@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.6"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.7"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13201,7 +13201,7 @@ def run_gui():
                            gap=px(16))
             if not sessions:
                 btn.config(state="disabled")
-            all_btn = head.add(ttk.Button(head, text="↻  Refresh all",
+            all_btn = head.add(ttk.Button(head, text=f"↻  Refresh {client.get('code') or 'this patient'}",
                                           command=lambda: self.refresh_all_patients(only_client=client, select="case")))
             if not sessions:
                 all_btn.config(state="disabled")
@@ -15105,7 +15105,7 @@ def run_gui():
             )
             if not sessions:
                 btn_here.config(state="disabled")
-            all_btn = head.add(ttk.Button(head, text="↻  Refresh all",
+            all_btn = head.add(ttk.Button(head, text=f"↻  Refresh {client.get('code') or 'this patient'}",
                                           command=lambda: self.refresh_all_patients(only_client=client, select="insights")))
             if not sessions:
                 all_btn.config(state="disabled")
@@ -16370,111 +16370,117 @@ def run_gui():
                 self.open_client(self.client_id, select="insights")
             return r
 
-        def refresh_all_patients(self, force=False, only_client=None, select=None):
-            """Refresh both Progress & risk (risk, treatment goals, follow-ups) AND Case overviews
-            for every active patient at once, or for one patient when only_client is given."""
-            if only_client is not None:
-                clients = [vault.load_client(only_client["id"])]
-            else:
-                clients = [c for c in vault.list_clients() if not c.get("archived")]
-            if not clients:
-                self.set_status("No active patients to refresh yet.")
-                return False
-            single = clients[0].get("code", "") if only_client is not None else ""
-            scope = single or f"All {len(clients)} active patient(s)"
-            bundles, ins_plan, total_ins = self._collect_insights_work(clients, force=force)
-            case_todo = []
-            with_docs = []
-            for c in clients:
-                sess = vault.sessions_for(c["id"])
-                if not case_overview_documented_days(sess):
-                    continue
-                with_docs.append((c["id"], c.get("code", "")))
-                if force or case_overview_stale_days(c, sess) > 0:
-                    case_todo.append((c["id"], c.get("code", "")))
-            if not total_ins and not case_todo:
-                if not with_docs:
-                    self.set_status("No active patients have session documentation to refresh yet.")
-                    return False
-                if not messagebox.askyesno(
-                    APP_NAME,
-                    (f"{single} already has an up-to-date Progress & risk and Case overview.\n\nRefresh everything anyway?"
-                     if single else
-                     f"All {len(with_docs)} active patient(s) already have up-to-date Progress & risk checks and Case overviews.\n\n"
-                     "Refresh everything for all patients anyway?"),
-                    parent=root,
-                ):
-                    self.set_status(f"{scope}: Progress & risk and Case overview are already up to date.")
-                    return False
-                bundles, ins_plan, total_ins = self._collect_insights_work(clients, force=True)
-                case_todo = list(with_docs)
+        def _patient_refresh_work(self, cid, force=False):
+            """What one patient's refresh would do: pending Progress & risk checks, and whether the
+            Case overview is missing or out of date."""
+            c = vault.load_client(cid)
+            bundles, plan, n_ins = self._collect_insights_work([c], force=force)
+            sess = vault.sessions_for(cid)
+            docs = bool(case_overview_documented_days(sess))
+            case = docs and (force or case_overview_stale_days(vault.load_client(cid), sess) > 0)
+            return {"id": cid, "code": c.get("code", ""), "bundles": bundles, "plan": plan, "n_ins": n_ins,
+                    "case": case, "docs": docs}
+
+        def _queue_patient_refresh(self, w, select=None):
+            """One task (its own line in Queue › Tasks) that refreshes one patient's Progress & risk
+            checks and Case overview."""
+            cid, code = w["id"], w["code"]
+            bundles, ins_plan, needs_case = w["bundles"], w["plan"], w["case"]
             job_cfg, orient = dict(cfg), self.settings.get("orientation", "")
-            n_cases = len(case_todo)
-            has_ins = bool(bundles)
 
             def job(p):
-                ins_share = 50.0 if (has_ins and n_cases) else (100.0 if has_ins else 0.0)
-                case_share = 100.0 - ins_share
-                n_pat, n_risk, n_goals, n_fu = 0, 0, 0, 0
-                if has_ins:
+                ins_share = (50.0 if needs_case else 100.0) if bundles else 0.0
+                n_pat = n_risk = n_goals = n_fu = 0
+                if bundles:
                     def ins_p(t, pct=None):
-                        scaled = ( float(pct) * ins_share / 100.0 ) if pct is not None else 0.0
-                        p(t, scaled)
+                        p(t, (float(pct) * ins_share / 100.0) if pct is not None else 0.0)
                     steps = _Steps(ins_p, ins_plan) if ins_plan else None
                     _, n_pat, n_risk, n_goals, n_fu = self._run_insights_bundles(job_cfg, bundles, steps, 0, ins_p)
-                done_cases = 0
-                for idx, (cid, code) in enumerate(case_todo):
-                    base = ins_share + (idx * case_share) / max(n_cases, 1)
-                    span = case_share / max(n_cases, 1)
-
-                    def sub_p(t, pct=None, _b=base, _s=span, _i=idx, _c=code):
-                        scaled = (_b + (_s * float(pct) / 100.0)) if pct is not None else _b
-                        p(f"[Case {_i + 1}/{n_cases} · {_c}] {t}", scaled)
-
-                    c_cur = vault.load_client(cid)
+                done_case = 0
+                if needs_case:
+                    def case_p(t, pct=None):
+                        p(f"Case overview · {t}",
+                          ins_share + ((100.0 - ins_share) * float(pct) / 100.0) if pct is not None else ins_share)
                     sess_dicts = [d for _, d in vault.sessions_for(cid)]
-                    if not sess_dicts:
-                        continue
-                    text = generate_case_overview(job_cfg, c_cur, sess_dicts, orient, sub_p)
-                    c_latest = vault.load_client(cid)
-                    c_latest["case_overview"] = {
-                        "text": text,
-                        "session_count": len({d["meta"].get("session_date") for d in sess_dicts}),
-                        "generated": datetime.now().isoformat(timespec="seconds"),
-                    }
-                    vault.save_client(c_latest)
-                    done_cases += 1
+                    if sess_dicts:
+                        text = generate_case_overview(job_cfg, vault.load_client(cid), sess_dicts, orient, case_p)
+                        c_latest = vault.load_client(cid)
+                        c_latest["case_overview"] = {
+                            "text": text,
+                            "session_count": len({d["meta"].get("session_date") for d in sess_dicts}),
+                            "generated": datetime.now().isoformat(timespec="seconds"),
+                        }
+                        vault.save_client(c_latest)
+                        done_case = 1
                 p("Done.", 100)
-                return n_pat, n_risk, n_goals, n_fu, done_cases
+                return n_risk, n_goals, n_fu, done_case
 
             def done(res):
-                n_pat, n_risk, n_goals, n_fu, done_cases = res
+                n_risk, n_goals, n_fu, done_case = res
                 self._sig = vault.signature()
-                if self.client_id and not self.wizard:
-                    self.open_client(self.client_id, select=select) if select else self.open_client(self.client_id)
-                elif not self.client_id and not self.wizard:
-                    self.show_home()
+                if self.wizard:
+                    pass
+                elif self.client_id == cid:
+                    self.open_client(cid, select=select) if select else self.open_client(cid)
+                elif not self.client_id:
+                    self.show_home_keep_scroll()
                 self.set_status(
-                    f"Refreshed {single or 'all patients'}: {done_cases} case overview{'s' if done_cases != 1 else ''}, "
+                    f"Refreshed {code}: {'case overview, ' if done_case else ''}"
                     f"{n_risk} risk record{'s' if n_risk != 1 else ''}, "
                     f"{n_goals} goal note{'s' if n_goals != 1 else ''}, "
                     f"{n_fu} follow-up{'s' if n_fu != 1 else ''}."
                 )
 
-            r = self.run_bg(
-                job,
-                done,
-                label=(f"refreshing progress, risk & case overview for {single}" if single
-                       else "refreshing progress, risk & case overviews for all patients"),
-                owner=("all", clients[0]["id"]) if single else ("all", "*"),
-                patient=single,
-                pausable=True,
-            )
-            if r and self.client_id and not self.wizard:
-                self.open_client(self.client_id, select=select) if select else self.open_client(self.client_id)
-            elif r and not self.client_id and not self.wizard:
-                self.show_home()
-            return r
+            return self.run_bg(job, done, label=f"refreshing progress, risk & case overview for {code}",
+                               owner=("all", cid), patient=code, pausable=True)
+
+        def refresh_all_patients(self, force=False, only_client=None, select=None):
+            """Refresh Progress & risk (risk, treatment goals, follow-ups) AND the Case overview.
+            With only_client: just that patient. Without (Home): every active patient, each as its own
+            task in the queue, so each can be paused, moved or cancelled on its own."""
+            if only_client is not None:
+                w = self._patient_refresh_work(only_client["id"], force=force)
+                if not w["n_ins"] and not w["case"]:
+                    if not w["docs"]:
+                        self.set_status(f"{w['code']} has no session documentation to refresh yet.")
+                        return False
+                    if not messagebox.askyesno(
+                            APP_NAME, f"{w['code']} already has an up-to-date Progress & risk and Case overview."
+                                      "\n\nRefresh everything anyway?", parent=root):
+                        self.set_status(f"{w['code']}: Progress & risk and Case overview are already up to date.")
+                        return False
+                    w = self._patient_refresh_work(only_client["id"], force=True)
+                r = self._queue_patient_refresh(w, select=select)
+                if r and self.client_id and not self.wizard:
+                    self.open_client(self.client_id, select=select) if select else self.open_client(self.client_id)
+                return r
+            clients = [c for c in vault.list_clients() if not c.get("archived")]
+            if not clients:
+                self.set_status("No active patients to refresh yet.")
+                return False
+            works = [self._patient_refresh_work(c["id"], force=force) for c in clients]
+            todo = [w for w in works if w["n_ins"] or w["case"]]
+            if not todo:
+                with_docs = [w for w in works if w["docs"]]
+                if not with_docs:
+                    self.set_status("No active patients have session documentation to refresh yet.")
+                    return False
+                if not messagebox.askyesno(
+                        APP_NAME, f"All {len(with_docs)} active patient(s) already have up-to-date Progress & risk "
+                                  "checks and Case overviews.\n\nRefresh everything for all patients anyway?",
+                        parent=root):
+                    self.set_status(f"All {len(clients)} active patient(s): Progress & risk and Case overview "
+                                    "are already up to date.")
+                    return False
+                works = [self._patient_refresh_work(w["id"], force=True) for w in with_docs]
+                todo = [w for w in works if w["n_ins"] or w["case"]]
+            results = [self._queue_patient_refresh(w) for w in todo]
+            n = len(todo)
+            self.set_status(f"Refreshing {n} patient{'s' if n != 1 else ''}, one at a time — each is its own "
+                            "task in Queue › Tasks.")
+            if not self.client_id and not self.wizard:
+                self.show_home_keep_scroll()
+            return next((r for r in results if r), False)
 
         # ======================================================== CASELOAD DASHBOARD
         def _dashboard_pairs(self):
