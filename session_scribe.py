@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.4"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.5"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -10703,7 +10703,21 @@ def run_gui():
                     canvas.update_idletasks()
             except tk.TclError:
                 pass
+            canvas._realized = True
+            apply_restore()
 
+        def apply_restore():
+            """Scroll to the spot a rebuilt page asked to keep (canvas._restore_y, in pixels from the top)."""
+            y = getattr(canvas, "_restore_y", None)
+            if not y or not canvas.winfo_exists():
+                return
+            try:
+                h = max(inner.winfo_reqheight(), 1)
+                canvas.yview_moveto(min(max(y / h, 0.0), 1.0))
+            except tk.TclError:
+                pass
+
+        canvas._apply_restore = apply_restore
         outer.realize_all = realize_all
         inner.realize_all = realize_all
         canvas.after_idle(realize_all)
@@ -16542,8 +16556,46 @@ def run_gui():
                 state = "minimized"
             self._save_dash_collapsed()
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.show_home_keep_scroll()
             return state
+
+        def _page_scroll_canvas(self):
+            """The open page's main scrolling canvas (the outermost one made by scrollable)."""
+            p = self.page
+            if p is None or not self._alive(p):
+                return None
+            queue = [p]
+            while queue:
+                w = queue.pop(0)
+                if isinstance(w, tk.Canvas) and getattr(w, "_apply_restore", None):
+                    return w
+                try:
+                    queue.extend(w.winfo_children())
+                except tk.TclError:
+                    pass
+            return None
+
+        def show_home_keep_scroll(self):
+            """Rebuild Home (after a Hide, ✕, Unhide or ticked follow-up) and stay at the same scroll
+            position instead of jumping back to the top."""
+            y = None
+            old = self._page_scroll_canvas() if self._page_is_home_now() else None
+            if old is not None:
+                try:
+                    sr = str(old.cget("scrollregion")).split()
+                    h = float(sr[3]) if len(sr) == 4 else 0.0
+                    y = old.yview()[0] * h
+                except (tk.TclError, ValueError):
+                    y = None
+            self.show_home()
+            new = self._page_scroll_canvas()
+            if new is not None and y:
+                new._restore_y = y
+                if getattr(new, "_realized", False):
+                    new._apply_restore()
+
+        def _page_is_home_now(self):
+            return bool(getattr(self, "_page_is_home", False)) and not self.client_id and not self.wizard
 
         def dismiss_dashboard_items(self, client_or_id, dkeys, refresh=True):
             """Hide/dismiss one or more dashboard items for a client."""
@@ -16564,7 +16616,7 @@ def run_gui():
                 if getattr(self, "_dash_memo", None) is not None:
                     self._dash_memo = (self._sig, self._dash_memo[1], self._dash_memo[2])
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.show_home_keep_scroll()
             return added
 
         def dismiss_dashboard_batch(self, client_dkey_pairs, refresh=True):
@@ -16577,7 +16629,7 @@ def run_gui():
             for cid, dkeys in by_cid.items():
                 total += self.dismiss_dashboard_items(cid, dkeys, refresh=False)
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.show_home_keep_scroll()
             return total
 
         def restore_dashboard_items(self, client_or_id=None, section_key=None, refresh=True):
@@ -16606,7 +16658,7 @@ def run_gui():
                 if getattr(self, "_dash_memo", None) is not None:
                     self._dash_memo = (self._sig, self._dash_memo[1], self._dash_memo[2])
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.show_home_keep_scroll()
             return restored
 
         def permanently_dismiss_dashboard_rows(self, rows, refresh=True):
@@ -16676,7 +16728,7 @@ def run_gui():
                 else:
                     self._sig = vault.signature()
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.show_home_keep_scroll()
             return removed_count
 
         def _dashboard(self, f):
@@ -16835,7 +16887,7 @@ def run_gui():
                                 variable=v,
                                 command=lambda r=r: (
                                     self.set_followup(r["client"], r["fid"], True, reopen=False),
-                                    self.show_home(),
+                                    self.show_home_keep_scroll(),
                                 ),
                             ).pack(side="left")
                         ttk.Label(
