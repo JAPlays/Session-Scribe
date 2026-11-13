@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.12.7"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.12.8"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -3379,6 +3379,8 @@ class Vault:
         # Decrypted files kept in memory, keyed by the file's (mtime, size): a file is read from the shared
         # drive again only if it changed (e.g. synced from the other computer). Wiped when the app locks.
         self._plain = collections.OrderedDict()       # "s:<sid>" / "c:<cid>" -> (stamp, plaintext bytes)
+        self._parsed = {}                             # "s:<sid>" / "c:<cid>" -> (stamp, parsed dict)
+        self._dir_cache = {}                          # folder -> (timestamp, entries)
         self._plain_bytes = 0
         self._clock = threading.Lock()
         self._index_dirty, self._index_saved = False, 0.0
@@ -3433,8 +3435,9 @@ class Vault:
             self.save_local_index()
         return key is not None
 
-    # --- speed: what's already been decrypted isn't read from the shared drive again
-    CACHE_BUDGET = 96 * 1024 * 1024        # decrypted sessions kept in memory (most recently used)
+    # --- speed: what's already been decrypted & parsed stays in RAM (512 MB budget)
+    CACHE_BUDGET = 512 * 1024 * 1024       # decrypted sessions kept in memory (most recently used)
+    SCAN_TTL = 3.0                         # seconds to reuse folder listings without re-statting disk
 
     @staticmethod
     def _stamp_of(path):
@@ -3452,7 +3455,7 @@ class Vault:
                 return hit[1]
         return None
 
-    def _cache_put(self, key, stamp, plain):
+    def _cache_put(self, key, stamp, plain, parsed=None):
         if stamp is None:
             return
         with self._clock:
@@ -3460,33 +3463,51 @@ class Vault:
             if old is not None:
                 self._plain_bytes -= len(old[1])
             self._plain[key] = (stamp, plain)
+            if parsed is not None:
+                self._parsed[key] = (stamp, parsed)
+            else:
+                self._parsed.pop(key, None)
             self._plain_bytes += len(plain)
             while self._plain_bytes > self.CACHE_BUDGET:      # drop the least recently used sessions
                 victim = next((k for k in self._plain if k.startswith("s:") and k != key), None)
                 if victim is None:                              # (patient files are small: always kept)
                     break
                 self._plain_bytes -= len(self._plain.pop(victim)[1])
+                self._parsed.pop(victim, None)
 
     def _cache_drop(self, key):
         with self._clock:
             old = self._plain.pop(key, None)
             if old is not None:
                 self._plain_bytes -= len(old[1])
+            self._parsed.pop(key, None)
 
     def forget_plaintext(self):
         """Drop every decrypted file from memory (the app locked)."""
         with self._clock:
             self._plain.clear()
+            self._parsed.clear()
+            self._dir_cache.clear()
             self._plain_bytes = 0
 
-    def _read_cached(self, key, path, stamp=None):
+    def _read_cached(self, key, path, stamp=None, readonly=False):
         stamp = stamp if stamp is not None else self._stamp_of(path)
+        with self._clock:
+            phit = self._parsed.get(key)
+            if phit is not None and stamp is not None and phit[0] == stamp:
+                self._plain.move_to_end(key)
+                return phit[1] if readonly else copy.deepcopy(phit[1])
         plain = self._cached(key, stamp)
         if plain is None:
             with open(path, "rb") as f:
                 plain = self.fernet.decrypt(f.read())
-            self._cache_put(key, stamp, plain)
-        return json.loads(plain.decode("utf-8"))
+            obj = json.loads(plain.decode("utf-8"))
+            self._cache_put(key, stamp, plain, obj)
+        else:
+            obj = json.loads(plain.decode("utf-8"))
+            with self._clock:
+                self._parsed[key] = (stamp, obj)
+        return obj if readonly else copy.deepcopy(obj)
 
     def _local_index_path(self):
         vid = hashlib.sha256(os.path.abspath(self.folder).encode("utf-8")).hexdigest()[:16]
@@ -3548,6 +3569,12 @@ class Vault:
         memo = getattr(self._tl, "memo", None)
         if memo is not None and d in memo:
             return memo[d]
+        now = time.monotonic()
+        hit = self._dir_cache.get(d)
+        if hit is not None and (now - hit[0]) < self.SCAN_TTL:
+            if memo is not None:
+                memo[d] = hit[1]
+            return hit[1]
         out = []
         with os.scandir(d) as it:
             for e in it:
@@ -3557,6 +3584,7 @@ class Vault:
                     except OSError:
                         continue
                     out.append((e.name, e.path, (st.st_mtime_ns, st.st_size)))
+        self._dir_cache[d] = (now, out)
         if memo is not None:
             memo[d] = out
         return out
@@ -3573,6 +3601,7 @@ class Vault:
             self._tl.memo = None
 
     def _changed(self, d):
+        self._dir_cache.pop(d, None)
         memo = getattr(self._tl, "memo", None)
         if memo:
             memo.pop(d, None)
@@ -3659,9 +3688,11 @@ class Vault:
         if stamp is None:
             return
         meta = dict(data.get("meta", {}))
+        is_parent = meta.get("kind") == "parent"
         meta["_x"] = {"note": bool((data.get("note") or "").strip()),          # enough for the dashboard and
-                      "tx": bool((data.get("transcript") or "").strip()),      # the checklists without reading
-                      "rc": data.get("risk_check"), "gc": data.get("goals_check")}   # the whole session again
+                      "pnote": (data.get("note") or "") if is_parent else "",  # contact follow-up sync without reading
+                      "tx": bool((data.get("transcript") or "").strip()),      # the whole session again
+                      "rc": data.get("risk_check"), "gc": data.get("goals_check")}
         with self._ilock:
             self._idx[sid] = (stamp, meta)
             self._index_dirty = True
@@ -3673,14 +3704,15 @@ class Vault:
         out = {}
         for sid, meta in self.session_index().items():
             x = meta.get("_x")
-            if x is None:
+            if x is None or (meta.get("kind") == "parent" and "pnote" not in x):
                 try:
                     d = self.load_session(sid)
                     self._remember(sid, os.path.join(self.sessions_dir, sid + ".enc"), d)   # summarised from now on
                 except Exception:
                     continue
             else:
-                d = {"meta": {k: v for k, v in meta.items() if k != "_x"}, "note": "·" if x.get("note") else "",
+                note_val = x.get("pnote", "") if meta.get("kind") == "parent" else ("·" if x.get("note") else "")
+                d = {"meta": {k: v for k, v in meta.items() if k != "_x"}, "note": note_val,
                      "transcript": "·" if x.get("tx") else "", "risk_check": x.get("rc"), "goals_check": x.get("gc")}
             out.setdefault(d.get("meta", {}).get("client_id"), []).append((sid, d))
         return out
@@ -3891,13 +3923,35 @@ class Vault:
 # --------------------------------------------------------------------------- #
 # Setup checks and installers
 # --------------------------------------------------------------------------- #
-def engine_installed():
+_SETUP_PROBES = {}
+_PROBE_LOCK = threading.Lock()
+
+
+def invalidate_setup_probes():
+    """Clear cached environment/model probes after an installer or download finishes."""
+    with _PROBE_LOCK:
+        _SETUP_PROBES.clear()
     importlib.invalidate_caches()
-    return importlib.util.find_spec("whisperx") is not None
+
+
+def engine_installed():
+    with _PROBE_LOCK:
+        if "engine" in _SETUP_PROBES:
+            return _SETUP_PROBES["engine"]
+    res = importlib.util.find_spec("whisperx") is not None
+    with _PROBE_LOCK:
+        _SETUP_PROBES["engine"] = res
+    return res
 
 
 def ffmpeg_installed():
-    return shutil.which("ffmpeg") is not None
+    with _PROBE_LOCK:
+        if "ffmpeg" in _SETUP_PROBES:
+            return _SETUP_PROBES["ffmpeg"]
+    res = shutil.which("ffmpeg") is not None
+    with _PROBE_LOCK:
+        _SETUP_PROBES["ffmpeg"] = res
+    return res
 
 
 def _hf_hub_dir():
@@ -3907,6 +3961,9 @@ def _hf_hub_dir():
 
 def cached_whisper_models():
     """Whisper model sizes fully present in the Hugging Face cache (have model.bin)."""
+    with _PROBE_LOCK:
+        if "whisper_cached" in _SETUP_PROBES:
+            return list(_SETUP_PROBES["whisper_cached"])
     import glob
     hub, sizes = _hf_hub_dir(), set()
     for d in glob.glob(os.path.join(hub, "models--*")):
@@ -3916,7 +3973,10 @@ def cached_whisper_models():
         size = re.sub(r"^.*?whisper-", "", name)
         size = re.sub(r"-ct2$", "", size)
         sizes.add(size)
-    return sorted(sizes)
+    res = sorted(sizes)
+    with _PROBE_LOCK:
+        _SETUP_PROBES["whisper_cached"] = res
+    return list(res)
 
 
 def models_status(cfg, hf_token):
@@ -3926,20 +3986,26 @@ def models_status(cfg, hf_token):
     lang = (cfg.get("language") or "en").lower()
     align = None
     if lang == "en":
-        torch_home = os.environ.get("TORCH_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "torch")
-        ckpt = os.path.join(torch_home, "hub", "checkpoints")
-        try:
-            align = any(f.startswith("wav2vec2_fairseq_base_ls960_asr_ls960") for f in os.listdir(ckpt))
-        except OSError:
-            align = False
+        with _PROBE_LOCK:
+            align = _SETUP_PROBES.get("align_en")
+        if align is None:
+            torch_home = os.environ.get("TORCH_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "torch")
+            ckpt = os.path.join(torch_home, "hub", "checkpoints")
+            try:
+                align = any(f.startswith("wav2vec2_fairseq_base_ls960_asr_ls960") for f in os.listdir(ckpt))
+            except OSError:
+                align = False
+            with _PROBE_LOCK:
+                _SETUP_PROBES["align_en"] = align
     speaker = speaker_model_cached() if hf_token else None
     return {"whisper": model in cached, "cached": cached, "align": align, "speaker": speaker}
 
 
 def speaker_model_cached():
-    """True if a complete pyannote speaker model is on disk. Newer WhisperX uses
-    speaker-diarization-community-1 (one download containing everything); older
-    versions use speaker-diarization-3.x plus a separate segmentation-3.0 model."""
+    """True if a complete pyannote speaker model is on disk."""
+    with _PROBE_LOCK:
+        if "speaker_cached" in _SETUP_PROBES:
+            return _SETUP_PROBES["speaker_cached"]
     import glob
     hub = _hf_hub_dir()
 
@@ -3954,7 +4020,10 @@ def speaker_model_cached():
     community = has("speaker-diarization-community", "config.yaml") and (
         has("speaker-diarization-community", weights) or has("speaker-diarization-community", "**/*.safetensors"))
     legacy = has("speaker-diarization-3", "config.yaml") and has("segmentation-3", weights)
-    return community or legacy
+    res = community or legacy
+    with _PROBE_LOCK:
+        _SETUP_PROBES["speaker_cached"] = res
+    return res
 
 
 def run_streamed(cmd, log, env=None):
@@ -4548,16 +4617,23 @@ def shortcut_icon_fix():
 
 def shortcut_exists():
     """Is there already a Session Scribe shortcut/app on this computer?"""
+    with _PROBE_LOCK:
+        if "shortcut" in _SETUP_PROBES:
+            return _SETUP_PROBES["shortcut"]
     home = os.path.expanduser("~")
     if IS_MAC:
-        return os.path.isdir(os.path.join(home, "Applications", "Session Scribe.app"))
-    if IS_WIN:
-        for desk in (os.path.join(home, "Desktop"), os.path.join(home, "OneDrive", "Desktop"),
-                     os.path.join(os.environ.get("PUBLIC", ""), "Desktop")):
-            if os.path.isfile(os.path.join(desk, "Session Scribe.lnk")):
-                return True
-        return False
-    return os.path.isfile(os.path.join(APP_DIR, "session_scribe.sh"))
+        res = os.path.isdir(os.path.join(home, "Applications", "Session Scribe.app"))
+    elif IS_WIN:
+        res = any(
+            os.path.isfile(os.path.join(desk, "Session Scribe.lnk"))
+            for desk in (os.path.join(home, "Desktop"), os.path.join(home, "OneDrive", "Desktop"),
+                         os.path.join(os.environ.get("PUBLIC", ""), "Desktop"))
+        )
+    else:
+        res = os.path.isfile(os.path.join(APP_DIR, "session_scribe.sh"))
+    with _PROBE_LOCK:
+        _SETUP_PROBES["shortcut"] = res
+    return res
 
 
 def desktop_shortcut(launcher, log=lambda t: None):
@@ -4795,8 +4871,13 @@ IMPORT_EXTS = (".txt", ".md", ".docx", ".pdf")
 
 
 def pdf_support():
-    importlib.invalidate_caches()
-    return importlib.util.find_spec("pypdf") is not None
+    with _PROBE_LOCK:
+        if "pdf" in _SETUP_PROBES:
+            return _SETUP_PROBES["pdf"]
+    res = importlib.util.find_spec("pypdf") is not None
+    with _PROBE_LOCK:
+        _SETUP_PROBES["pdf"] = res
+    return res
 
 
 def install_pdf_support(log):
@@ -8260,6 +8341,15 @@ def worksheet_root(cfg):
     return os.path.join(data_root(cfg), WORKSHEET_DIR)
 
 
+def worksheet_count(folder):
+    """Fast count of worksheet files without opening or parsing PDFs/DOCXs."""
+    try:
+        with os.scandir(folder) as it:
+            return sum(1 for e in it if e.name.lower().endswith(WORKSHEET_TYPES) and not e.name.startswith("~$"))
+    except OSError:
+        return 0
+
+
 def worksheet_catalog(folder, cache_path=None):
     """[{"title", "file", "summary"}] for the library (each file's opening text, cached by modification time)."""
     try:
@@ -8833,64 +8923,89 @@ DASH_PLAN_SOON = 7            # plan reviews due within this many days are liste
 DASH_HOMEWORK_DAYS = 7        # homework still "assigned" after this many days, or after a later session
 
 
-def caseload(pairs, today=None):
+def dash_item_key(category, row):
+    """Stable key for a dashboard item so hiding/dismissing it persists across refreshes."""
+    if row.get("dkey"):
+        return row["dkey"]
+    if category == "followups" and row.get("fid"):
+        return f"followups:{row['fid']}"
+    if category == "homework" and row.get("hid"):
+        return f"homework:{row['hid']}:{row.get('when', '')}"
+    txt = row.get("text", "")
+    if category == "goals":
+        txt = re.sub(r"^Goal not worked on in \d+ sessions:\s*", "goal:", txt)
+    elif category == "plans":
+        txt = re.sub(r"\(\d+ sessions\)", "", txt).strip()
+    return f"{category}:{row.get('when', '')}:{txt}"
+
+
+def caseload(pairs, today=None, include_dismissed=False):
     """pairs: [(client, sessions)] (active patients). Returns {category: [row]} — each row has "client",
-    "text", "when", and where to open it ("select")."""
+    "text", "when", "dkey", and where to open it ("select")."""
     today = today or date.today().isoformat()
     soon = (date.fromisoformat(today) + timedelta(days=DASH_PLAN_SOON)).isoformat()
     old_hw = (date.fromisoformat(today) - timedelta(days=DASH_HOMEWORK_DAYS)).isoformat()
     out = {k: [] for k in ("review", "plans", "no_note", "risk", "scores", "followups", "homework", "goals")}
     for c, sessions in pairs:
+        perm_dismissed = set(c.get("permanently_dismissed_dashboard") or [])
+        dismissed = set() if include_dismissed else set(c.get("dismissed_dashboard") or [])
+        raw = {k: [] for k in out}
         days = sorted({d["meta"].get("session_date") or "" for _, d in sessions})
         for sid, d in sessions:
             m = d.get("meta", {})
             day = m.get("session_date") or ""
             if m.get("needs_review"):
-                out["review"].append({"client": c, "text": f"{session_label(m)} — {m.get('review_reason') or 'drafted unattended'}",
+                raw["review"].append({"client": c, "sid": sid, "text": f"{session_label(m)} — {m.get('review_reason') or 'drafted unattended'}",
                                       "when": day, "select": f"day:{day}"})
             if (d.get("transcript") or "").strip() and not (d.get("note") or "").strip() and m.get("source") != "imported":
-                out["no_note"].append({"client": c, "text": f"{session_label(m)} — transcript saved, no note yet",
+                raw["no_note"].append({"client": c, "sid": sid, "text": f"{session_label(m)} — transcript saved, no note yet",
                                        "when": day, "select": f"day:{day}"})
         plan = current_plan(c)
         due = plan_review_due(plan) if plan else None
         if due and due.isoformat() <= soon:
-            out["plans"].append({"client": c, "text": ("Treatment plan review overdue since " if due.isoformat() < today
+            raw["plans"].append({"client": c, "text": ("Treatment plan review overdue since " if due.isoformat() < today
                                                        else "Treatment plan review due ") + fmt_date(due.isoformat()),
                                  "when": due.isoformat(), "select": "plan"})
         elif not plan and len(days) >= 3:
-            out["plans"].append({"client": c, "text": f"No treatment plan yet ({len(days)} sessions)", "when": days[-1],
+            raw["plans"].append({"client": c, "text": f"No treatment plan yet ({len(days)} sessions)", "when": days[-1],
                                  "select": "plan"})
         rs = risk_summary(c, sessions)
         for r in rs["recent"][:2]:
-            out["risk"].append({"client": c, "text": f"{r['type']}: {r['summary']}", "when": r["date"],
+            raw["risk"].append({"client": c, "text": f"{r['type']}: {r['summary']}", "when": r["date"],
                                 "select": f"day:{r['date']}"})
         if rs["needs_plan"]:
-            out["risk"].append({"client": c, "text": "Recent risk documented but no safety plan mentioned or on file",
+            raw["risk"].append({"client": c, "text": "Recent risk documented but no safety plan mentioned or on file",
                                 "when": rs["recent"][0]["date"], "select": "insights:risk"})
         for kind in MEASURES:
             t = measure_trend(c, kind)
             if t and t["item9"]:
-                out["risk"].append({"client": c, "text": f"PHQ-9 item 9 answered {t['latest']['items'][8]}",
+                raw["risk"].append({"client": c, "text": f"PHQ-9 item 9 answered {t['latest']['items'][8]}",
                                     "when": t["latest"]["date"], "select": "insights:scores"})
             if t and t["worse"]:
-                out["scores"].append({"client": c, "text": f"{kind} {t['previous']['total']} → {t['latest']['total']} "
+                raw["scores"].append({"client": c, "text": f"{kind} {t['previous']['total']} → {t['latest']['total']} "
                                                            f"({measure_band(kind, t['latest']['total'])})",
                                       "when": t["latest"]["date"], "select": "insights:scores"})
         for x in c.get("followups") or []:
             if not x.get("done"):
-                out["followups"].append({"client": c, "text": x["text"], "when": x.get("date") or "", "fid": x["id"],
+                raw["followups"].append({"client": c, "text": x["text"], "when": x.get("date") or "", "fid": x["id"],
                                          "select": "insights:followups"})
         for x in c.get("homework") or []:
             if x.get("status") == "assigned" and ((x.get("date") or today) <= old_hw
                                                    or any(dd > (x.get("date") or "") for dd in days)):
-                out["homework"].append({"client": c, "text": f"Check homework: {x['title']}", "when": x.get("date") or "",
-                                        "select": "insights:homework"})
+                raw["homework"].append({"client": c, "text": f"Check homework: {x['title']}", "when": x.get("date") or "",
+                                        "hid": x.get("id", ""), "select": "insights:homework"})
         try:
             for g, n, since in goals_summary(c, sessions)["stale"]:
-                out["goals"].append({"client": c, "text": f"Goal not worked on in {n} sessions: {g}",
+                raw["goals"].append({"client": c, "text": f"Goal not worked on in {n} sessions: {g}",
                                      "when": since or "", "select": "insights:goals"})
         except Exception:
             pass
+        for k, items in raw.items():
+            for it in items:
+                it["category"] = k
+                it["dkey"] = dash_item_key(k, it)
+                if it["dkey"] not in perm_dismissed and it["dkey"] not in dismissed:
+                    out[k].append(it)
     for k in out:
         out[k].sort(key=lambda r: r["when"] or "", reverse=k not in ("plans", "followups", "homework"))
     return out
@@ -8948,6 +9063,32 @@ def generate_case_overview(cfg, client, sessions, orientation, progress):
         "source_kind": kind, "sessions": source}))
 
 
+def case_overview_documented_days(sessions):
+    """Session dates that have non-transcript clinical documentation."""
+    pairs = [(None, d) if isinstance(d, dict) else d for d in sessions]
+    return [
+        (day, recs) for day, recs in group_by_date(pairs)
+        if any(d.get(k, "").strip() for _, k, _, d in day_docs(recs) if k != "transcript")
+    ]
+
+
+def case_overview_stale_days(client, sessions):
+    """How many documented session dates are new or updated since the case overview was generated
+    (or total documented dates if no case overview exists yet). Returns 0 if up to date or no docs."""
+    days = case_overview_documented_days(sessions)
+    if not days:
+        return 0
+    case = client.get("case_overview") or {}
+    if not case.get("text"):
+        return len(days)
+    gen = case.get("generated", "")
+    return sum(
+        1 for _, recs in days
+        if max((d["meta"].get("updated") or d["meta"].get("created") or "") for _, d in recs) > gen
+    )
+
+
+
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
@@ -8969,8 +9110,8 @@ THEME_PACKAGE = "sv-ttk"        # Microsoft's Windows 11 "Sun Valley" look for T
 
 
 def theme_installed():
-    importlib.invalidate_caches()
-    return importlib.util.find_spec("sv_ttk") is not None
+    # Built-in hardware-accelerated vector theme is always active (avoids sv_ttk 1px PNG tile lag)
+    return True
 
 
 def ensure_theme_package():
@@ -9452,35 +9593,15 @@ def run_gui():
         for name in ("TFrame", "TLabel", "TCheckbutton", "TRadiobutton", "TLabelframe", "TLabelframe.Label"):
             style.configure(name, background=bg)
         style.configure("TLabelframe.Label", foreground=p["muted"], font=F["caption_strong"])
-        # Cards: a flat bordered panel in the page color, so text inside never sits in a
-        # different-colored box (the theme's card picture is a slightly different shade).
-        try:
-            r = card_image(p)
-            try:
-                style.element_create("Card.border", "image", _CARD["img"], border=r, sticky="nswe")
-            except tk.TclError:
-                pass                                   # this theme already has it (the picture was repainted)
-            style.layout("Card.TFrame", [("Card.border", {"sticky": "nswe"})])
-            style.configure("Card.TFrame", background=bg, borderwidth=0, relief="flat")
-        except tk.TclError:                            # no image support: the plain bordered box
-            style.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
-            style.configure("Card.TFrame", background=bg, relief="solid", borderwidth=1, bordercolor=p["border"],
-                            lightcolor=p["border"], darkcolor=p["border"])
+        # Cards & LabelFrames: pure vector borders (1 C FillRect call instead of tiling PhotoImages during scroll)
+        style.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
+        style.configure("Card.TFrame", background=bg, relief="solid", borderwidth=1, bordercolor=p["border"],
+                        lightcolor=p["border"], darkcolor=p["border"])
 
     def apply_theme(mode):
         resolved = mode if mode in ("light", "dark") else system_mode()
-        THEME.update(mode=resolved, P=PALETTES[resolved])
-        try:
-            import sv_ttk
-            sv_ttk.set_theme(resolved, root)
-            THEME["sv"] = True
-            try:
-                root.tk.call("configure_colors")       # what the theme would do later — do it now
-            except tk.TclError:
-                pass
-        except Exception:
-            THEME["sv"] = False
-            fallback_styles(THEME["P"])
+        THEME.update(mode=resolved, P=PALETTES[resolved], sv=False)
+        fallback_styles(THEME["P"])
         fix_fonts()
         base_styles(THEME["P"])
         custom_styles(THEME["P"])
@@ -9550,56 +9671,158 @@ def run_gui():
         w.pack(side="left", fill="both", expand=True)
         return box, w
 
+    _SCROLLING_UNTIL = [0.0]
+
+    def _find_scroll_canvas(w):
+        """Walk up from widget w to find the nearest enclosing scrollable canvas."""
+        cur = w
+        while cur is not None:
+            sc = getattr(cur, "_scroll_wheel", None)
+            if sc is not None:
+                return sc
+            cur = getattr(cur, "master", None)
+        return None
+
+    def _global_wheel(e):
+        sc = _find_scroll_canvas(getattr(e, "widget", None))
+        if sc is not None:
+            sc(e)
+
+    root.bind_all("<MouseWheel>", _global_wheel, add="+")
+    root.bind_all("<Button-4>", _global_wheel, add="+")
+    root.bind_all("<Button-5>", _global_wheel, add="+")
+
+    def _realize_tree(widget, width_hint):
+        """Synchronously realize all Flow layouts and wraplengths inside widget before first paint."""
+        for ch in widget.winfo_children():
+            if isinstance(ch, Flow):
+                ch._reflow(width_hint=width_hint)
+            _realize_tree(ch, width_hint)
+
     def scrollable(parent, padding=0):
-        """A vertically scrolling area (mouse wheel works); returns (outer, inner)."""
+        """A vertically scrolling area whose entire content is pre-loaded and pre-mapped up front
+        (even offscreen sections below the fold) so scrolling is instant and never lazy-loads."""
         outer = ttk.Frame(parent)
         canvas = register(tk.Canvas(outer, highlightthickness=0, borderwidth=0), "canvas")
-        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+
+        def _sb_cmd(*args):
+            _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+            canvas.yview(*args)
+
+        sb = ttk.Scrollbar(outer, orient="vertical", command=_sb_cmd)
         inner = ttk.Frame(canvas, padding=padding)
-        item = canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(item, width=e.width))
-        def on_scroll(lo, hi):                     # the scrollbar is only there when there's something to scroll
-            sb.set(lo, hi)
-            try:
-                fits = float(lo) <= 0.0 and float(hi) >= 1.0
-                if fits and sb.winfo_ismapped():
-                    sb.pack_forget()
-                elif not fits and not sb.winfo_ismapped():
-                    sb.pack(side="right", fill="y", before=canvas)
-            except tk.TclError:
-                pass
-        canvas.configure(yscrollcommand=on_scroll)
+        try:
+            pw = parent.winfo_width()
+        except Exception:
+            pw = 0
+        init_w = pw - px(24) if pw > px(200) else px(820)
+        item = canvas.create_window((0, 0), window=inner, anchor="nw", width=init_w)
+        _sr_job = [None]
+        _last_cw = [init_w]
+
+        def _flush_sr():
+            _sr_job[0] = None
+            if canvas.winfo_exists() and inner.winfo_exists():
+                try:
+                    w_ = max(_last_cw[0], inner.winfo_reqwidth(), 1)
+                    h_ = max(inner.winfo_reqheight(), 1)
+                    canvas.configure(scrollregion=(0, 0, w_, h_))
+                except tk.TclError:
+                    pass
+
+        def _on_inner_conf(_e=None):
+            if _sr_job[0] is None and canvas.winfo_exists():
+                _sr_job[0] = canvas.after_idle(_flush_sr)
+
+        def _on_canvas_conf(e):
+            if e.width > 1 and abs(e.width - _last_cw[0]) > 2:
+                _last_cw[0] = e.width
+                canvas.itemconfigure(item, width=e.width)
+                _on_inner_conf()
+
+        inner.bind("<Configure>", _on_inner_conf)
+        canvas.bind("<Configure>", _on_canvas_conf)
+        canvas.configure(yscrollcommand=sb.set, yscrollincrement=px(2))
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
+        wheel_state = {"steps": 0.0, "job": None}
+        step_px = max(1, px(2))
+
+        def wheel_flush():
+            wheel_state["job"] = None
+            n = int(wheel_state["steps"])
+            wheel_state["steps"] -= n
+            if n and canvas.winfo_exists():
+                _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+                canvas.yview_scroll(n, "units")
+
         def wheel(e):
-            if canvas.winfo_exists() and canvas.yview() != (0.0, 1.0):
-                canvas.yview_scroll(-1 if (e.num == 4 or e.delta > 0) else 1, "units")
+            if not canvas.winfo_exists() or canvas.yview() == (0.0, 1.0):
+                return
+            if e.num in (4, 5):
+                notches = 1.0 if e.num == 4 else -1.0
+            elif IS_MAC:
+                notches = e.delta / 4.0
+            else:
+                notches = e.delta / 120.0
+            _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+            wheel_state["steps"] -= (notches * px(72)) / step_px
+            if wheel_state["job"] is None:
+                wheel_state["job"] = canvas.after_idle(wheel_flush)
 
-        def enter(_):
-            canvas.bind_all("<MouseWheel>", wheel)
-            canvas.bind_all("<Button-4>", wheel)
-            canvas.bind_all("<Button-5>", wheel)
+        outer._scroll_wheel = wheel
+        canvas._scroll_wheel = wheel
+        inner._scroll_wheel = wheel
 
-        def leave(_):
-            for ev in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
-                canvas.unbind_all(ev)
-        outer.bind("<Enter>", enter)
-        outer.bind("<Leave>", leave)
+        def realize_all():
+            """Force Tk to lay out, map, and rasterize the entire page (including offscreen sections
+            below the fold) right now so nothing loads lazily during scrolling."""
+            if not (canvas.winfo_exists() and inner.winfo_exists()):
+                return
+            try:
+                _SCROLLING_UNTIL[0] = time.monotonic() + 0.4
+                cw = canvas.winfo_width()
+                target_w = cw if cw > px(200) else _last_cw[0]
+                _last_cw[0] = target_w
+                canvas.itemconfigure(item, width=target_w)
+                _realize_tree(inner, target_w)
+                inner.update_idletasks()
+                req_h = max(inner.winfo_reqheight(), 1)
+                canvas.configure(scrollregion=(0, 0, target_w, req_h))
+                vh = max(canvas.winfo_height(), px(500))
+                if req_h > vh:
+                    # Step viewport across offscreen slices so Tk calls Tk_MapWindow on every widget
+                    slices = max(2, min(12, (req_h // max(vh, 200)) + 1))
+                    for s_i in range(slices + 1):
+                        canvas.yview_moveto(s_i / slices)
+                        canvas.update_idletasks()
+                    canvas.yview_moveto(0.0)
+                    canvas.update_idletasks()
+            except tk.TclError:
+                pass
+
+        outer.realize_all = realize_all
+        inner.realize_all = realize_all
+        canvas.after_idle(realize_all)
         return outer, inner
 
     def _autowrap(e):
-        """Any label that wraps (wraplength set) re-wraps to the width it really has, so long text
-        never forces the window wider than the screen or pushes buttons off the edge."""
+        """Any label that wraps (wraplength set) re-wraps only when its container width genuinely changes,
+        and never during scrolling."""
+        if time.monotonic() < _SCROLLING_UNTIL[0]:
+            return
         w = e.widget
-        if not hasattr(w, "cget"):          # Tk-internal widget (e.g. inside a dropdown): not ours
+        if e.width <= px(60) or e.width == getattr(w, "_aw_last_w", None):
+            return
+        if not hasattr(w, "cget"):
             return
         try:
             wl = int(str(w.cget("wraplength")) or 0)
         except (tk.TclError, ValueError):
             return
         if wl <= 0:
+            w._aw_last_w = e.width
             return
         try:
             mgr = w.winfo_manager()
@@ -9611,15 +9834,18 @@ def run_gui():
                         w.pack_configure(fill="x")
                         info["fill"] = "x"
                 if info.get("fill") not in ("x", "both"):
-                    return                 # not stretched to its row: its width just follows the text
+                    w._aw_last_w = e.width
+                    return
             elif mgr == "grid":
                 sticky = str(w.grid_info().get("sticky", ""))
                 if not ("e" in sticky and "w" in sticky):
+                    w._aw_last_w = e.width
                     return
             else:
                 return
+            w._aw_last_w = e.width
             new = max(px(140), e.width - px(4))
-            if abs(new - wl) > px(3) and e.width > px(60):
+            if abs(new - wl) > px(6):
                 w.configure(wraplength=new)
         except tk.TclError:
             pass
@@ -9666,17 +9892,19 @@ def run_gui():
                 self.after_idle(self._reflow)
 
         def _on_conf(self, e):
-            if e.width != self._lastw:
+            if time.monotonic() < _SCROLLING_UNTIL[0]:
+                return
+            if e.width > 1 and e.width != self._lastw:
                 self._lastw = e.width
                 self._schedule()
 
-        def _reflow(self):
+        def _reflow(self, width_hint=None):
             self._pending = False
             if not self.winfo_exists():
                 return
             width = self.winfo_width()
             if width <= 1:
-                width = 10 ** 6
+                width = width_hint if (width_hint and width_hint > 1) else 10 ** 6
             rows, cur = [[]], 0
             for w, g in self.items:
                 if not w.winfo_exists() or str(w) in self.hidden:
@@ -10288,7 +10516,7 @@ def run_gui():
                                 + ": letterhead, Insurer(s), Staff Signature and plain-WNL items removed; "
                                   "primary focus moved to the top.")
             self.check_lmstudio()
-            for ev in ("<Key>", "<Motion>", "<Button>"):
+            for ev in ("<Key>", "<Button>"):
                 root.bind_all(ev, lambda e: setattr(self, "last_activity", time.time()), add="+")
             self._search_entry = None
             root.bind_all(f"<{MOD}-f>", self.global_find)
@@ -10304,7 +10532,24 @@ def run_gui():
             self.queue_restore()
             root.after(3_000, self.queue_persist_tick)
             _SleepWatch.start()
-            threading.Thread(target=checkpoint_tidy, daemon=True).start()
+            def _warm_everything():
+                _quiet(checkpoint_tidy)
+                _quiet(engine_installed)
+                _quiet(ffmpeg_installed)
+                _quiet(pdf_support)
+                _quiet(theme_installed)
+                _quiet(shortcut_exists)
+                _quiet(models_status, cfg, self.settings.get("hf_token", ""))
+                try:
+                    with vault.one_look():
+                        vault.light_sessions()
+                        for c_ in vault.list_clients():
+                            if not c_.get("archived"):
+                                vault.sessions_for(c_["id"])
+                except Exception:
+                    pass
+            threading.Thread(target=_warm_everything, daemon=True).start()
+            root.after(250, lambda: not getattr(self, "locked", False) and _quiet(self.open_setup, True))
 
         # ------------------------------------------------- multi-computer sync
         def sync_check(self):
@@ -10521,9 +10766,25 @@ def run_gui():
             except tk.TclError:
                 return False
 
+        def _owner_matches(self, page_owner, task_owner):
+            if page_owner is None or task_owner is None:
+                return False
+            if page_owner == task_owner:
+                return True
+            if isinstance(page_owner, tuple) and isinstance(task_owner, tuple):
+                p0, t0 = page_owner[0], task_owner[0]
+                ins = ("insights", "risk", "goals", "followups")
+                same_kind = (p0 == t0) or (t0 == "all") or (p0 in ins and t0 in ins)
+                if same_kind:
+                    p1 = page_owner[1] if len(page_owner) > 1 else "*"
+                    t1 = task_owner[1] if len(task_owner) > 1 else "*"
+                    if p1 == t1 or p1 == "*" or t1 == "*":
+                        return True
+            return False
+
         def page_owns_task(self):
-            return self.busy and getattr(self, "_page_owner", None) is not None and \
-                self._page_owner == getattr(self, "task_owner", None)
+            return self.busy and self._owner_matches(getattr(self, "_page_owner", None),
+                                                     getattr(self, "task_owner", None))
 
         def set_status(self, t, pct=None, from_task=False):
             code = getattr(self, "task_patient", "") if self.busy else ""
@@ -10795,7 +11056,7 @@ def run_gui():
         def waiting_text(self, owner):
             """'Waiting in line…' for a page whose task hasn't started yet (None if it isn't waiting)."""
             for i, j in enumerate(self.waitlist):
-                if owner is not None and j["owner"] == owner:
+                if self._owner_matches(owner, j["owner"]):
                     ahead = f"{self.task_label or 'the current task'}" + (f" and {i} more" if i else "")
                     return f"Waiting in line — this starts by itself after {ahead} finishes."
             return None
@@ -11019,16 +11280,38 @@ def run_gui():
             self.clip = None
 
         # ----------------------------------------------------- navigation
-        def show(self, builder):
+        def show(self, builder, is_home=False, home_key=None):
             if self.page is not None:
-                self.page.destroy()
+                if getattr(self, "_page_is_home", False) and self._alive(self.page):
+                    self.page.pack_forget()
+                else:
+                    self.page.destroy()
             self.progress_label = self.page_bar = self.page_pct = None
             self._page_owner = None
             self._page_editing = False             # set while text is being edited in place
+            if is_home:
+                cached_f = getattr(self, "_home_page_frame", None)
+                if (
+                    cached_f is not None
+                    and self._alive(cached_f)
+                    and home_key is not None
+                    and getattr(self, "_home_page_key", None) == home_key
+                    and not self.busy
+                ):
+                    self.page = cached_f
+                    self._page_is_home = True
+                    self.page.pack(fill="both", expand=True)
+                    return
+                if cached_f is not None and self._alive(cached_f):
+                    cached_f.destroy()
             self.page = ttk.Frame(self.main, padding=(px(28), px(22), px(28), px(18)))
             self.page.pack(fill="both", expand=True)
+            self._page_is_home = bool(is_home)
             self._page_builder = builder
             builder(self.page)
+            if is_home:
+                self._home_page_frame = self.page
+                self._home_page_key = home_key
 
         def leave(self, then):
             """Navigate away. An unfinished session (still transcribing/writing, or
@@ -11252,7 +11535,16 @@ def run_gui():
                                   + ("FileVault" if IS_MAC else "BitLocker") + " (disk encryption). Always "
                                   "review drafts before they go in the EHR.",
                           style="Caption.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(18), 0))
-            self.show(build)
+            with vault.one_look():
+                hkey = (
+                    vault.signature(),
+                    date.today().isoformat(),
+                    getattr(self, "setup_ok", None),
+                    len(self.clients),
+                    getattr(THEME, "get", lambda _k: None)("mode"),
+                    tuple(sorted(self._get_dash_collapsed())),
+                )
+            self.show(build, is_home=True, home_key=hkey)
 
         # ===================================================== client dialog
         def client_dialog(self, client=None):
@@ -13252,6 +13544,80 @@ def run_gui():
                     and self.client_id == client["id"] and not self.wizard:
                 self.open_client(client["id"], select="case")
 
+        def refresh_all_case_overviews(self, force=False):
+            """Create or update case overviews across all active patients that have session documentation."""
+            active = [c for c in vault.list_clients() if not c.get("archived")]
+            with_docs, todo = [], []
+            for c in active:
+                sess = vault.sessions_for(c["id"])
+                if not case_overview_documented_days(sess):
+                    continue
+                with_docs.append((c["id"], c.get("code", "")))
+                if force or case_overview_stale_days(c, sess) > 0:
+                    todo.append((c["id"], c.get("code", "")))
+            if not with_docs:
+                self.set_status("No active patients have session documentation for a case overview yet.")
+                return False
+            if not todo:
+                if not messagebox.askyesno(
+                    APP_NAME,
+                    f"All {len(with_docs)} patient case overview(s) are already up to date.\n\n"
+                    "Rewrite all of them anyway?",
+                    parent=root,
+                ):
+                    self.set_status("All patient case overviews are already up to date.")
+                    return False
+                todo = list(with_docs)
+            job_cfg, orient = dict(cfg), self.settings.get("orientation", "")
+            total = len(todo)
+
+            def job(p):
+                done_count = 0
+                for idx, (cid, code) in enumerate(todo):
+                    base = (idx * 100.0) / total
+                    span = 100.0 / total
+
+                    def sub_p(t, pct=None, _b=base, _s=span, _i=idx, _c=code):
+                        scaled = (_b + (_s * float(pct) / 100.0)) if pct is not None else _b
+                        p(f"[{_i + 1}/{total} · {_c}] {t}", scaled)
+
+                    c_cur = vault.load_client(cid)
+                    sess_dicts = [d for _, d in vault.sessions_for(cid)]
+                    if not sess_dicts:
+                        continue
+                    text = generate_case_overview(job_cfg, c_cur, sess_dicts, orient, sub_p)
+                    c_latest = vault.load_client(cid)
+                    c_latest["case_overview"] = {
+                        "text": text,
+                        "session_count": len({d["meta"].get("session_date") for d in sess_dicts}),
+                        "generated": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    vault.save_client(c_latest)
+                    done_count += 1
+                p("Done.", 100)
+                return done_count
+
+            def done(n):
+                self._sig = vault.signature()
+                if self.client_id and not self.wizard:
+                    self.open_client(self.client_id, select="case")
+                elif not self.client_id and not self.wizard:
+                    self.show_home()
+                self.set_status(
+                    f"Case overviews updated for {n} patient{'s' if n != 1 else ''}. Review them before relying on them."
+                )
+
+            r = self.run_bg(
+                job,
+                done,
+                label=f"updating case overviews for {total} patient{'s' if total != 1 else ''}",
+                owner=("case", "*"),
+                pausable=True,
+            )
+            if r and self.client_id and not self.wizard:
+                self.open_client(self.client_id, select="case")
+            return r
+
         # ======================================================== SESSION REVIEW (map, feedback, techniques)
         def _counselor_patient(self):
             labels = role_labels(cfg)
@@ -13647,6 +14013,23 @@ def run_gui():
             head = Flow(v, gap=px(8))
             head.pack(fill="x")
             head.add(ttk.Label(head, text="Progress & risk", style="H2.TLabel"))
+            _, g_todo_here = goals_todo(client, sessions)
+            r_todo_here = risk_todo(sessions)
+            f_todo_here = followups_todo(sessions)
+            n_here = len(g_todo_here) + len(r_todo_here) + len(f_todo_here)
+            btn_here = head.add(
+                ttk.Button(
+                    head,
+                    text=f"Refresh progress & risk ({n_here})" if n_here else "Refresh progress & risk",
+                    style="Accent.TButton" if n_here else "TButton",
+                    command=lambda: self.refresh_all_insights(only_client=client),
+                ),
+                gap=px(16),
+            )
+            if not sessions:
+                btn_here.config(state="disabled")
+            top_prog = ttk.Frame(v)
+            top_prog.pack(anchor="w", fill="x", pady=(px(4), 0))
             nb = ttk.Notebook(v)
             nb.pack(fill="both", expand=True, pady=(px(6), 0))
             built, frames = set(), {}
@@ -13713,7 +14096,21 @@ def run_gui():
                 if frames[t_][0] == want_tab:
                     nb.select(t_)
                     break
+            def sync_top_prog():
+                for ch in top_prog.winfo_children():
+                    ch.destroy()
+                t_own = getattr(self, "task_owner", None)
+                w_own = any(isinstance(j.get("owner"), tuple) and j["owner"][0] in ("insights", "all") for j in self.waitlist)
+                if (isinstance(t_own, tuple) and t_own[0] in ("insights", "all")) or w_own:
+                    self.progress_panel(top_prog, owner=("insights", client["id"])).pack(anchor="w", fill="x")
+
+            orig_changed = changed
+            def changed_with_prog(_e=None):
+                orig_changed(_e)
+                sync_top_prog()
+            nb.bind("<<NotebookTabChanged>>", changed_with_prog)
             show()
+            sync_top_prog()
             v._insights = nb
 
         def _ins_goals(self, fr, client, sessions):
@@ -14730,23 +15127,502 @@ def run_gui():
                 self._insight_tab = "followups"
                 self.open_client(client["id"], select="insights")
 
-        # ======================================================== CASELOAD DASHBOARD
-        def dashboard_data(self):
-            pairs, light = [], vault.light_sessions()
-            stamps = vault.client_stamps()              # one look at the folder, not one per patient
-            for c in self.clients:
-                if c.get("archived"):
+        def _collect_insights_work(self, clients, force=False):
+            """Sync contact-note follow-ups and gather pending (risk, goals, followups) checks per client."""
+            bundles = []
+            plan = []
+            total_items = 0
+            for c_meta in clients:
+                c = vault.load_client(c_meta["id"])
+                sessions = vault.sessions_for(c["id"])
+                if not sessions:
                     continue
+                if followups_sync(c, sessions):
+                    vault.save_client(c)
+                if force:
+                    for sid, d in sessions:
+                        dd = vault.load_session(sid)
+                        dd.pop("risk_check", None)
+                        dd.pop("goals_check", None)
+                        dd.pop("followups_scanned", None)
+                        vault.save_session(dd, sid)
+                    sessions = vault.sessions_for(c["id"])
+                r_todo = risk_todo(sessions)
+                goals, g_todo = goals_todo(c, sessions)
+                g_key = goals_key(goals) if goals else ""
+                f_todo = followups_todo(sessions)
+                n_c = len(r_todo) + len(g_todo) + len(f_todo)
+                if not n_c:
+                    continue
+                total_items += n_c
+                code = c.get("code", "")
+                for _, d, src, _ in r_todo:
+                    if RISK_RE.search(src):
+                        plan.append((f"{code} · reading {fmt_date(d['meta'].get('session_date'))} record for risk",
+                                     500, len(src) + 1500))
+                for _, d in g_todo:
+                    plan.append((f"{code} · checking goals in {fmt_date(d['meta'].get('session_date'))} note",
+                                 400, len(d.get("note", "")) + 1200))
+                for _, d, src, _ in f_todo:
+                    plan.append((f"{code} · finding follow-ups in {fmt_date(d['meta'].get('session_date'))} session",
+                                 300, len(src) + 1200))
+                bundles.append((c["id"], code, goals, g_key, r_todo, g_todo, f_todo))
+            return bundles, plan, total_items
+
+        def _run_insights_bundles(self, job_cfg, bundles, steps, step_idx=0, progress=None):
+            """Execute all collected risk, goals, and follow-up checks across patient bundles."""
+            n_pat, n_risk, n_goals, n_fu = 0, 0, 0, 0
+            for cid, code, goals, g_key, r_todo, g_todo, f_todo in bundles:
+                c_cur = vault.load_client(cid)
+                for sid, d, src, r_key in r_todo:
+                    uses_ai = RISK_RE.search(src) is not None
+                    if not uses_ai and progress is not None and steps is None:
+                        progress(f"{code} · checking {fmt_date(d['meta'].get('session_date'))} record for risk…", None)
+                    res = risk_check_record(job_cfg, c_cur, d, src, steps, step_idx)
+                    if uses_ai:
+                        step_idx += 1
+                    dd = vault.load_session(sid)
+                    dd["risk_check"] = dict(res, key=r_key, generated=datetime.now().isoformat(timespec="seconds"))
+                    vault.save_session(dd, sid)
+                    n_risk += 1
+                for sid, d in g_todo:
+                    items = goals_check_note(job_cfg, c_cur, d, goals, steps, step_idx)
+                    step_idx += 1
+                    dd = vault.load_session(sid)
+                    dd["goals_check"] = {
+                        "key": g_key,
+                        "items": items,
+                        "generated": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    vault.save_session(dd, sid)
+                    n_goals += 1
+                found_fu = []
+                for sid, d, src, f_key in f_todo:
+                    items = find_followups(job_cfg, c_cur, d, src, steps, step_idx)
+                    step_idx += 1
+                    dd = vault.load_session(sid)
+                    dd["followups_scanned"] = f_key
+                    vault.save_session(dd, sid)
+                    found_fu.append((sid, d["meta"].get("session_date", ""), items))
+                if found_fu:
+                    c_latest = vault.load_client(cid)
+                    fus = c_latest.setdefault("followups", [])
+                    have = {(x.get("sid"), fu_norm(x["text"])) for x in fus}
+                    for sid, day, items in found_fu:
+                        for it in items:
+                            if (sid, fu_norm(it)) not in have:
+                                fus.append({
+                                    "id": uuid.uuid4().hex[:12],
+                                    "text": it,
+                                    "sid": sid,
+                                    "date": day,
+                                    "source": "found in session",
+                                    "done": False,
+                                    "added": datetime.now().isoformat(timespec="seconds"),
+                                })
+                                have.add((sid, fu_norm(it)))
+                                n_fu += 1
+                    vault.save_client(c_latest)
+                n_pat += 1
+            return step_idx, n_pat, n_risk, n_goals, n_fu
+
+        def refresh_all_insights(self, only_client=None, force=False):
+            """Refresh Progress & risk (risk timeline, treatment goals, and session follow-ups)
+            across all active patients at once (or for a single patient when only_client is given)."""
+            if only_client is not None:
+                clients = [vault.load_client(only_client["id"])]
+            else:
+                clients = [c for c in vault.list_clients() if not c.get("archived")]
+            if not clients:
+                self.set_status("No active patients to check yet.")
+                return False
+            bundles, plan, total_items = self._collect_insights_work(clients, force=force)
+            if not total_items:
+                scope = clients[0].get("code", "Patient") if only_client is not None else f"All {len(clients)} active patient(s)"
+                if not messagebox.askyesno(
+                    APP_NAME,
+                    f"{scope}: all progress & risk records (risk, goals, and follow-ups) are already checked.\n\n"
+                    "Re-check all of them anyway?",
+                    parent=root,
+                ):
+                    self.set_status(f"{scope}: all progress & risk records are already up to date.")
+                    if self.client_id and not self.wizard:
+                        self.open_client(self.client_id, select="insights")
+                    return False
+                bundles, plan, total_items = self._collect_insights_work(clients, force=True)
+                if not total_items:
+                    self.set_status("No session records to check yet.")
+                    return False
+            job_cfg = dict(cfg)
+            single_code = clients[0].get("code", "") if only_client is not None else ""
+            owner = ("insights", clients[0]["id"]) if only_client is not None else ("insights", "*")
+            label = (
+                f"refreshing progress & risk for {single_code}"
+                if only_client is not None
+                else f"refreshing progress & risk for {len(bundles)} patient{'s' if len(bundles) != 1 else ''}"
+            )
+
+            def job(p):
+                steps = _Steps(p, plan) if plan else None
+                _, n_pat, n_risk, n_goals, n_fu = self._run_insights_bundles(job_cfg, bundles, steps, 0, p)
+                p("Done.", 100)
+                return n_pat, n_risk, n_goals, n_fu
+
+            def done(res):
+                n_pat, n_risk, n_goals, n_fu = res
+                self._sig = vault.signature()
+                if self.client_id and not self.wizard:
+                    self.open_client(self.client_id, select="insights")
+                elif not self.client_id and not self.wizard:
+                    self.show_home()
+                who = single_code if only_client is not None else f"{n_pat} patient{'s' if n_pat != 1 else ''}"
+                self.set_status(
+                    f"{who}: checked {n_risk} risk record{'s' if n_risk != 1 else ''}, "
+                    f"{n_goals} goal note{'s' if n_goals != 1 else ''}, "
+                    f"and found {n_fu} follow-up{'s' if n_fu != 1 else ''}."
+                )
+
+            r = self.run_bg(job, done, label=label, owner=owner, patient=single_code, pausable=True)
+            if r and self.client_id and not self.wizard:
+                self.open_client(self.client_id, select="insights")
+            return r
+
+        def refresh_all_patients(self, force=False):
+            """Refresh both Progress & risk (risk, treatment goals, follow-ups) AND Case overviews
+            for every active patient at once."""
+            clients = [c for c in vault.list_clients() if not c.get("archived")]
+            if not clients:
+                self.set_status("No active patients to refresh yet.")
+                return False
+            bundles, ins_plan, total_ins = self._collect_insights_work(clients, force=force)
+            case_todo = []
+            with_docs = []
+            for c in clients:
+                sess = vault.sessions_for(c["id"])
+                if not case_overview_documented_days(sess):
+                    continue
+                with_docs.append((c["id"], c.get("code", "")))
+                if force or case_overview_stale_days(c, sess) > 0:
+                    case_todo.append((c["id"], c.get("code", "")))
+            if not total_ins and not case_todo:
+                if not with_docs:
+                    self.set_status("No active patients have session documentation to refresh yet.")
+                    return False
+                if not messagebox.askyesno(
+                    APP_NAME,
+                    f"All {len(with_docs)} active patient(s) already have up-to-date Progress & risk checks and Case overviews.\n\n"
+                    "Refresh everything for all patients anyway?",
+                    parent=root,
+                ):
+                    self.set_status("All patients' Progress & risk checks and Case overviews are already up to date.")
+                    return False
+                bundles, ins_plan, total_ins = self._collect_insights_work(clients, force=True)
+                case_todo = list(with_docs)
+            job_cfg, orient = dict(cfg), self.settings.get("orientation", "")
+            n_cases = len(case_todo)
+            has_ins = bool(bundles)
+
+            def job(p):
+                ins_share = 50.0 if (has_ins and n_cases) else (100.0 if has_ins else 0.0)
+                case_share = 100.0 - ins_share
+                n_pat, n_risk, n_goals, n_fu = 0, 0, 0, 0
+                if has_ins:
+                    def ins_p(t, pct=None):
+                        scaled = ( float(pct) * ins_share / 100.0 ) if pct is not None else 0.0
+                        p(t, scaled)
+                    steps = _Steps(ins_p, ins_plan) if ins_plan else None
+                    _, n_pat, n_risk, n_goals, n_fu = self._run_insights_bundles(job_cfg, bundles, steps, 0, ins_p)
+                done_cases = 0
+                for idx, (cid, code) in enumerate(case_todo):
+                    base = ins_share + (idx * case_share) / max(n_cases, 1)
+                    span = case_share / max(n_cases, 1)
+
+                    def sub_p(t, pct=None, _b=base, _s=span, _i=idx, _c=code):
+                        scaled = (_b + (_s * float(pct) / 100.0)) if pct is not None else _b
+                        p(f"[Case {_i + 1}/{n_cases} · {_c}] {t}", scaled)
+
+                    c_cur = vault.load_client(cid)
+                    sess_dicts = [d for _, d in vault.sessions_for(cid)]
+                    if not sess_dicts:
+                        continue
+                    text = generate_case_overview(job_cfg, c_cur, sess_dicts, orient, sub_p)
+                    c_latest = vault.load_client(cid)
+                    c_latest["case_overview"] = {
+                        "text": text,
+                        "session_count": len({d["meta"].get("session_date") for d in sess_dicts}),
+                        "generated": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    vault.save_client(c_latest)
+                    done_cases += 1
+                p("Done.", 100)
+                return n_pat, n_risk, n_goals, n_fu, done_cases
+
+            def done(res):
+                n_pat, n_risk, n_goals, n_fu, done_cases = res
+                self._sig = vault.signature()
+                if self.client_id and not self.wizard:
+                    self.open_client(self.client_id)
+                elif not self.client_id and not self.wizard:
+                    self.show_home()
+                self.set_status(
+                    f"Refreshed all patients: {done_cases} case overview{'s' if done_cases != 1 else ''}, "
+                    f"{n_risk} risk record{'s' if n_risk != 1 else ''}, "
+                    f"{n_goals} goal note{'s' if n_goals != 1 else ''}, "
+                    f"{n_fu} follow-up{'s' if n_fu != 1 else ''}."
+                )
+
+            r = self.run_bg(
+                job,
+                done,
+                label="refreshing progress, risk & case overviews for all patients",
+                owner=("all", "*"),
+                pausable=True,
+            )
+            if r and self.client_id and not self.wizard:
+                self.open_client(self.client_id)
+            elif r and not self.client_id and not self.wizard:
+                self.show_home()
+            return r
+
+        # ======================================================== CASELOAD DASHBOARD
+        def _dashboard_pairs(self):
+            with vault.one_look():
+                pairs, light = [], vault.light_sessions()
+                stamps = vault.client_stamps()          # one look at the folder, not one per patient
+                for c in self.clients:
+                    if c.get("archived"):
+                        continue
+                    try:
+                        full = vault._read_cached(
+                            "c:" + c["id"],
+                            os.path.join(vault.clients_dir, c["id"] + ".enc"),
+                            stamps.get(c["id"]),
+                            readonly=True,
+                        )
+                        sessions = light.get(c["id"], [])
+                        contacts = [(sid, d) for sid, d in sessions if d["meta"].get("kind") == "parent"]
+                        if contacts and followups_sync(full, contacts):
+                            full_copy = copy.deepcopy(full)
+                            vault.save_client(full_copy)
+                            full = full_copy
+                        pairs.append((full, sessions))
+                    except Exception:
+                        continue
+                return pairs
+
+        def _dashboard_both(self):
+            """Returns (active_data, hidden_total) in a single memoized pass keyed by vault signature."""
+            with vault.one_look():
+                sig = vault.signature()
+                today = date.today().isoformat()
+                cached = getattr(self, "_dash_memo", None)
+                if cached is not None and cached[0] == sig and cached[1] == today:
+                    all_data = cached[2]
+                else:
+                    pairs = self._dashboard_pairs()
+                    all_data = caseload(pairs, today=today, include_dismissed=True)
+                    self._dash_memo = (sig, today, all_data)
+                stamps = vault.client_stamps()
+                dismissed_by_cid = {}
+                perm_by_cid = {}
+                for c in self.clients:
+                    if not c.get("archived"):
+                        try:
+                            full = vault._read_cached(
+                                "c:" + c["id"],
+                                os.path.join(vault.clients_dir, c["id"] + ".enc"),
+                                stamps.get(c["id"]),
+                                readonly=True,
+                            )
+                            dismissed_by_cid[c["id"]] = set(full.get("dismissed_dashboard") or [])
+                            perm_by_cid[c["id"]] = set(full.get("permanently_dismissed_dashboard") or [])
+                        except Exception:
+                            dismissed_by_cid[c["id"]] = set()
+                            perm_by_cid[c["id"]] = set()
+                active_data = {}
+                hidden_total = 0
+                for k, rows in all_data.items():
+                    kept = []
+                    for r in rows:
+                        cid = r["client"]["id"]
+                        if r["dkey"] in perm_by_cid.get(cid, set()):
+                            continue
+                        if r["dkey"] in dismissed_by_cid.get(cid, set()):
+                            hidden_total += 1
+                        else:
+                            kept.append(r)
+                    active_data[k] = kept
+                return active_data, hidden_total
+
+        def dashboard_data(self, include_dismissed=False):
+            if include_dismissed:
+                return caseload(self._dashboard_pairs(), include_dismissed=True)
+            return self._dashboard_both()[0]
+
+        def _get_dash_collapsed(self):
+            if not hasattr(self, "_dash_collapsed"):
+                raw = self.settings.get("dash_collapsed") or []
+                self._dash_collapsed = {
+                    (str(x[0]), str(x[1])) for x in raw if isinstance(x, (list, tuple)) and len(x) == 2
+                }
+            return self._dash_collapsed
+
+        def _save_dash_collapsed(self):
+            col = self._get_dash_collapsed()
+            self.settings["dash_collapsed"] = [[k, cid] for k, cid in sorted(col)]
+            try:
+                vault.save_settings(self.settings)
+            except Exception:
+                pass
+
+        def toggle_dashboard_client(self, section_key, client_id, refresh=True):
+            """Toggle open/closed (minimized) state for a patient's dropdown menu in a dashboard section."""
+            col = self._get_dash_collapsed()
+            pair = (str(section_key), str(client_id))
+            if pair in col:
+                col.remove(pair)
+                state = "expanded"
+            else:
+                col.add(pair)
+                state = "minimized"
+            self._save_dash_collapsed()
+            if refresh and not self.client_id and not self.wizard:
+                self.show_home()
+            return state
+
+        def dismiss_dashboard_items(self, client_or_id, dkeys, refresh=True):
+            """Hide/dismiss one or more dashboard items for a client."""
+            cid = client_or_id["id"] if isinstance(client_or_id, dict) else str(client_or_id)
+            c = vault.load_client(cid)
+            cur = list(c.get("dismissed_dashboard") or [])
+            have = set(cur)
+            added = 0
+            for dk in dkeys:
+                if dk and dk not in have:
+                    cur.append(dk)
+                    have.add(dk)
+                    added += 1
+            if added:
+                c["dismissed_dashboard"] = cur
+                vault.save_client(c)
+                self._sig = vault.signature()
+                if getattr(self, "_dash_memo", None) is not None:
+                    self._dash_memo = (self._sig, self._dash_memo[1], self._dash_memo[2])
+            if refresh and not self.client_id and not self.wizard:
+                self.show_home()
+            return added
+
+        def dismiss_dashboard_batch(self, client_dkey_pairs, refresh=True):
+            """Hide/dismiss multiple (client, dkey) pairs across one or more patients."""
+            by_cid = {}
+            for c_or_id, dk in client_dkey_pairs:
+                cid = c_or_id["id"] if isinstance(c_or_id, dict) else str(c_or_id)
+                by_cid.setdefault(cid, []).append(dk)
+            total = 0
+            for cid, dkeys in by_cid.items():
+                total += self.dismiss_dashboard_items(cid, dkeys, refresh=False)
+            if refresh and not self.client_id and not self.wizard:
+                self.show_home()
+            return total
+
+        def restore_dashboard_items(self, client_or_id=None, section_key=None, refresh=True):
+            """Restore hidden/dismissed dashboard items (all, per section, or per client)."""
+            targets = (
+                [vault.load_client(client_or_id["id"] if isinstance(client_or_id, dict) else client_or_id)]
+                if client_or_id is not None
+                else [c for c in vault.list_clients() if not c.get("archived")]
+            )
+            restored = 0
+            for c in targets:
+                cur = list(c.get("dismissed_dashboard") or [])
+                if not cur:
+                    continue
+                if section_key:
+                    prefix = f"{section_key}:"
+                    kept = [dk for dk in cur if not dk.startswith(prefix)]
+                else:
+                    kept = []
+                if len(kept) != len(cur):
+                    restored += len(cur) - len(kept)
+                    c["dismissed_dashboard"] = kept
+                    vault.save_client(c)
+            if restored:
+                self._sig = vault.signature()
+                if getattr(self, "_dash_memo", None) is not None:
+                    self._dash_memo = (self._sig, self._dash_memo[1], self._dash_memo[2])
+            if refresh and not self.client_id and not self.wizard:
+                self.show_home()
+            return restored
+
+        def permanently_dismiss_dashboard_rows(self, rows, refresh=True):
+            """Permanently dismiss (✕) one or more dashboard row dicts so they are removed from the menu
+            (not just temporarily hidden), clearing underlying review/followup/homework flags where applicable."""
+            by_cid = {}
+            review_sids = set()
+            for r in rows:
+                c_or_id = r.get("client")
+                cid = c_or_id["id"] if isinstance(c_or_id, dict) else str(c_or_id)
+                by_cid.setdefault(cid, []).append(r)
+                if r.get("category") == "review" and r.get("sid"):
+                    review_sids.add(r["sid"])
+            for sid in review_sids:
                 try:
-                    full = vault.load_client(c["id"], stamps.get(c["id"]))
-                    sessions = light.get(c["id"], [])
-                    contacts = [(sid, d) for sid, d in sessions if d["meta"].get("kind") == "parent"]
-                    if contacts and followups_sync(full, [(sid, vault.load_session(sid)) for sid, _ in contacts]):
-                        vault.save_client(full)
-                    pairs.append((full, sessions))
+                    dd = vault.load_session(sid)
+                    if dd.get("meta", {}).get("needs_review"):
+                        dd["meta"].pop("needs_review", None)
+                        dd["meta"].pop("review_reason", None)
+                        vault.save_session(dd, sid)
+                except Exception:
+                    pass
+            removed_count = 0
+            for cid, c_rows in by_cid.items():
+                try:
+                    c = vault.load_client(cid)
                 except Exception:
                     continue
-            return caseload(pairs)
+                perm = list(c.get("permanently_dismissed_dashboard") or [])
+                perm_set = set(perm)
+                hidden = list(c.get("dismissed_dashboard") or [])
+                fids_to_remove = set()
+                hids_to_dismiss = set()
+                changed = False
+                for r in c_rows:
+                    dk = r.get("dkey")
+                    if dk and dk not in perm_set:
+                        perm.append(dk)
+                        perm_set.add(dk)
+                        removed_count += 1
+                        changed = True
+                    if dk and dk in hidden:
+                        hidden.remove(dk)
+                        changed = True
+                    if r.get("category") == "followups" and r.get("fid"):
+                        fids_to_remove.add(r["fid"])
+                    elif r.get("category") == "homework" and r.get("hid"):
+                        hids_to_dismiss.add(r["hid"])
+                if fids_to_remove and c.get("followups"):
+                    before_len = len(c["followups"])
+                    c["followups"] = [x for x in c["followups"] if x.get("id") not in fids_to_remove]
+                    if len(c["followups"]) != before_len:
+                        changed = True
+                if hids_to_dismiss and c.get("homework"):
+                    for x in c["homework"]:
+                        if x.get("id") in hids_to_dismiss and x.get("status") == "assigned":
+                            x["status"] = "dismissed"
+                            changed = True
+                if changed:
+                    c["permanently_dismissed_dashboard"] = perm
+                    c["dismissed_dashboard"] = hidden
+                    vault.save_client(c)
+            if removed_count or review_sids:
+                self._dash_memo = None
+                if review_sids:
+                    self.refresh_clients()
+                else:
+                    self._sig = vault.signature()
+            if refresh and not self.client_id and not self.wizard:
+                self.show_home()
+            return removed_count
 
         def _dashboard(self, f):
             hour = datetime.now().hour
@@ -14754,15 +15630,26 @@ def run_gui():
             top_ = ttk.Frame(f)
             top_.pack(fill="x")
             ttk.Label(top_, text=greet, style="Hero.TLabel").pack(side="left")
+            data, hidden_total = self._dashboard_both()
+            total = sum(len(v) for v in data.values())
             bar = Flow(top_, align="right", gap=px(8))
             bar.pack(side="right", fill="x", expand=True)
+            if hidden_total > 0:
+                bar.add(
+                    ttk.Button(
+                        bar,
+                        text=f"Unhide dismissed ({hidden_total})",
+                        command=lambda: self.restore_dashboard_items(),
+                    )
+                )
+            bar.add(ttk.Button(bar, text="↻  Refresh all patients", style="Accent.TButton", command=self.refresh_all_patients))
             bar.add(ttk.Button(bar, text="📋  Supervision prep", command=self.supervision_prep))
-            data = self.dashboard_data()
             n_pat = sum(1 for c in self.clients if not c.get("archived"))
-            total = sum(len(v) for k, v in data.items())
             ttk.Label(f, text=f"Your caseload · {n_pat} active patient{'s' if n_pat != 1 else ''}"
-                              + (" · everything's up to date" if not total else ""), style="Muted.TLabel").pack(
-                anchor="w", pady=(px(2), px(12)))
+                              + (" · everything's up to date" if not total else "")
+                              + (f" · {hidden_total} hidden" if hidden_total else ""), style="Muted.TLabel").pack(
+                anchor="w", pady=(px(2), px(6)))
+            self.progress_panel(f, owner=("all", "*")).pack(anchor="w", fill="x", pady=(0, px(6)))
             tiles = Flow(f, gap=px(10))
             tiles.pack(fill="x")
             for key, title, tone in DASH_SECTIONS:
@@ -14774,33 +15661,163 @@ def run_gui():
                 ttk.Label(t_, text=title, style="Bad.TLabel" if tone == "Bad" else "Muted.TLabel").pack(anchor="w")
             sc, box = scrollable(f)
             sc.pack(fill="both", expand=True, pady=(px(12), 0))
+            collapsed = self._get_dash_collapsed()
+            dash_groups = {}
             for key, title, tone in DASH_SECTIONS:
                 rows = data[key]
                 if not rows:
                     continue
-                ttk.Label(box, text=f"{title} ({len(rows)})", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(2)))
-                for r in rows[:12]:
-                    r_ = ttk.Frame(box)
-                    r_.pack(fill="x", pady=px(1))
-                    if key == "followups":
-                        v = tk.BooleanVar(value=False)
-                        r_._v = v                      # keep it alive, or the box shows as half ticked
-                        ttk.Checkbutton(r_, variable=v, command=lambda r=r: (
-                            self.set_followup(r["client"], r["fid"], True, reopen=False), self.show_home())).pack(side="left")
-                    ttk.Label(r_, text=r["client"].get("code", ""), style="Strong.TLabel", width=8).pack(side="left")
-                    ttk.Label(r_, text=r["text"], style="Bad.TLabel" if tone == "Bad" else "TLabel",
-                              wraplength=px(620), justify="left").pack(side="left", padx=(px(6), 0))
-                    ttk.Button(r_, text="Open", command=lambda r=r: self.open_client(r["client"]["id"],
-                                                                                    select=r["select"])).pack(side="right")
-                    if r["when"]:
-                        ttk.Label(r_, text=fmt_date(r["when"]), style="Muted.TLabel").pack(side="right", padx=px(8))
-                if len(rows) > 12:
-                    ttk.Label(box, text=f"…and {len(rows) - 12} more", style="Muted.TLabel").pack(anchor="w")
+                # Group rows in this list by patient (preserving urgency order of first appearance)
+                by_patient = []
+                seen_cids = {}
+                for r in rows:
+                    cid = r["client"]["id"]
+                    if cid not in seen_cids:
+                        seen_cids[cid] = []
+                        by_patient.append((cid, r["client"], seen_cids[cid]))
+                    seen_cids[cid].append(r)
+                dash_groups[key] = by_patient
+                sec_hdr = ttk.Frame(box)
+                sec_hdr.pack(fill="x", pady=(px(14), px(4)))
+                ttk.Label(
+                    sec_hdr,
+                    text=f"{title} ({len(rows)} item{'s' if len(rows) != 1 else ''} across {len(by_patient)} patient{'s' if len(by_patient) != 1 else ''})",
+                    style="Strong.TLabel",
+                ).pack(side="left")
+                ttk.Button(
+                    sec_hdr,
+                    text="✕  Dismiss list",
+                    command=lambda rs=rows: self.permanently_dismiss_dashboard_rows(rs),
+                ).pack(side="right", padx=(px(4), 0))
+                ttk.Button(
+                    sec_hdr,
+                    text="Hide list",
+                    command=lambda rs=rows: self.dismiss_dashboard_batch([(r["client"], r["dkey"]) for r in rs]),
+                ).pack(side="right")
+                all_cids = [cid for cid, _, _ in by_patient]
+                sec_widgets = []
+                min_all_btn = ttk.Button(
+                    sec_hdr,
+                    text="Expand all patients" if all((key, cid) in collapsed for cid in all_cids) else "Minimize all patients",
+                )
+                min_all_btn.pack(side="right", padx=(0, px(6)))
+
+                def toggle_all_in_sec(k=key, cids=all_cids, sw=sec_widgets, mb=min_all_btn):
+                    col = self._get_dash_collapsed()
+                    minimize = not all((k, c_) in col for c_ in cids)
+                    for c_id, cd, cnt, ib, b in sw:
+                        if minimize:
+                            col.add((k, c_id))
+                            ib.pack_forget()
+                            b.config(text=f"▶  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                        else:
+                            col.discard((k, c_id))
+                            ib.pack(fill="x", pady=(px(4), 0))
+                            b.config(text=f"▼  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                    mb.config(text="Expand all patients" if minimize else "Minimize all patients")
+                    self._save_dash_collapsed()
+
+                min_all_btn.config(command=toggle_all_in_sec)
+
+                for cid, p_client, p_rows in by_patient:
+                    is_min = (key, cid) in collapsed
+                    code = p_client.get("code", "") or "Patient"
+                    p_card = ttk.Frame(box, style="Card.TFrame", padding=(px(10), px(6)))
+                    p_card.pack(fill="x", pady=(px(3), 0))
+                    p_hdr = ttk.Frame(p_card)
+                    p_hdr.pack(fill="x")
+                    items_box = ttk.Frame(p_card)
+
+                    t_btn = ttk.Button(
+                        p_hdr,
+                        text=f"{'▶' if is_min else '▼'}  {code} ({len(p_rows)} item{'s' if len(p_rows) != 1 else ''})",
+                        command=None,
+                    )
+
+                    def make_toggle(k=key, c_id=cid, cd=code, cnt=len(p_rows), ib=items_box, b=t_btn):
+                        def _toggle():
+                            col = self._get_dash_collapsed()
+                            pair = (k, c_id)
+                            if pair in col:
+                                col.remove(pair)
+                                ib.pack(fill="x", pady=(px(4), 0))
+                                b.config(text=f"▼  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                            else:
+                                col.add(pair)
+                                ib.pack_forget()
+                                b.config(text=f"▶  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                            self._save_dash_collapsed()
+                        return _toggle
+
+                    t_btn.config(command=make_toggle())
+                    t_btn.pack(side="left")
+                    sec_widgets.append((cid, code, len(p_rows), items_box, t_btn))
+                    ttk.Button(
+                        p_hdr,
+                        text="✕",
+                        width=3,
+                        command=lambda rs=p_rows: self.permanently_dismiss_dashboard_rows(rs),
+                    ).pack(side="right", padx=(px(4), 0))
+                    ttk.Button(
+                        p_hdr,
+                        text="Hide client items",
+                        command=lambda c=p_client, rs=p_rows: self.dismiss_dashboard_items(c, [r["dkey"] for r in rs]),
+                    ).pack(side="right")
+                    ttk.Button(
+                        p_hdr,
+                        text="Open client",
+                        command=lambda c_id=cid: self.open_client(c_id),
+                    ).pack(side="right", padx=(0, px(6)))
+
+                    for r in p_rows:
+                        r_ = ttk.Frame(items_box)
+                        r_.pack(fill="x", pady=px(2), padx=(px(14), 0))
+                        if key == "followups":
+                            v = tk.BooleanVar(value=False)
+                            r_._v = v                      # keep it alive, or the box shows as half ticked
+                            ttk.Checkbutton(
+                                r_,
+                                variable=v,
+                                command=lambda r=r: (
+                                    self.set_followup(r["client"], r["fid"], True, reopen=False),
+                                    self.show_home(),
+                                ),
+                            ).pack(side="left")
+                        ttk.Label(
+                            r_,
+                            text=r["text"],
+                            style="Bad.TLabel" if tone == "Bad" else "TLabel",
+                            wraplength=px(580),
+                            justify="left",
+                        ).pack(side="left", padx=(px(6), 0))
+                        ttk.Button(
+                            r_,
+                            text="✕",
+                            width=3,
+                            command=lambda r=r: self.permanently_dismiss_dashboard_rows([r]),
+                        ).pack(side="right", padx=(px(4), 0))
+                        ttk.Button(
+                            r_,
+                            text="Hide",
+                            width=5,
+                            command=lambda r=r: self.dismiss_dashboard_items(r["client"], [r["dkey"]]),
+                        ).pack(side="right", padx=(px(4), 0))
+                        ttk.Button(
+                            r_,
+                            text="Open",
+                            command=lambda r=r: self.open_client(r["client"]["id"], select=r["select"]),
+                        ).pack(side="right")
+                        if r["when"]:
+                            ttk.Label(r_, text=fmt_date(r["when"]), style="Muted.TLabel").pack(side="right", padx=px(8))
+                    if not is_min:
+                        items_box.pack(fill="x", pady=(px(4), 0))
             if not total:
                 ttk.Label(box, text="Nothing needs your attention right now. Drafts to review, plan reviews, risk, score "
                                     "changes, follow-ups and homework show up here as they come in.",
                           style="Muted.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(10), 0))
             f._dash = data
+            f._dash_groups = dash_groups
+            sc.realize_all()
 
         # ========================================================== WIZARD
         def start_wizard(self, client, sid=None, data=None):
@@ -17303,11 +18320,25 @@ def run_gui():
             self.queue_refresh()
 
         # =========================================================== SETUP
-        def open_setup(self):
-            if self.setup_win is not None:
+        def open_setup(self, _preload=False):
+            if not _preload and self.setup_win is not None and self._alive(self.setup_win.get("win")):
+                self.setup_win["win"].deiconify()
                 self.setup_win["win"].lift()
                 return
+            cached_win = getattr(self, "_setup_cached", None)
+            if cached_win is not None and self._alive(cached_win.get("win")):
+                if _preload:
+                    return
+                self.setup_win = cached_win
+                w = cached_win["win"]
+                cached_win["refresh"]()
+                w.deiconify()
+                w.lift()
+                w.after(100, lambda: w.winfo_exists() and cached_win["sync"](redraw=False))
+                return
             win = new_window(root, "Settings", "920x820")
+            if _preload:
+                win.withdraw()
             scroller, outer = scrollable(win, padding=(px(24), px(20), px(18), px(20)))
             scroller.pack(fill="both", expand=True)
             ttk.Label(outer, text="Settings", style="Title.TLabel").pack(anchor="w")
@@ -17421,6 +18452,7 @@ def run_gui():
                         return fn(lambda t: self.msgs.put(("setuplog", t)))
 
                     def done(msg):
+                        invalidate_setup_probes()
                         log("✓ " + (msg or name))
                         next_step()
 
@@ -17624,7 +18656,7 @@ def run_gui():
 
             def show_library():
                 if wl_info.winfo_exists():
-                    n = len(self.worksheet_catalog())
+                    n = worksheet_count(worksheet_root(cfg))
                     wl_info.config(text=f"{n} worksheet{'s' if n != 1 else ''} in your library ({worksheet_root(cfg)}). "
                                         "Add your own handouts (PDF, Word or text); after a session, “Suggest worksheets” "
                                         "on its Session review tab picks ones that fit. Handouts only — no patient "
@@ -17660,11 +18692,13 @@ def run_gui():
                     return fn(lambda t: self.msgs.put(("setuplog", t)))
 
                 def done(msg):
+                    invalidate_setup_probes()
                     log("✓ " + msg)
                     refresh()
                     self.refresh_strip()
 
                 def fail(msg):
+                    invalidate_setup_probes()
                     log("✗ " + msg)
                     refresh()
                 if not self.run_bg(work, done, fail, label="Settings", quiet=True):
@@ -18136,16 +19170,22 @@ def run_gui():
             logbox.pack(fill="both", expand=True)
 
             def close():
+                self._setup_cached = self.setup_win
                 self.setup_win = None
-                win.destroy()
+                win.withdraw()
                 self.refresh_strip()
                 if self.page is not None and self.wizard is None and self.client_id is None:
                     self.show_home()
             win.protocol("WM_DELETE_WINDOW", close)
             self.setup_win = {"win": win, "log": log, "refresh": refresh, "sync": do_sync, "run_all": run_all,
-                              "plan": plan_steps, "describe": describe}
+                              "plan": plan_steps, "describe": describe, "close": close}
+            self._setup_cached = self.setup_win
             refresh()
-            do_sync(redraw=False)       # (the screen behind is only redrawn if something actually arrived)
+            scroller.realize_all()
+            if _preload:
+                self.setup_win = None
+                return
+            win.after(100, lambda: win.winfo_exists() and do_sync(redraw=False))
             # first time Setup opens on this computer: detect it and offer to install everything at once
             if not cfg.get("setup_assistant_offered"):
                 cfg["setup_assistant_offered"] = True
