@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.12"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.13"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -11635,6 +11635,26 @@ def run_gui():
         style.configure("TCheckbutton", background=p["bg"])
         style.configure("TRadiobutton", background=p["bg"])
         style.configure("Toolbutton", padding=(px(10), px(4)), background=p["bg"])
+        # Arrows and indicators: the theme sizes these in raw pixels, so with Windows display scaling they
+        # stayed tiny next to everything else. Sized with the rest of the app (and big enough for a finger).
+        for sb in ("TScrollbar", "Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(sb, arrowsize=px(17), arrowcolor=p["text"], background=p["surface2"],
+                            bordercolor=p["border"], lightcolor=p["surface2"], darkcolor=p["surface2"],
+                            gripcount=0)
+        style.map("TScrollbar", background=[("active", p["accent_soft"])])
+        style.configure("TCombobox", arrowsize=px(17))
+        style.map("TCombobox", fieldbackground=[("readonly", p["surface"]), ("disabled", p["surface2"])],
+                  foreground=[("readonly", p["text"]), ("disabled", p["muted"])],
+                  selectbackground=[("readonly", p["surface"])], selectforeground=[("readonly", p["text"])],
+                  background=[("active", p["accent_soft"]), ("readonly", p["surface"])])
+        style.configure("TSpinbox", arrowsize=px(14))
+        style.configure("TMenubutton", arrowsize=px(6), arrowpadding=px(8), arrowcolor=p["text"])
+        style.configure("Treeview", indicatorsize=px(15), foreground=p["text"])
+        style.configure("Item", indicatorsize=px(15), foreground=p["text"])
+        style.configure("TCheckbutton", indicatorsize=px(17), indicatormargin=(0, 0, px(8), 0),
+                        indicatorbackground=p["surface"], indicatorforeground=p["accent"])
+        style.configure("TRadiobutton", indicatorsize=px(17), indicatormargin=(0, 0, px(8), 0),
+                        indicatorbackground=p["surface"], indicatorforeground=p["accent"])
 
     _CARD = {"img": None}
 
