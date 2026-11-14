@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.30"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.31"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -12864,6 +12864,108 @@ def run_gui():
         if sc is not None:
             sc(e)
 
+    # ---- smooth scrolling: the wheel (and a touchpad) glide to where they're going ------------------
+    # Each notch moves the target; the view eases toward it a little every frame (~60 a second), fast at
+    # first and settling softly, instead of jumping a whole notch at once. Notches that come quickly
+    # add up, so a fast spin goes far but still glides.
+    WHEEL_PX = 100                     # how far one wheel notch goes (before scaling)
+    GLIDE_TAU = 0.07                   # seconds: smaller = snappier, larger = floatier
+
+    def _wheel_notches(e):
+        if getattr(e, "num", None) in (4, 5):
+            return 1.0 if e.num == 4 else -1.0
+        if IS_MAC:
+            return e.delta / 4.0
+        return e.delta / 120.0
+
+    def smooth_scroller(widget, get_top, set_top, get_range):
+        """A glide for one scrolling widget. get_top/set_top: the view's top in pixels; get_range: the
+        (lowest, highest) top it can have. Returns (add(pixels), stop())."""
+        st = {"pos": 0.0, "target": None, "job": None, "t": 0.0}
+
+        def stop():
+            if st["job"] is not None:
+                _quiet(widget.after_cancel, st["job"])
+            st["job"], st["target"] = None, None
+
+        def frame():
+            st["job"] = None
+            if st["target"] is None:
+                return
+            try:
+                if not widget.winfo_exists():
+                    return
+                now = time.monotonic()
+                dt = min(max(now - st["t"], 0.001), 0.05)
+                st["t"] = now
+                d = st["target"] - st["pos"]
+                if abs(d) <= 0.6:
+                    st["pos"] = st["target"]
+                    set_top(st["pos"])
+                    st["target"] = None
+                    return
+                step = d * (1.0 - math.exp(-dt / GLIDE_TAU))
+                if abs(step) < 0.6:
+                    step = math.copysign(min(0.6, abs(d)), d)
+                st["pos"] += step
+                _SCROLLING_UNTIL[0] = now + 0.25
+                set_top(st["pos"])
+                st["job"] = widget.after(15, frame)
+            except tk.TclError:
+                st["target"] = None
+
+        def add(dpx):
+            try:
+                if st["target"] is None:                # starting: from wherever the view is now
+                    st["pos"] = st["target"] = float(get_top())
+                    st["range"] = get_range()
+                lo, hi = st["range"]
+                st["target"] = min(max(st["target"] + dpx, float(lo)), float(max(hi, lo)))
+            except tk.TclError:
+                return
+            _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+            if st["job"] is None:
+                st["t"] = time.monotonic() - 0.016      # (move on this very event: no lag)
+                frame()
+        return add, stop
+
+    def _text_wheel(e):
+        """Text boxes glide too. One that has nothing to scroll passes the wheel to the page around it."""
+        t = e.widget
+        try:
+            a, b = t.yview()
+        except (tk.TclError, AttributeError):
+            return None
+        if a <= 0.0 and b >= 1.0:
+            sc = _find_scroll_canvas(getattr(t, "master", None))
+            if sc is not None:
+                sc(e)
+            return "break"
+        sm = getattr(t, "_smooth", None)
+        if sm is None:
+            box = {"done": 0}                          # pixels moved since this glide began
+
+            def get_top():
+                box["done"] = 0
+                return 0.0
+
+            def set_top(p):
+                n = int(round(p)) - box["done"]
+                if n:
+                    t.yview_scroll(n, "pixels")
+                    box["done"] += n
+
+            def get_range():
+                # how far it can go either way, measured from where this glide began
+                a_, b_ = t.yview()
+                total = max(t.winfo_height(), 1) / max(b_ - a_, 1e-6)
+                return -a_ * total, (1.0 - b_) * total
+            add, stop = smooth_scroller(t, get_top, set_top, get_range)
+            sm = t._smooth = {"add": add, "stop": stop}
+        sm["add"](-_wheel_notches(e) * px(WHEEL_PX * 0.8))
+        return "break"
+    root.bind_class("Text", "<MouseWheel>", _text_wheel)
+
     root.bind_all("<MouseWheel>", _global_wheel, add="+")
     root.bind_all("<Button-4>", _global_wheel, add="+")
     root.bind_all("<Button-5>", _global_wheel, add="+")
@@ -12945,6 +13047,13 @@ def run_gui():
 
     def _touch_begin(w, e):
         _glide_stop()
+        cur = w                                        # a finger takes over from a wheel glide
+        while cur is not None:
+            st_ = getattr(getattr(cur, "_touch_view", None), "_smooth_stop", None)
+            if st_:
+                _quiet(st_)
+                break
+            cur = getattr(cur, "master", None)
         if TOUCH["replay"] or not isinstance(w, tk.Misc) or not _from_finger():
             TOUCH["on"] = False
             return False
@@ -13062,6 +13171,7 @@ def run_gui():
 
         def _sb_cmd(*args):
             _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+            _quiet(lambda: canvas._smooth_stop())        # the scrollbar takes over from a glide
             canvas.yview(*args)
 
         sb = ttk.Scrollbar(outer, orient="vertical", command=_sb_cmd)
@@ -13097,34 +13207,28 @@ def run_gui():
 
         inner.bind("<Configure>", _on_inner_conf)
         canvas.bind("<Configure>", _on_canvas_conf)
-        canvas.configure(yscrollcommand=sb.set, yscrollincrement=px(2))
+        canvas.configure(yscrollcommand=sb.set, yscrollincrement=1)     # (1 px: the glide moves finely)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        wheel_state = {"steps": 0.0, "job": None}
-        step_px = max(1, px(2))
+        def _content_h():
+            try:
+                return max(float(str(canvas.cget("scrollregion")).split()[3]), 1.0)
+            except (IndexError, ValueError, tk.TclError):
+                return max(float(inner.winfo_reqheight()), 1.0)
 
-        def wheel_flush():
-            wheel_state["job"] = None
-            n = int(wheel_state["steps"])
-            wheel_state["steps"] -= n
-            if n and canvas.winfo_exists():
-                _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
-                canvas.yview_scroll(n, "units")
+        def _set_top(p):
+            canvas.yview_moveto(p / _content_h())
+
+        glide, glide_stop = smooth_scroller(
+            canvas, lambda: canvas.yview()[0] * _content_h(), _set_top,
+            lambda: (0.0, _content_h() - canvas.winfo_height()))
+        canvas._smooth_stop = glide_stop
 
         def wheel(e):
             if not canvas.winfo_exists() or canvas.yview() == (0.0, 1.0):
                 return
-            if e.num in (4, 5):
-                notches = 1.0 if e.num == 4 else -1.0
-            elif IS_MAC:
-                notches = e.delta / 4.0
-            else:
-                notches = e.delta / 120.0
-            _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
-            wheel_state["steps"] -= (notches * px(72)) / step_px
-            if wheel_state["job"] is None:
-                wheel_state["job"] = canvas.after_idle(wheel_flush)
+            glide(-_wheel_notches(e) * px(WHEEL_PX))
 
         outer._scroll_wheel = wheel
         canvas._scroll_wheel = wheel
