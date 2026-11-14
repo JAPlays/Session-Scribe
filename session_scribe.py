@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.2"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.3"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2927,6 +2927,9 @@ ASK_SYSTEM = """You help a mental health counseling extern at South Shore Counse
 one patient's record. Answer ONLY from the PATIENT RECORD and SSC MANUAL GUIDANCE provided. \
 Rules:
 - Cite where each point comes from, e.g. "(Session 4, 2026-04-23)" or "(treatment plan)".
+- The record has notes (summaries) and transcript excerpts (what was actually said in the session). Use \
+the transcripts for what the patient or Counselor said, how they said it and details the notes leave out; \
+quote them briefly where it helps.
 - If the record doesn't contain the answer, say so plainly and say what's missing. Never invent \
 history, quotes, diagnoses, dates or scores.
 - Use SSC's terms ("patient", "Counselor") and the SSC manual's vocabulary when describing interventions.
@@ -3022,7 +3025,7 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
             text = d.get(key) or ""
             if not text.strip():
                 continue
-            chunks = [text] if key != "transcript" else [text[i:i + 3000] for i in range(0, len(text), 3000)]
+            chunks = [text] if key != "transcript" else [text[i:i + 2000] for i in range(0, len(text), 2000)]
             for ci, chunk in enumerate(chunks):
                 low = chunk.lower()
                 score = sum(low.count(w) for w in words)
@@ -3067,14 +3070,32 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
     focused = [c for c in cands if c["rank"] >= 1000]
     others = sorted([c for c in cands if c["key"] != "note" and c["rank"] < 1000],
                     key=lambda c: (c["rank"], c["recent"]), reverse=True)
-    for c in focused + notes + [c for c in others if c["rank"] > 1]:
-        if c in picked:
-            continue
-        size = len(c["text"]) + 80
-        if size > room:
-            continue
-        picked.append(c)
-        room -= size
+    # what was actually said: transcript excerpts that match the question best, then the most recent ones
+    about_words = re.search(r"\b(said|say|says|saying|told|tell|talk(ed|s)?|quote|words?|transcripts?|"
+                            r"mention(ed|s)?|discuss(ed|es)?|spoke|conversation|exact)\b", question, re.I)
+    trans = sorted([c for c in others if c["key"] == "transcript"],
+                   key=lambda c: (c["rank"], c["recent"]), reverse=True)
+    extra = [c for c in others if c["key"] != "transcript" and c["rank"] > 1]
+
+    def take(pool, limit):
+        nonlocal room
+        spent = 0
+        for c in pool:
+            if c in picked:
+                continue
+            size = len(c["text"]) + 80
+            if size > room or spent + size > limit:
+                continue
+            picked.append(c)
+            room -= size
+            spent += size
+    take(focused, room)
+    # notes get at most half of what's left (a third when the question is about what was said), so the
+    # transcripts — the sessions themselves — always get a share too
+    take(notes, room * (0.34 if about_words else 0.5))
+    take(extra, room * 0.4)
+    take(trans, room)
+    take(notes, room)                                 # any room left: more notes
     for c in sorted(picked, key=lambda c: c["day"]):
         head = f"{fmt_date(c['day'])}" + (f" · Session {c['num']}" if c["num"] is not None else "") + f" · {c['label']}"
         add(head, c["text"])
@@ -25050,8 +25071,7 @@ def run_gui():
                 win.withdraw()
             scroller, outer = scrollable(win, padding=(px(24), px(20), px(18), px(20)))
             scroller.pack(fill="both", expand=True)
-            ttk.Label(outer, text="Settings", style="Title.TLabel").pack(anchor="w")
-            ttk.Label(outer, text=f"Running with: {sys.executable}", style="Caption.TLabel").pack(anchor="w", pady=(0, 8))
+            ttk.Label(outer, text="Settings", style="Title.TLabel").pack(anchor="w", pady=(0, px(8)))
             checks = ttk.Frame(outer)          # only things that need attention
             checks.pack(fill="x")
             checks.columnconfigure(1, weight=1)
@@ -25067,8 +25087,6 @@ def run_gui():
                                  style="Strong.TLabel"))
             all_btn = pc_top.add(ttk.Button(pc_top, text="Set up everything for this computer",
                                             style="Accent.TButton"))
-            pc_top.add(ttk.Button(pc_top, text="Test the speech engine", command=lambda: self.test_engine(win)))
-            pc_top.add(ttk.Button(pc_top, text="Transcription log", command=lambda: self.show_worker_log(win)))
             pc_note = ttk.Label(pc, text="", style="Muted.TLabel", wraplength=px(760), justify="left")
             pc_note.pack(anchor="w", pady=(px(4), 0))
 
@@ -25888,8 +25906,8 @@ def run_gui():
                      None if ffmpeg_installed() else ("Install", lambda: task(install_ffmpeg))),
                     ("Speaker labels", speakers_on(token_var.get().strip()) or None,
                      "Token saved." if token_var.get().strip() else
-                     "Optional. Paste a free Hugging Face token below, accept the pyannote model terms "
-                     "on huggingface.co, then click Download.", None),
+                     "Optional. Paste a free Hugging Face token in Advanced settings (below), accept the "
+                     "pyannote model terms on huggingface.co, then click Download.", None),
                     ("Speech models", models_ok, model_detail, model_actions),
                     builtin_ai_row() if ai_engine(cfg) == "builtin" else
                     ("LM Studio (writes the notes)",
@@ -25937,58 +25955,83 @@ def run_gui():
             prefs.columnconfigure(3, weight=1)
 
             # settings grid: two label/field pairs per line, or one per line when the window is narrow
+            # everyday settings here; the technical ones (speech engine, AI connection, token…) in Advanced
             pg = ttk.Frame(prefs)
             pg.grid(row=0, column=0, columnspan=4, sticky="ew")
-            pref_items, pref_seps, pref_cols = [], [], {"n": None}
+            adv_btn = ttk.Button(prefs, text="⚙  Advanced settings  ▸")
+            adv_btn.grid(row=12, column=0, columnspan=4, sticky="w", pady=(px(10), 0))
+            adv = ttk.LabelFrame(prefs, text="Advanced settings", padding=px(10))
+            ttk.Label(adv, text="For setting up the speech engine and the AI. Most people never need to change "
+                                "these.", style="Muted.TLabel", wraplength=px(700), justify="left").pack(
+                anchor="w", fill="x", pady=(0, px(6)))
+            pga = ttk.Frame(adv)
+            pga.pack(fill="x")
+            grids = {pg: ([], [], {"n": None}), pga: ([], [], {"n": None})}
+
+            def show_adv(on=None):
+                on = not adv.winfo_ismapped() if on is None else on
+                if on:
+                    adv.grid(row=13, column=0, columnspan=4, sticky="ew", pady=(px(6), 0))
+                    adv_btn.config(text="⚙  Advanced settings  ▾")
+                    win.after_idle(lay_prefs)
+                else:
+                    adv.grid_remove()
+                    adv_btn.config(text="⚙  Advanced settings  ▸")
+            adv_btn.config(command=show_adv)
 
             def pr(r, c, label, widget):
-                lab = ttk.Label(pg, text=label, wraplength=px(190), justify="left") if label else None
-                pref_items.append((lab, widget))
+                g = widget.master if widget.master in grids else pg
+                lab = ttk.Label(g, text=label, wraplength=px(190), justify="left") if label else None
+                grids[g][0].append((lab, widget))
 
             def lay_prefs(_e=None):
-                n = 2 if pg.winfo_width() >= px(720) or pg.winfo_width() <= 1 else 1
-                if n == pref_cols["n"]:
-                    return
-                pref_cols["n"] = n
-                for sp in pref_seps:
-                    sp.destroy()
-                pref_seps.clear()
-                for c in range(4):
-                    pg.columnconfigure(c, weight=0)
-                pg.columnconfigure(1, weight=1)
-                if n == 2:
-                    pg.columnconfigure(3, weight=1)
-                for i, (lab, w) in enumerate(pref_items):
-                    line, col = divmod(i, n)
-                    if line and col == 0:
-                        sp = ttk.Separator(pg)
-                        sp.grid(row=line * 2 - 1, column=0, columnspan=4, sticky="ew", pady=px(2))
-                        pref_seps.append(sp)
-                    if lab is None:
-                        w.grid(row=line * 2, column=col * 2, columnspan=2, sticky="ew", pady=px(4), padx=(0, 16))
+                for g, (items_, seps_, cols_) in grids.items():
+                    n = 2 if g.winfo_width() >= px(720) or (g.winfo_width() <= 1 and pg.winfo_width() >= px(720)) \
+                        or pg.winfo_width() <= 1 else 1
+                    if n == cols_["n"]:
                         continue
-                    lab.grid(row=line * 2, column=col * 2, sticky="w", pady=px(4), padx=(0, 6))
-                    w.grid(row=line * 2, column=col * 2 + 1, sticky="ew", pady=px(4), padx=(0, 16))
+                    cols_["n"] = n
+                    for sp in seps_:
+                        sp.destroy()
+                    seps_.clear()
+                    for c in range(4):
+                        g.columnconfigure(c, weight=0)
+                    g.columnconfigure(1, weight=1)
+                    if n == 2:
+                        g.columnconfigure(3, weight=1)
+                    for i, (lab, w) in enumerate(items_):
+                        line, col = divmod(i, n)
+                        if line and col == 0:
+                            sp = ttk.Separator(g)
+                            sp.grid(row=line * 2 - 1, column=0, columnspan=4, sticky="ew", pady=px(2))
+                            seps_.append(sp)
+                        if lab is None:
+                            w.grid(row=line * 2, column=col * 2, columnspan=2, sticky="ew", pady=px(4),
+                                   padx=(0, 16))
+                            continue
+                        lab.grid(row=line * 2, column=col * 2, sticky="w", pady=px(4), padx=(0, 6))
+                        w.grid(row=line * 2, column=col * 2 + 1, sticky="ew", pady=px(4), padx=(0, 16))
             pg.bind("<Configure>", lay_prefs, add="+")
+            pga.bind("<Configure>", lay_prefs, add="+")
             pr(0, 0, "Theoretical orientation", ttk.Entry(pg, textvariable=orient_var))
-            pr(0, 2, "Hugging Face token", ttk.Entry(pg, textvariable=token_var, show="•"))
-            pr(1, 0, "Speech model", ttk.Combobox(pg, textvariable=sv["whisper_model"],
+            pr(2, 2, "Previous notes to build on", ttk.Spinbox(pg, from_=0, to=6,
+                                                               textvariable=sv["previous_notes"], width=4))
+            pr(3, 0, "Auto-lock (minutes, 0 = off)", ttk.Entry(pg, textvariable=sv["autolock_minutes"], width=6))
+            pr(0, 2, "Hugging Face token", ttk.Entry(pga, textvariable=token_var, show="•"))
+            pr(1, 0, "Speech model", ttk.Combobox(pga, textvariable=sv["whisper_model"],
                                                   values=WHISPER_MODELS, state="readonly"))
-            pr(1, 2, "Language (blank = auto)", ttk.Entry(pg, textvariable=sv["language"], width=6))
-            spk = ttk.Frame(pg)
+            pr(1, 2, "Language (blank = auto)", ttk.Entry(pga, textvariable=sv["language"], width=6))
+            spk = ttk.Frame(pga)
             ttk.Spinbox(spk, from_=1, to=6, textvariable=sv["min_speakers"], width=4).pack(side="left")
             ttk.Label(spk, text=" to ").pack(side="left")
             ttk.Spinbox(spk, from_=1, to=6, textvariable=sv["max_speakers"], width=4).pack(side="left")
             pr(2, 0, "People in session", spk)
-            pr(2, 2, "Previous notes to build on", ttk.Spinbox(pg, from_=0, to=6,
-                                                               textvariable=sv["previous_notes"], width=4))
-            pr(3, 0, "Auto-lock (minutes, 0 = off)", ttk.Entry(pg, textvariable=sv["autolock_minutes"], width=6))
-            pr(3, 2, "Condense transcripts over (chars)", ttk.Entry(pg, textvariable=sv["max_chars"], width=8))
+            pr(3, 2, "Condense transcripts over (chars)", ttk.Entry(pga, textvariable=sv["max_chars"], width=8))
             if ai_engine(cfg) == "builtin":
                 if not find_model(sv["model"].get()):         # first start, before auto_tune has picked one
                     first = find_model(BUNDLE.get("default_model")) or (model_files() or [{"name": ""}])[0]
                     sv["model"].set(first["name"])
-                mf = ttk.Frame(pg)
+                mf = ttk.Frame(pga)
                 ttk.Combobox(mf, textvariable=sv["model"], values=[m["name"] for m in model_files()],
                              state="readonly", postcommand=lambda: mcb.config(
                                  values=[m["name"] for m in model_files()])).pack(fill="x")
@@ -25996,7 +26039,7 @@ def run_gui():
                 fit_lbl = ttk.Label(mf, style="Caption.TLabel", wraplength=px(360), justify="left")
                 fit_lbl.pack(fill="x", pady=(px(2), 0))
 
-                hwf = ttk.Frame(pg)
+                hwf = ttk.Frame(pga)
                 hw_lbl = ttk.Label(hwf, style="Caption.TLabel", wraplength=px(360), justify="left")
                 hw_lbl.pack(fill="x")
                 ttk.Button(hwf, text="Check this computer again", command=retune).pack(anchor="w", pady=(px(4), 0))
@@ -26031,8 +26074,8 @@ def run_gui():
                 pr(4, 2, "This computer", hwf)
             else:
                 show_fit = lambda: None
-                pr(4, 0, "LM Studio address", ttk.Entry(pg, textvariable=sv["lmstudio_url"]))
-                pr(4, 2, "AI model (blank = loaded one)", ttk.Entry(pg, textvariable=sv["model"]))
+                pr(4, 0, "LM Studio address", ttk.Entry(pga, textvariable=sv["lmstudio_url"]))
+                pr(4, 2, "AI model (blank = loaded one)", ttk.Entry(pga, textvariable=sv["model"]))
             pr(5, 0, "Appearance", ttk.Combobox(pg, textvariable=appear_var, values=list(APPEARANCE.values()),
                                                 state="readonly", width=16))
             datefmt_var = tk.StringVar(value=DATE_FORMATS.get(cfg.get("date_format", "iso"), DATE_FORMATS["iso"]))
@@ -26046,8 +26089,8 @@ def run_gui():
                                                              values=["Clinician", "Therapist", "Counselor"]))
             pr(6, 2, "Label for the person you see", ttk.Combobox(pg, textvariable=them_var, width=16,
                                                                 values=["Patient", "Client"]))
-            pr(7, 0, "Other speaker labels", ttk.Entry(pg, textvariable=extra_var))
-            pr(7, 2, None, ttk.Label(pg, text="Comma-separated, e.g. Parent/Guardian, Partner, Other. Used in Who's who and "
+            pr(7, 0, "Other speaker labels", ttk.Entry(pga, textvariable=extra_var))
+            pr(7, 2, None, ttk.Label(pga, text="Comma-separated, e.g. Parent/Guardian, Partner, Other. Used in Who's who and "
                                   "transcripts; earlier transcripts keep their labels.",
                       style="Caption.TLabel", wraplength=px(360), justify="left"))
             names_var = tk.BooleanVar(value=bool(cfg.get("ai_names", True)))
@@ -26060,17 +26103,24 @@ def run_gui():
                                      style="Caption.TLabel", wraplength=px(360), justify="left"))
             TOUCH_MODES = {"auto": "Automatic (finger or pen)", "on": "Every drag scrolls", "off": "Off"}
             touch_var = tk.StringVar(value=TOUCH_MODES.get(cfg.get("touch_scroll") or "auto", TOUCH_MODES["auto"]))
-            pr(8, 0, "Touchscreen scrolling", ttk.Combobox(pg, textvariable=touch_var, values=list(TOUCH_MODES.values()),
+            pr(8, 0, "Touchscreen scrolling", ttk.Combobox(pga, textvariable=touch_var, values=list(TOUCH_MODES.values()),
                                                          state="readonly", width=22))
-            pr(8, 2, None, ttk.Label(pg, text="Drag with a finger to scroll pages, lists and notes; flick to keep "
+            pr(8, 2, None, ttk.Label(pga, text="Drag with a finger to scroll pages, lists and notes; flick to keep "
                                               "going. Choose “Every drag scrolls” if your screen isn't recognized.",
                                      style="Caption.TLabel", wraplength=px(360), justify="left"))
             lay_prefs()
             ttk.Separator(prefs).grid(row=15, column=0, columnspan=4, sticky="ew", pady=px(2))
             ttk.Checkbutton(prefs, text="Offer to delete the recording after saving a session",
                             variable=delete_var).grid(row=16, column=0, columnspan=4, sticky="w", pady=(px(6), 0))
-            ttk.Checkbutton(prefs, text="Smooth one-word speaker flicker (diarization blips)",
-                            variable=smooth_var).grid(row=17, column=0, columnspan=4, sticky="w", pady=(px(4), 0))
+            ttk.Checkbutton(adv, text="Smooth one-word speaker flicker (diarization blips)",
+                            variable=smooth_var).pack(anchor="w", pady=(px(8), 0))
+            tools = Flow(adv, gap=px(8))                  # the speech engine's own checks
+            tools.pack(fill="x", pady=(px(8), 0))
+            tools.add(ttk.Button(tools, text="Test the speech engine", command=lambda: self.test_engine(win)))
+            tools.add(ttk.Button(tools, text="Transcription log", command=lambda: self.show_worker_log(win)))
+            ttk.Label(adv, text=f"Running with: {sys.executable}", style="Caption.TLabel", wraplength=px(700),
+                      justify="left").pack(anchor="w", fill="x", pady=(px(6), 0))
+            show_adv(False)
             ttk.Separator(prefs).grid(row=18, column=0, columnspan=4, sticky="ew", pady=(px(8), 0))
             pb = Flow(prefs, gap=px(6))
             pb.grid(row=19, column=0, columnspan=4, sticky="ew", pady=(px(10), 0))
