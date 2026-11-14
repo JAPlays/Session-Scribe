@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.32"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.1"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -9011,6 +9011,20 @@ def ensure_model_loaded(cfg, model):
     _LM_LOADED.update(key=key, at=time.time())
 
 
+def ai_prompt_chars(cfg, answer_tokens=2000):
+    """How much text (characters) one request to the AI may carry: the model's context (lm_context tokens,
+    what Session Scribe loads it with) less room for the answer and the instructions, at a careful ~3
+    characters a token. Past this the model can't read the whole prompt and answers with nothing."""
+    ctx = int(cfg.get("lm_context") or 16384)
+    return max(4000, (ctx - answer_tokens - 700) * 3)
+
+
+def ai_chunk_chars(cfg):
+    """How much of a transcript or record goes into one request alongside the rest of the prompt (earlier
+    notes, the plan, the template): "Condense transcripts over" from Settings, but never more than fits."""
+    return max(4000, min(int(cfg.get("max_chars", 24000)), int(ai_prompt_chars(cfg, 3000) * 0.65)))
+
+
 LLM_RETRY_WAITS = (5, 15, 30)      # seconds before trying LM Studio again after a dropped connection
 
 
@@ -9110,6 +9124,10 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
         r = conn.getresponse()
         if r.status >= 400:
             detail = r.read().decode("utf-8", errors="replace")[:300]
+            if re.search(r"context|too (long|many tokens)|exceed", detail, re.I):
+                raise RuntimeError(f"That was more text than the AI model can read at once ({who}: {detail[:160]}). "
+                                   "Lower “Condense transcripts over” in Settings, or load the model with a "
+                                   "longer context.")
             raise RuntimeError(f"{who} returned an error ({r.status}): {detail}")
         if "event-stream" not in (r.getheader("Content-Type") or ""):
             data = json.loads(r.read().decode("utf-8"))      # server ignored streaming
@@ -9428,7 +9446,7 @@ def plan_material(client, sessions, hide):
 def generate_treatment_plan(cfg, client, sessions, orientation, review_days, instructions, progress):
     hide = client_hider(client)
     blocks = plan_material(client, sessions, hide)
-    groups = group_blocks(blocks, int(cfg.get("max_chars", 24000)))
+    groups = group_blocks(blocks, ai_chunk_chars(cfg))
     steps = _Steps(progress, [(f"Condensing the record, part {i} of {len(groups)}", 3500)
                               for i in range(1, len(groups) + 1)] + [("Writing the treatment plan", 5000)])
     if groups:
@@ -9511,7 +9529,7 @@ def generate_documents(cfg, values, transcript, context, progress, kind="progres
     """Returns (first, second): progress -> (note, overview); intake -> (assessment, questionnaire).
     `which` limits what's written (the other comes back as None); `instructions` are the
     clinician's directions for this draft."""
-    max_chars = int(cfg.get("max_chars", 24000))
+    max_chars = ai_chunk_chars(cfg)
     chunks = split_chunks(transcript, max_chars) if len(transcript) > max_chars else []
     if kind == "intake":
         tail = [("Writing the intake assessment", 4000), ("Filling in the 13-section intake questionnaire", 5000)]
@@ -9657,7 +9675,7 @@ def contact_counts_text(counts):
 
 def generate_contact_summary(cfg, values, blocks, start, end, progress):
     """One detailed summary note of every contact in the period (long periods are condensed first)."""
-    groups = group_blocks(blocks, int(cfg.get("max_chars", 24000)))
+    groups = group_blocks(blocks, ai_chunk_chars(cfg))
     long_ = len(groups) > 1
     steps = _Steps(progress, ([(f"Condensing the contacts, part {i} of {len(groups)}", 3000)
                                for i in range(1, len(groups) + 1)] if long_ else []) +
@@ -9950,7 +9968,7 @@ def generate_session_review(cfg, client, d, counselor, patient, orientation, ref
     hide = client_hider(client)
     transcript = hide(review_transcript(d))
     smap = session_map(timed_lines(d), d.get("roles") or {}, counselor, patient_label=patient)
-    max_chars = int(cfg.get("max_chars", 24000))
+    max_chars = ai_chunk_chars(cfg)
     parts = split_chunks(transcript, max_chars) if len(transcript) > max_chars else [transcript]
     vocab = (reference or {}).get("vocabulary") or BUILTIN_REFERENCE.get("vocabulary", "")
     plan = []
@@ -12306,7 +12324,7 @@ def generate_case_overview(cfg, client, sessions, orientation, progress):
             blocks.append(f"=== {day_title(records)} — {fmt_date(day)} ===\n" + "\n\n".join(parts))
     blocks = documents_blocks(client, hide) + blocks       # imported reports and records come first, as background
     text = "\n\n".join(blocks)
-    max_chars = int(cfg.get("max_chars", 24000))
+    max_chars = ai_chunk_chars(cfg)
     if len(text) > max_chars:
         groups, cur = [], ""
         for b in blocks:
@@ -16189,10 +16207,13 @@ def run_gui():
             sessions = vault.sessions_for(client["id"])
             chat = next((x for x in c.get("chats") or [] if x["id"] == chat_id), None)
             history = (chat or {}).get("messages", [])
+            # the patient's record gets what the model can read, less the conversation, question and manual
+            convo = sum(min(len(m_.get("text", "")), 1500) + 20 for m_ in history[-6:])
+            budget = max(6000, ai_prompt_chars(cfg, 1800) - convo - len(question) - 5000)
             prompt, sources = build_ask_prompt(c, sessions, question, history,
                                                self.settings.get("reference") or BUILTIN_REFERENCE,
                                                self.settings.get("orientation") or "not specified",
-                                               budget=max(12000, int(cfg.get("max_chars", 24000))))
+                                               budget=budget)
             system = ASK_SYSTEM.format(orientation=self.settings.get("orientation") or "not specified")
             job_cfg = dict(cfg)
             live = {"text": "", "at": 0}
@@ -16212,8 +16233,13 @@ def run_gui():
                 self.msgs.put(("call", lambda txt=txt: view_ok() and self._ask_view["show"]((question, txt))))
 
             def job(progress):
-                return llm_chat(job_cfg, prompt, lambda f: progress("Answering…", 100 * f), expected=1400,
-                                system=system, on_text=on_text, temperature=0.3)
+                answer = llm_chat(job_cfg, prompt, lambda f: progress("Answering…", 100 * f), expected=1400,
+                                  system=system, on_text=on_text, temperature=0.3)
+                if not re.sub(r"\[VERIFY:[^\]]*\]", "", answer or "").strip():
+                    raise RuntimeError("The AI sent back an empty answer. This usually means the question and this "
+                                       "patient's record were more than the model could read at once — ask again "
+                                       "(it now sends less), or start a New conversation.")
+                return answer
 
             def done(answer):
                 cc = vault.load_client(client["id"])
@@ -22868,7 +22894,7 @@ def run_gui():
                 for i, (k, lbl, draft) in enumerate(jobs):
                     out[k] = steps.run(i, job_cfg, fill(REVISE_PROMPT, {
                         "doc_label": lbl.lower(), "instructions": instr, "draft": draft,
-                        "source": (source or "(no transcript — rely on the draft)")[:int(job_cfg.get("max_chars", 24000))]}))
+                        "source": (source or "(no transcript — rely on the draft)")[:ai_chunk_chars(job_cfg)]}))
                 progress("Done.", 100)
                 return out
 
