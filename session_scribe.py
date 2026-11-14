@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.29"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.30"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -219,6 +219,7 @@ DEFAULT_CONFIG = {
     "appearance": "system",     # system / light / dark
     "theme_install_tried": "",
     "session_sort": "desc",     # date list order: desc = newest first, asc = oldest first
+    "contact_sort": "desc",     # the Contact log's order, the same way
     "doc_zoom": 0,              # document text size step (A−/A+)
     "export_format": "docx",    # last export format (docx / pdf)
     "setup_assistant_offered": False,   # first Setup visit: offered to install everything for this computer
@@ -14110,7 +14111,7 @@ def run_gui():
                 side="left", padx=px(14))
             hdr_btns = Flow(header, align="right", gap=px(8))
             hdr_btns.pack(side="right", fill="x", expand=True)
-            self.queue_btn = hdr_btns.add(ttk.Button(hdr_btns, text="🎙  Queue recordings",
+            self.queue_btn = hdr_btns.add(ttk.Button(hdr_btns, text="🎙  Queue",
                                                      command=lambda: self.open_queue(self.client_id)))
             hdr_btns.add(ttk.Button(hdr_btns, text="⚙  Settings", command=self.open_setup))
             hdr_btns.add(ttk.Button(hdr_btns, text="🔒  Lock", command=self.lock))
@@ -15064,7 +15065,7 @@ def run_gui():
                      "Pick the patient on the left, then click ＋ New session. You'll be walked "
                      "through it one step at a time, and each note builds on the previous ones. Have several "
                      "recordings? Queue them and let them run while you're away.",
-                     ("🎙  Queue recordings…", lambda: self.open_queue())),
+                     ("🎙  Queue…", lambda: self.open_queue())),
                 ]
                 words = {2: "Two", 3: "Three"}
                 ttk.Label(f, text=(f"{n_pat} patient{'s' if n_pat != 1 else ''} in your vault. " if n_pat else "")
@@ -18463,8 +18464,20 @@ def run_gui():
                                   "messages themselves or a recorded call.", style="Muted.TLabel", wraplength=px(560),
                           justify="left").pack(anchor="w", pady=(px(6), 0))
                 return
-            ttk.Label(v, text=f"{len(entries)} contact{'s' if len(entries) != 1 else ''}, newest first",
-                      style="Caption.TLabel").pack(anchor="w", pady=(px(4), px(2)))
+            oldest = cfg.get("contact_sort", "desc") == "asc"        # (like the session list's order button)
+            if oldest:
+                entries.reverse()
+            srt = ttk.Frame(v)
+            srt.pack(fill="x", pady=(px(4), px(2)))
+            ttk.Label(srt, text=f"{len(entries)} contact{'s' if len(entries) != 1 else ''}",
+                      style="Caption.TLabel").pack(side="left")
+
+            def flip_order():
+                cfg["contact_sort"] = "desc" if oldest else "asc"
+                save_config(cfg)
+                self.refresh_client_page(client["id"], select="comms")
+            ttk.Button(srt, text="↑  Oldest first" if oldest else "↓  Newest first", command=flip_order).pack(
+                side="right")
             lbox, clb = auto_scroll(v, lambda b: NiceList(b, "List.Treeview"))
             lbox.pack(fill="x")
             clb.configure(height=min(max(len(entries), 2), 4))      # (scrolls) — leaves the room for the thread
@@ -18508,8 +18521,8 @@ def run_gui():
             focus = getattr(self, "_contact_focus", None)
             i0 = next((i for i, e in enumerate(entries) if focus and (
                 (focus[0] in ("log", "sum") and e[3][0] == focus[0] and e[3][1].get("id") == focus[1]) or
-                (focus[0] == "day" and e[3] == ("day", focus[1])))), 0)
-            clb.selection_set(i0)
+                (focus[0] == "day" and e[3] == ("day", focus[1])))), len(entries) - 1 if oldest else 0)
+            clb.selection_set(i0)                    # (the newest one, unless another was chosen)
             clb.see(i0)
             show(i0)
             v._contacts = {"list": clb, "entries": entries, "show": show}
@@ -21785,15 +21798,39 @@ def run_gui():
             with_var.trace_add("write", kind_changed)
             kind_changed()
 
-            ttk.Label(f, text="Anything the recording won't capture? (optional)", style="H2.TLabel").grid(
-                row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
-            ttk.Label(f, text="Appearance, affect, body language, MSE observations, things said before "
-                              "recording started…", style="Muted.TLabel").grid(row=6, column=0, columnspan=3, sticky="w")
+            obs_head = ttk.Label(f, text="", style="H2.TLabel")
+            obs_head.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            obs_sub = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(760), justify="left")
+            obs_sub.grid(row=6, column=0, columnspan=3, sticky="w")
             ofr, obs = scrolled_text(f, height=5)
             ofr.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
             f.rowconfigure(7, weight=1)
             set_text(obs, w["observations"])
             obs.bind("<<Modified>>", lambda e: obs.edit_modified() and w.update(dirty=True))
+
+            def is_written():                  # no recording and no pasted transcript: you write what happened
+                return not audio_var.get().strip() and not w["pasted"] and not (w["transcript"].strip() or w["lines"])
+
+            def box_mode(*_):
+                if is_written():
+                    obs_head.config(text="What happened in the session?")
+                    obs_sub.config(text="No recording? Write what occurred: topics discussed, the patient's "
+                                        "presentation and mood, interventions you used and how they responded, "
+                                        "any risk, homework and the plan. The note is written from this.")
+                    obs.config(height=12)
+                else:
+                    obs_head.config(text="Anything the recording won't capture? (optional)")
+                    obs_sub.config(text="Appearance, affect, body language, MSE observations, things said before "
+                                        "recording started…")
+                    obs.config(height=5)
+            audio_var.trace_add("write", box_mode)
+            _show_paste = show_paste
+
+            def show_paste(on):                # (the box changes with the paste toggle too)
+                _show_paste(on)
+                box_mode()
+            toggle.config(command=lambda: show_paste(not w["pasted"]))
+            box_mode()
 
             def collect():
                 w["audio"] = audio_var.get()
@@ -21805,12 +21842,29 @@ def run_gui():
                 w["observations"] = get_text(obs).strip()
                 if w["pasted"]:
                     w["transcript"] = get_text(paste_txt).strip()
+                if is_written() and not w["transcript"].strip():
+                    w["source"] = "written"
+                elif w.get("source") == "written":
+                    w["source"] = ""
             w["collect"] = collect
 
             def next_step():
                 collect()
                 if not w["date"]:
                     return messagebox.showinfo(APP_NAME, "Enter the session date.")
+                if is_written():
+                    if not w["observations"]:
+                        return messagebox.showinfo(APP_NAME, "Write what happened in the session (or choose its "
+                                                             "recording) first.")
+                    w["transcript"], w["lines"] = "", []
+                    w["source"], w["dirty"] = "written", True
+                    generate = not w["note"] or messagebox.askyesno(
+                        APP_NAME, "Rewrite the note and overview from what you wrote?\n\n(No keeps the current "
+                                  "drafts.)")
+                    self.goto(3)
+                    if generate:
+                        self.start_generation()
+                    return
                 if w["pasted"]:
                     if not w["transcript"]:
                         return messagebox.showinfo(APP_NAME, "Paste the transcript first.")
@@ -21861,7 +21915,7 @@ def run_gui():
             self.queue_refresh()
             self.open_client(cid)
             self.set_status(f"{code}: recording sent to {name}. You'll get a notification when the draft is ready "
-                            "to review — Queue recordings shows its progress.")
+                            "to review — Queue shows its progress.")
 
         # ---- step 2
         def _step_transcribe(self, f):
@@ -22044,10 +22098,11 @@ def run_gui():
 
             nav = Flow(f)                          # reserved at the bottom: never pushed off-screen
             nav.pack(side="bottom", fill="x", pady=(10, 0), before=nb)
-            nav.add(ttk.Button(nav, text="◀ Back", command=lambda: self.goto(2)))
+            written = w.get("source") == "written" and not w["transcript"].strip()
+            nav.add(ttk.Button(nav, text="◀ Back", command=lambda: self.goto(0 if written else 2)))
             rw = nav.add(ttk.Button(nav, text="✎  Rewrite with instructions…",
                                     command=lambda: (collect(), self.rewrite_dialog())))
-            if not (w["transcript"].strip() or w["note"].strip() or w["overview"].strip()):
+            if not (w["transcript"].strip() or w["note"].strip() or w["overview"].strip() or written):
                 rw.config(state="disabled")
             if w.get("undo"):
                 def undo():
@@ -22098,6 +22153,12 @@ def run_gui():
             code, hide, context, used, values = self._gen_inputs(client, w["sid"], w["date"], w["number"],
                                                                  w["observations"])
             transcript, job_cfg = hide(w["transcript"]), dict(cfg)
+            if w.get("source") == "written" and not w["transcript"].strip():
+                # no recording: the Counselor's own account of the session is what the note is written from
+                transcript = hide(w["observations"])
+                values["observations"] = "(none beyond the account below)"
+                values["source_kind"] = ("the Counselor's own written account of what happened in the session "
+                                         "(there is no recording or transcript; document only what it states)")
             if w["kind"] == "parent":
                 values["contact_method"] = w.get("contact_method") or "In person (recorded)"
                 values.update(contact_with=w.get("contact_with") or "parent", contact_who=w.get("contact_who", ""))
@@ -23122,7 +23183,7 @@ def run_gui():
             extra = f"  ·  {n_tasks} task{'s' if n_tasks != 1 else ''} waiting" if n_tasks else ""
             self.queue_btn.config(text=(f"🎙  Queue  {done}/{total}" if (Q["running"] or away) else
                                         ("🎙  Queue  ·  " + str(total)) if total else
-                                        "🎙  Queue" if n_tasks else "🎙  Queue recordings") + extra)
+                                        "🎙  Queue") + extra)
 
         def stay_awake(self, on):
             """Stop the computer from sleeping while the queue runs (you're away from it).
