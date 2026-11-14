@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.18"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.19"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14381,8 +14381,12 @@ def run_gui():
                                   + ("FileVault" if IS_MAC else "BitLocker") + " (disk encryption). Always "
                                   "review drafts before they go in the EHR.",
                           style="Caption.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(18), 0))
+            self.show(build, is_home=True, home_key=self._home_key())
+
+        def _home_key(self):
+            """When Home can be shown as it is (anything that changes it changes this)."""
             with vault.one_look():
-                hkey = (
+                return (
                     vault.signature(),
                     date.today().isoformat(),
                     getattr(self, "setup_ok", None),
@@ -14390,7 +14394,19 @@ def run_gui():
                     getattr(THEME, "get", lambda _k: None)("mode"),
                     tuple(sorted(self._get_dash_collapsed())),
                 )
-            self.show(build, is_home=True, home_key=hkey)
+
+        def home_update(self, dkeys, hidden_delta=0):
+            """After Hide / ✕ / a ticked follow-up: take just those items off Home (no rebuild). Falls back to
+            redrawing Home where it can't (Home isn't the page on screen)."""
+            f = getattr(self, "_home_page_frame", None)
+            fn = getattr(f, "_dash_remove", None) if f is not None and self._alive(f) else None
+            if fn is not None and self._page_is_home_now() and self.page is f:
+                fn(list(dkeys), hidden_delta)
+                self._home_page_key = self._home_key()        # the page on screen is current: reuse it
+                return True
+            if not self.client_id and not self.wizard:
+                self.show_home_keep_scroll()
+            return False
 
         # ===================================================== client dialog
         def client_dialog(self, client=None):
@@ -19980,7 +19996,7 @@ def run_gui():
                 if getattr(self, "_dash_memo", None) is not None:
                     self._dash_memo = (self._sig, self._dash_memo[1], self._dash_memo[2])
             if refresh and not self.client_id and not self.wizard:
-                self.show_home_keep_scroll()
+                self.home_update([dk for dk in dkeys if dk], hidden_delta=added)
             return added
 
         def dismiss_dashboard_batch(self, client_dkey_pairs, refresh=True):
@@ -19993,7 +20009,7 @@ def run_gui():
             for cid, dkeys in by_cid.items():
                 total += self.dismiss_dashboard_items(cid, dkeys, refresh=False)
             if refresh and not self.client_id and not self.wizard:
-                self.show_home_keep_scroll()
+                self.home_update([dk for dks in by_cid.values() for dk in dks if dk], hidden_delta=total)
             return total
 
         def restore_dashboard_items(self, client_or_id=None, section_key=None, refresh=True):
@@ -20092,7 +20108,7 @@ def run_gui():
                 else:
                     self._sig = vault.signature()
             if refresh and not self.client_id and not self.wizard:
-                self.show_home_keep_scroll()
+                self.home_update([r.get("dkey") for r in rows if r.get("dkey")])
             return removed_count
 
         def _dashboard(self, f):
@@ -20105,35 +20121,44 @@ def run_gui():
             total = sum(len(v) for v in data.values())
             bar = Flow(top_, align="right", gap=px(8))
             bar.pack(side="right", fill="x", expand=True)
-            if hidden_total > 0:
-                bar.add(
-                    ttk.Button(
-                        bar,
-                        text=f"Unhide dismissed ({hidden_total})",
-                        command=lambda: self.restore_dashboard_items(),
-                    )
-                )
+            n_pat = sum(1 for c in self.clients if not c.get("archived"))
+            # what's on the page, so Hide / ✕ / a ticked follow-up update just their rows (see dash_remove)
+            reg = {"rows": {}, "groups": {}, "secs": {}, "tiles": {}, "hidden": hidden_total, "unhide": None,
+                   "bar": bar, "tiles_flow": None, "box": None, "n_pat": n_pat}
+            unhide = ttk.Button(bar, text=f"Unhide dismissed ({hidden_total})",
+                                command=lambda: self.restore_dashboard_items())
+            bar.add(unhide)
+            bar.show(unhide, hidden_total > 0)
+            reg["unhide"] = unhide
             bar.add(ttk.Button(bar, text="↻  Refresh all patients", style="Accent.TButton", command=self.refresh_all_patients))
             bar.add(ttk.Button(bar, text="📋  Supervision prep", command=self.supervision_prep))
-            n_pat = sum(1 for c in self.clients if not c.get("archived"))
-            ttk.Label(f, text=f"Your caseload · {n_pat} active patient{'s' if n_pat != 1 else ''}"
-                              + (" · everything's up to date" if not total else "")
-                              + (f" · {hidden_total} hidden" if hidden_total else ""), style="Muted.TLabel").pack(
-                anchor="w", pady=(px(2), px(6)))
+
+            def caseload_text(n_items, hidden):
+                return (f"Your caseload · {n_pat} active patient{'s' if n_pat != 1 else ''}"
+                        + (" · everything's up to date" if not n_items else "")
+                        + (f" · {hidden} hidden" if hidden else ""))
+            cl_lbl = ttk.Label(f, text=caseload_text(total, hidden_total), style="Muted.TLabel")
+            cl_lbl.pack(anchor="w", pady=(px(2), px(6)))
+            reg["caseload"], reg["caseload_text"] = cl_lbl, caseload_text
             self.progress_panel(f, owner=("all", "*")).pack(anchor="w", fill="x", pady=(0, px(6)))
             tiles = Flow(f, gap=px(10))
             tiles.pack(fill="x")
+            reg["tiles_flow"] = tiles
             for key, title, tone in DASH_SECTIONS:
                 n = len(data[key])
                 if not n:
                     continue
                 t_ = tiles.add(ttk.Frame(tiles, style="Card.TFrame", padding=(px(14), px(8))))
-                ttk.Label(t_, text=str(n), style="Hero.TLabel").pack(anchor="w")
+                n_lbl = ttk.Label(t_, text=str(n), style="Hero.TLabel")
+                n_lbl.pack(anchor="w")
                 ttk.Label(t_, text=title, style="Bad.TLabel" if tone == "Bad" else "Muted.TLabel").pack(anchor="w")
+                reg["tiles"][key] = (t_, n_lbl)
             sc, box = scrollable(f)
             sc.pack(fill="both", expand=True, pady=(px(12), 0))
+            reg["box"] = box
             collapsed = self._get_dash_collapsed()
             dash_groups = {}
+            plural = lambda n, w: f"{n} {w}{'s' if n != 1 else ''}"
             for key, title, tone in DASH_SECTIONS:
                 rows = data[key]
                 if not rows:
@@ -20150,20 +20175,24 @@ def run_gui():
                 dash_groups[key] = by_patient
                 sec_hdr = ttk.Frame(box)
                 sec_hdr.pack(fill="x", pady=(px(14), px(4)))
-                ttk.Label(
+                sec_lbl = ttk.Label(
                     sec_hdr,
-                    text=f"{title} ({len(rows)} item{'s' if len(rows) != 1 else ''} across {len(by_patient)} patient{'s' if len(by_patient) != 1 else ''})",
+                    text=f"{title} ({plural(len(rows), 'item')} across {plural(len(by_patient), 'patient')})",
                     style="Strong.TLabel",
-                ).pack(side="left")
+                )
+                sec_lbl.pack(side="left")
+                reg["secs"][key] = {"hdr": sec_hdr, "lbl": sec_lbl, "title": title, "n": len(rows)}
+                live = lambda k, cid=None: [x["row"] for x in reg["rows"].values()
+                                            if x["key"] == k and (cid is None or x["cid"] == cid)]
                 ttk.Button(
                     sec_hdr,
                     text="✕  Dismiss list",
-                    command=lambda rs=rows: self.permanently_dismiss_dashboard_rows(rs),
+                    command=lambda k=key: self.permanently_dismiss_dashboard_rows(live(k)),
                 ).pack(side="right", padx=(px(4), 0))
                 ttk.Button(
                     sec_hdr,
                     text="Hide list",
-                    command=lambda rs=rows: self.dismiss_dashboard_batch([(r["client"], r["dkey"]) for r in rs]),
+                    command=lambda k=key: self.dismiss_dashboard_batch([(r["client"], r["dkey"]) for r in live(k)]),
                 ).pack(side="right")
                 all_cids = [cid for cid, _, _ in by_patient]
                 sec_widgets = []
@@ -20173,18 +20202,18 @@ def run_gui():
                 )
                 min_all_btn.pack(side="right", padx=(0, px(6)))
 
-                def toggle_all_in_sec(k=key, cids=all_cids, sw=sec_widgets, mb=min_all_btn):
+                def toggle_all_in_sec(k=key, sw=sec_widgets, mb=min_all_btn):
                     col = self._get_dash_collapsed()
-                    minimize = not all((k, c_) in col for c_ in cids)
-                    for c_id, cd, cnt, ib, b in sw:
+                    live = [g for g in sw if g["card"].winfo_exists()]
+                    minimize = not all((k, g["cid"]) in col for g in live)
+                    for g in live:
                         if minimize:
-                            col.add((k, c_id))
-                            ib.pack_forget()
-                            b.config(text=f"▶  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                            col.add((k, g["cid"]))
+                            g["ib"].pack_forget()
                         else:
-                            col.discard((k, c_id))
-                            ib.pack(fill="x", pady=(px(4), 0))
-                            b.config(text=f"▼  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                            col.discard((k, g["cid"]))
+                            g["ib"].pack(fill="x", pady=(px(4), 0))
+                        g["btn"].config(text=f"{'▶' if minimize else '▼'}  {g['code']} ({plural(g['n'], 'item')})")
                     mb.config(text="Expand all patients" if minimize else "Minimize all patients")
                     self._save_dash_collapsed()
 
@@ -20205,34 +20234,38 @@ def run_gui():
                         command=None,
                     )
 
-                    def make_toggle(k=key, c_id=cid, cd=code, cnt=len(p_rows), ib=items_box, b=t_btn):
+                    g = {"cid": cid, "code": code, "n": len(p_rows), "ib": items_box, "btn": t_btn, "card": p_card,
+                         "key": key}
+                    reg["groups"][(key, cid)] = g
+
+                    def make_toggle(g=g):
                         def _toggle():
                             col = self._get_dash_collapsed()
-                            pair = (k, c_id)
+                            pair = (g["key"], g["cid"])
                             if pair in col:
                                 col.remove(pair)
-                                ib.pack(fill="x", pady=(px(4), 0))
-                                b.config(text=f"▼  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                                g["ib"].pack(fill="x", pady=(px(4), 0))
                             else:
                                 col.add(pair)
-                                ib.pack_forget()
-                                b.config(text=f"▶  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                                g["ib"].pack_forget()
+                            g["btn"].config(text=f"{'▶' if pair in col else '▼'}  {g['code']} ({plural(g['n'], 'item')})")
                             self._save_dash_collapsed()
                         return _toggle
 
                     t_btn.config(command=make_toggle())
                     t_btn.pack(side="left")
-                    sec_widgets.append((cid, code, len(p_rows), items_box, t_btn))
+                    sec_widgets.append(g)
                     ttk.Button(
                         p_hdr,
                         text="✕",
                         width=3,
-                        command=lambda rs=p_rows: self.permanently_dismiss_dashboard_rows(rs),
+                        command=lambda k=key, c_id=cid: self.permanently_dismiss_dashboard_rows(live(k, c_id)),
                     ).pack(side="right", padx=(px(4), 0))
                     ttk.Button(
                         p_hdr,
                         text="Hide client items",
-                        command=lambda c=p_client, rs=p_rows: self.dismiss_dashboard_items(c, [r["dkey"] for r in rs]),
+                        command=lambda c=p_client, k=key, c_id=cid: self.dismiss_dashboard_items(
+                            c, [r["dkey"] for r in live(k, c_id)]),
                     ).pack(side="right")
                     ttk.Button(
                         p_hdr,
@@ -20243,6 +20276,7 @@ def run_gui():
                     for r in p_rows:
                         r_ = ttk.Frame(items_box)
                         r_.pack(fill="x", pady=px(2), padx=(px(14), 0))
+                        reg["rows"][r["dkey"]] = {"w": r_, "key": key, "cid": cid, "row": r}
                         if key == "followups":
                             v = tk.BooleanVar(value=False)
                             r_._v = v                      # keep it alive, or the box shows as half ticked
@@ -20251,7 +20285,7 @@ def run_gui():
                                 variable=v,
                                 command=lambda r=r: (
                                     self.set_followup(r["client"], r["fid"], True, reopen=False),
-                                    self.show_home_keep_scroll(),
+                                    self.home_update([r["dkey"]]),
                                 ),
                             ).pack(side="left")
                         ttk.Label(
@@ -20282,12 +20316,63 @@ def run_gui():
                             ttk.Label(r_, text=fmt_date(r["when"]), style="Muted.TLabel").pack(side="right", padx=px(8))
                     if not is_min:
                         items_box.pack(fill="x", pady=(px(4), 0))
-            if not total:
+            def all_clear():
                 ttk.Label(box, text="Nothing needs your attention right now. Drafts to review, plan reviews, risk, score "
                                     "changes, follow-ups and homework show up here as they come in.",
                           style="Muted.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(10), 0))
+            if not total:
+                all_clear()
+
+            def dash_remove(dkeys, hidden_delta=0):
+                """Take these items off the page where they are — their rows, and a patient's card or a whole list
+                once it's empty — and bring the counts up to date. Nothing else on the page is rebuilt."""
+                col = self._get_dash_collapsed()
+                for dk in dkeys:
+                    row = reg["rows"].pop(dk, None)
+                    if not row:
+                        continue
+                    _quiet(row["w"].destroy)
+                    k, cid = row["key"], row["cid"]
+                    data[k] = [r for r in data.get(k, []) if r.get("dkey") != dk]
+                    g = reg["groups"].get((k, cid))
+                    if g:
+                        g["n"] -= 1
+                        if g["n"] <= 0:
+                            _quiet(g["card"].destroy)
+                            reg["groups"].pop((k, cid), None)
+                        else:
+                            g["btn"].config(text=f"{'▶' if (k, cid) in col else '▼'}  {g['code']} ({plural(g['n'], 'item')})")
+                    s = reg["secs"].get(k)
+                    if s:
+                        s["n"] -= 1
+                        if s["n"] <= 0:
+                            _quiet(s["hdr"].destroy)
+                            reg["secs"].pop(k, None)
+                        else:
+                            n_p = sum(1 for (k2, _c) in reg["groups"] if k2 == k)
+                            s["lbl"].config(text=f"{s['title']} ({plural(s['n'], 'item')} across {plural(n_p, 'patient')})")
+                    t = reg["tiles"].get(k)
+                    if t:
+                        n_left = len(data.get(k, []))
+                        if n_left:
+                            t[1].config(text=str(n_left))
+                        else:
+                            _quiet(t[0].destroy)
+                            reg["tiles"].pop(k, None)
+                            reg["tiles_flow"]._layout = None
+                            reg["tiles_flow"]._schedule()
+                reg["hidden"] = max(0, reg["hidden"] + hidden_delta)
+                left = len(reg["rows"])
+                reg["caseload"].config(text=reg["caseload_text"](left, reg["hidden"]))
+                reg["unhide"].config(text=f"Unhide dismissed ({reg['hidden']})")
+                reg["bar"].show(reg["unhide"], reg["hidden"] > 0)
+                if not left and not getattr(box, "_all_clear", False):
+                    box._all_clear = True
+                    all_clear()
             f._dash = data
             f._dash_groups = dash_groups
+            f._dash_remove = dash_remove
+            f._dash_reg = reg
             sc.realize_all()
 
         # ========================================================== WIZARD
