@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.9"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.10"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -22374,24 +22374,33 @@ def run_gui():
                 return False
             works = [self._patient_refresh_work(c["id"], force=force) for c in clients]
             todo = [w for w in works if w["n_ins"] or w["case"]]
-            if not todo:
-                with_docs = [w for w in works if w["docs"]]
-                if not with_docs:
-                    self.set_status("No active patients have session documentation to refresh yet.")
-                    return False
-                if not messagebox.askyesno(
-                        APP_NAME, f"All {len(with_docs)} active patient(s) already have up-to-date Progress & risk "
-                                  "checks and Case overviews.\n\nRefresh everything for all patients anyway?",
-                        parent=root):
-                    self.set_status(f"All {len(clients)} active patient(s): Progress & risk and Case overview "
+            current = [w for w in works if w["docs"] and not (w["n_ins"] or w["case"])]   # nothing new to check
+            no_docs = [w["code"] for w in works if not w["docs"] and not (w["n_ins"] or w["case"])]
+            if not todo and not current:
+                self.set_status("No active patients have session documentation to refresh yet.")
+                return False
+            if current:
+                names = ", ".join(w["code"] for w in current[:12]) + (" …" if len(current) > 12 else "")
+                ask = (f"All {len(current)} active patient(s) already have up-to-date Progress & risk checks and Case "
+                       "overviews.\n\nRefresh everything for all patients anyway?" if not todo else
+                       f"{len(todo)} patient(s) have something new to refresh. {len(current)} are already up to "
+                       f"date: {names}.\n\nRefresh those too? Yes — every patient is queued (theirs are rechecked "
+                       "and their case overviews rewritten, which takes longer). No — only the ones with "
+                       "something new.")
+                if messagebox.askyesno(APP_NAME, ask, parent=root):
+                    todo += [w for w in (self._patient_refresh_work(w["id"], force=True) for w in current)
+                             if w["n_ins"] or w["case"]]
+                elif not todo:
+                    self.set_status(f"All {len(current)} active patient(s): Progress & risk and Case overview "
                                     "are already up to date.")
                     return False
-                works = [self._patient_refresh_work(w["id"], force=True) for w in with_docs]
-                todo = [w for w in works if w["n_ins"] or w["case"]]
+            order = {c["id"]: i for i, c in enumerate(clients)}       # the queue follows the patient list
+            todo.sort(key=lambda w: order.get(w["id"], 0))
             results = [self._queue_patient_refresh(w) for w in todo]
             n = len(todo)
             self.set_status(f"Refreshing {n} patient{'s' if n != 1 else ''}, one at a time — each is its own "
-                            "task in Queue › Tasks.")
+                            "task in Queue › Tasks."
+                            + (f" Not queued (no session notes yet): {', '.join(no_docs)}." if no_docs else ""))
             if not self.client_id and not self.wizard:
                 self.show_home_keep_scroll()
             return next((r for r in results if r), False)
