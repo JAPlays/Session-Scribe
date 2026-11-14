@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.27"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.28"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2513,7 +2513,118 @@ def compare_appointments(appts, sessions, first_number=1):
 EXPORT_KINDS = [("notes", "Progress notes"), ("intake", "Intake assessments"), ("overviews", "Session overviews"),
                 ("transcripts", "Transcripts"), ("plan", "Current treatment plan"),
                 ("plans_old", "Earlier treatment plan versions"), ("case", "Case overview"),
+                ("contacts", "Contact log"), ("assessments", "Assessments"),
                 ("chats", "Ask-AI conversations")]
+
+
+def _paras(text):
+    return [p.strip() for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()]
+
+
+def thread_export_blocks(text):
+    """A logged thread for an export: each email under its own "who → whom · date time" heading (and its subject
+    when the conversation changes), then its paragraphs; a day's texts as one "time  who: message" list."""
+    pre, subject, blocks = contact_blocks(text)
+    if not blocks:
+        return [("p", p) for p in _paras(text)]
+    out = [("p", "Subject: " + subject)] if subject else []
+    out += [("p", p) for p in _paras(reflow_paragraphs("\n".join(pre)))]
+    texts, last = [], re.sub(r"^((re|fwd?)\s*:\s*)+", "", subject, flags=re.I).lower()
+
+    def flush():
+        if texts:
+            out.append(("p", "\n".join(texts)))
+            texts.clear()
+    for d, _mins, tm, block in sorted(blocks, key=lambda b: b[1]):
+        first, _, rest = block.partition("\n")
+        m = re.match(r"^\[[^\]]*\]\s*(.*)$", first, re.S)
+        who_line = m.group(1) if m else first
+        esubj = ""
+        if rest.startswith("Subject: "):
+            s_line, _, rest = rest.partition("\n")
+            esubj = s_line[9:].strip()
+        if rest.strip() or who_line.endswith(":") or esubj:      # an email
+            flush()
+            out.append(("h3", f"{who_line.rstrip(':').strip()}  ·  {fmt_date(d)}" + (f" {tm}" if tm else "")))
+            key = re.sub(r"^((re|fwd?)\s*:\s*)+", "", esubj, flags=re.I).lower()
+            if esubj and key != last:
+                out.append(("p", "Subject: " + esubj))
+                last = key
+            out += [("p", p) for p in _paras(reflow_paragraphs(rest))]
+        else:                                                     # a text message (or a reaction)
+            texts.append(f"{tm}   {who_line}" if tm else who_line)
+    flush()
+    return out
+
+
+def _export_party(x):
+    if x.get("mixed"):
+        return "several people"
+    w, who = x.get("with", "patient"), (x.get("who") or "").strip()
+    return {"patient": "the patient", "parent": "parent / guardian"}.get(w, who or "other contact")
+
+
+def assessment_export_blocks(client, inr):
+    """Every assessment in the date range, oldest first: its result, warnings, what it means, the change since the
+    last time and (taken here) every answer."""
+    out = []
+    linked = {a.get("measure_id") for a in client.get("assessments") or [] if a.get("measure_id")}
+    rows = [("m", m.get("date", ""), m) for m in client.get("measures") or [] if m.get("id") not in linked] + \
+           [("a", a.get("date", ""), a) for a in client.get("assessments") or []]
+    rows.sort(key=lambda r: (r[1], r[2].get("added", "")))
+    done = {}
+    for kind, day, x in rows:
+        if not inr(day):
+            continue
+        if kind == "m":
+            band = measure_band(x.get("kind"), x.get("total"))
+            out.append(("h2", f"{x.get('kind', 'Measure')} — {fmt_date(day)}"))
+            lines = [f"Score: {x.get('total')}" + (f" ({band})" if band else "") + f"  ·  {x.get('source', 'manual')}"]
+            if x.get("items"):
+                lines.append("Answers: " + " ".join(map(str, x["items"])))
+                if x.get("kind") == "PHQ-9" and len(x["items"]) > 8 and x["items"][8]:
+                    lines.append(f"⚠ Item 9 answered {x['items'][8]}.")
+            out.append(("p", "\n".join(lines)))
+            continue
+        inst = ASSESS_INSTRUMENTS.get(x.get("instrument"), {})
+        r = x.get("result") or {}
+        out.append(("h2", f"{x.get('name', 'Assessment')} — {fmt_date(day)}" + (f" {x['time']}" if x.get("time") and
+                                                                                   x.get("administered") else "")))
+        if inst.get("title") and inst["title"] != x.get("name"):
+            out.append(("p", inst["title"]))
+        lines = []
+        summary = r.get("summary") or x.get("score") or ""
+        if summary:
+            lines.append("Result: " + summary)
+        if x.get("administered") and not x.get("completed", True):
+            lines.append(f"Stopped early: {x.get('answered', 0)} of {x.get('of', 0)} questions answered.")
+        lines += [f"⚠ {fl}" for fl in r.get("flags") or []]
+        prev = done.get(x.get("instrument"))
+        if x.get("administered") and x.get("completed", True) and prev and r.get("total") is not None \
+                and (prev.get("result") or {}).get("total") is not None:
+            ch = r["total"] - prev["result"]["total"]
+            lines.append(f"Change: {'+' if ch > 0 else ''}{ch} since {fmt_date(prev.get('date', ''))}"
+                         if ch else f"No change since {fmt_date(prev.get('date', ''))}")
+        if lines:
+            out.append(("p", "\n".join(lines)))
+        if r.get("lines"):
+            out.append(("p", "\n".join(r["lines"])))
+        if x.get("notes"):
+            out.append(("p", "Notes: " + x["notes"]))
+        answers = x.get("answers") or {}
+        items = [q for q in inst.get("items") or [] if q["id"] in answers]
+        if items:
+            out.append(("h3", "Answers"))
+            al = []
+            for n, q in enumerate(items, 1):
+                v = answers[q["id"]]
+                shown = _label_of(inst, q["id"], v) if q["kind"] == "choice" else (
+                    f"{v} {q.get('unit', '')}".strip() if q["kind"] == "number" else (v or "—"))
+                al.append(f"{n}. {q['text']} — {shown}")
+            out.append(("p", "\n".join(al)))
+        if x.get("administered") and x.get("completed", True):
+            done[x.get("instrument")] = x
+    return out
 
 
 def collect_export(client, sessions, include, start="", end=""):
@@ -2547,8 +2658,8 @@ def collect_export(client, sessions, include, start="", end=""):
             section(f"Treatment plan (version {pl.get('version', '')}, {fmt_date(str(pl.get('created', ''))[:10])})",
                     plan_for_ehr(pl["text"]))
     for day, records in group_by_date(sessions):
-        if not inr(day):
-            continue
+        if not inr(day) or ("contacts" in include and is_contact_day(records)):
+            continue                                     # (contact notes go in the Contact log section then)
         parts = []
         for label, key, _sid, d in day_docs(records):
             kind = d.get("meta", {}).get("kind")
@@ -2566,6 +2677,36 @@ def collect_export(client, sessions, include, start="", end=""):
             blocks.append(("h2", label))
             for para in re.split(r"\n\s*\n", text.strip()):
                 blocks.append(("p", para.strip()))
+    if "contacts" in include:
+        rows = [(x.get("date", ""), x.get("time", ""), "log", x) for x in client.get("communications") or []
+                if inr(x.get("date", ""))]
+        rows += [(day, "", "note", records) for day, records in group_by_date(sessions)
+                 if inr(day) and is_contact_day(records)]
+        if rows:
+            if not first:
+                blocks.append(("break", ""))
+            first = False
+            blocks.append(("h1", "Contact log"))
+            for day, tm, kind, x in sorted(rows, key=lambda r: (r[0], _clock(r[1]) if r[1] else -1)):
+                if kind == "log":
+                    blocks.append(("h2", f"{fmt_date(day)}" + (f" {tm}" if tm else "") +
+                                   f" — {x.get('method', 'Contact')} with {_export_party(x)}"))
+                    if x.get("notes"):
+                        blocks.append(("p", "Note: " + x["notes"]))
+                    blocks += thread_export_blocks(x.get("text", ""))
+                else:
+                    blocks.append(("h2", f"{fmt_date(day)} — {day_title(x)} note"))
+                    for _label, key, _sid, d in day_docs(x):
+                        if key == "note" and (d.get("note") or "").strip():
+                            blocks += [("p", p) for p in _paras(d["note"])]
+    if "assessments" in include:
+        ab = assessment_export_blocks(client, lambda d_: (not start or d_ >= start) and (not end or d_ <= end))
+        if ab:
+            if not first:
+                blocks.append(("break", ""))
+            first = False
+            blocks.append(("h1", "Assessments"))
+            blocks += ab
     if "chats" in include:
         for ch in client.get("chats") or []:
             if not inr(str(ch.get("created", ""))[:10]):
@@ -2596,7 +2737,7 @@ def write_docx(path, blocks, footer=""):
         if kind == "break":
             body.append('<w:p><w:r><w:br w:type="page"/></w:r></w:p>')
             continue
-        style = {"title": "Title", "sub": "Subtitle", "h1": "Heading1", "h2": "Heading2"}.get(kind)
+        style = {"title": "Title", "sub": "Subtitle", "h1": "Heading1", "h2": "Heading2", "h3": "Heading3"}.get(kind)
         ppr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
         runs = []
         for i, line in enumerate(text.split("\n")):
@@ -2628,6 +2769,9 @@ def write_docx(path, blocks, footer=""):
               '<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/>'
               '<w:next w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="200" w:after="80"/><w:outlineLvl w:val="1"/>'
               '</w:pPr><w:rPr><w:b/><w:color w:val="2E74B5"/><w:sz w:val="24"/></w:rPr></w:style>'
+              '<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/>'
+              '<w:next w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="160" w:after="40"/><w:outlineLvl w:val="2"/>'
+              '</w:pPr><w:rPr><w:b/><w:color w:val="262626"/><w:sz w:val="22"/></w:rPr></w:style>'
               '<w:style w:type="paragraph" w:styleId="Footer"><w:name w:val="footer"/><w:basedOn w:val="Normal"/>'
               '<w:rPr><w:color w:val="7F7F7F"/><w:sz w:val="18"/></w:rPr></w:style>'
               '</w:styles>')
@@ -2679,9 +2823,10 @@ def write_pdf(path, blocks, footer=""):
     W_, H_, M = 612, 792, 72
     styles = {"title": ("F2", 22, 10, (0.12, 0.22, 0.39)), "sub": ("F1", 10, 18, (0.35, 0.35, 0.35)),
               "h1": ("F2", 15, 8, (0.12, 0.22, 0.39)), "h2": ("F2", 12, 5, (0.18, 0.45, 0.71)),
-              "p": ("F1", 11, 7, (0.1, 0.1, 0.1))}
+              "h3": ("F2", 11, 3, (0.15, 0.15, 0.15)), "p": ("F1", 11, 7, (0.1, 0.1, 0.1))}
 
     def enc(t):
+        t = t.replace("→", "->").replace("⚠", "(!)").replace("─", "-")      # (not in the PDF's built-in font)
         return t.encode("cp1252", "replace").decode("latin-1")
 
     def width(t, size, bold):
@@ -2715,9 +2860,9 @@ def write_pdf(path, blocks, footer=""):
         font, size, after, rgb = styles.get(kind, styles["p"])
         lead = size * 1.35
         lines = wrap(text, size, font == "F2")
-        if kind in ("h1", "h2") and y - lead * (len(lines) + 2) < M:
+        if kind in ("h1", "h2", "h3") and y - lead * (len(lines) + 2) < M:
             new_page()                                    # keep headings with what follows
-        if kind in ("h1", "h2") and y < H_ - M:
+        if kind in ("h1", "h2", "h3") and y < H_ - M:
             y -= size * 0.6
         for ln in lines:
             if y - lead < M:
@@ -18294,7 +18439,7 @@ def run_gui():
             client = vault.load_client(client["id"])
             sessions = vault.sessions_for(client["id"])
             days = sorted({d["meta"].get("session_date") for _, d in sessions if d["meta"].get("session_date")})
-            win = new_window(root, f"Export — {client.get('code', '')}", "720x640")
+            win = new_window(root, f"Export — {client.get('code', '')}", "720x700")
             win.grab_set()
             f = ttk.Frame(win, padding=(px(26), px(20)))
             f.pack(fill="both", expand=True)
