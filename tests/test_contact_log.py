@@ -128,6 +128,26 @@ def script(app, root, V, h):
     app.open_client(cid3, select="comms"); h.pump(root, 1)
     h.ok("an older multi-date entry is split by date when the patient is opened",
          sorted(e["date"] for e in V.load_client(cid3)["communications"]) == ["2026-10-19", "2026-10-21"])
+    # one entry per date for texts and one for emails — whoever they were with
+    cid4 = V.save_client({"code": "CL4"})
+    app.comm_add(cid4, {"date": "x", "with": "patient", "who": "", "method": "Text messages",
+                        "text": "[2026-11-03 9:00 AM] Patient: running late", "notes": ""})
+    app.comm_add(cid4, {"date": "x", "with": "parent", "who": "", "method": "Email",
+                        "text": "[2026-11-03 8:00 AM] Parent → Counselor:\nForms attached.", "notes": ""})
+    app.comm_add(cid4, {"date": "x", "with": "other", "who": "teacher", "method": "Email",
+                        "text": "[2026-11-03 7:30 AM] Teacher → Counselor:\nQuick question.", "notes": ""})
+    app.comm_add(cid4, {"date": "x", "with": "parent", "who": "", "method": "Text messages",
+                        "text": "[2026-11-03 6:45 AM] Parent: on our way", "notes": ""})
+    log = V.load_client(cid4)["communications"]
+    texts = [e for e in log if e["method"] == "Text messages"]
+    mails = [e for e in log if e["method"] == "Email"]
+    h.ok("the same day's texts and emails are two entries (one each), whoever they were with",
+         len(log) == 2 and len(texts) == 1 and len(mails) == 1 and all(e["date"] == "2026-11-03" for e in log), log)
+    h.ok("…each in time order, marked as several people when it mixes them",
+         texts[0]["text"].index("6:45 AM") < texts[0]["text"].index("9:00 AM")
+         and mails[0]["text"].index("Teacher") < mails[0]["text"].index("Parent")
+         and app.comm_party(mails[0]) == "several people" and texts[0]["time"] == "6:45 AM", (texts, mails))
+
     # dates are read from what's pasted or loaded
     app.external_comm(V.load_client(cid3)); h.pump(root, 0.4)
     w = app.parent_win

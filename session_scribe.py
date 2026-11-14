@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.24"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.25"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7622,12 +7622,15 @@ def merge_contacts(entries, new, now=None):
     for b in blocks:
         by_date.setdefault(b[0], []).append(b)
     first = min(by_date)
-    same = lambda e: (e.get("method") == new.get("method") and e.get("with", "patient") == new.get("with", "patient")
-                      and (e.get("who") or "") == (new.get("who") or ""))
+    # one entry per date for each way of contact: all of a day's texts together, all of its emails together
+    same = lambda e: e.get("method") == new.get("method")
     for d in sorted(by_date):
         bl = by_date[d]
-        tgt = next((e for e in entries if e.get("date") == d and same(e)), None)
+        tgt = next((e for e in entries if e.get("date") == d and same(e) and contact_blocks(e.get("text", ""))[2]),
+                   None)
         if tgt is not None:
+            if (tgt.get("with", "patient"), tgt.get("who") or "") != (new.get("with", "patient"), new.get("who") or ""):
+                tgt["mixed"] = True                    # more than one person that day (each message says who)
             p2, s2, b2 = contact_blocks(tgt.get("text", ""))
             seen = {re.sub(r"\s+", " ", b[3]).strip().lower() for b in b2}
             add = [b for b in bl if re.sub(r"\s+", " ", b[3]).strip().lower() not in seen]
@@ -17790,6 +17793,8 @@ def run_gui():
 
         @staticmethod
         def comm_party(entry):
+            if entry.get("mixed"):
+                return "several people"
             w, who = entry.get("with", "patient"), (entry.get("who") or "").strip()
             return {"patient": "Patient", "parent": "Parent / guardian"}.get(w, who.capitalize() or "Other contact")
 
