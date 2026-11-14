@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.31"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.32"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -8037,6 +8037,330 @@ def read_messages_file(path):
 
 
 # --------------------------------------------------------------------------- #
+# Registration forms: every answer read out of the form and organized by topic (no AI)
+# --------------------------------------------------------------------------- #
+def _nk(s):
+    return re.sub(r"\s+", "", s or "").lower()
+
+
+def _reg_from_pdf(data):
+    """(title, form date, [(form section, question, answer)]) from a filled-in form PDF (a Jotform-style
+    export: bold questions, answers beside or under them in a lighter type, larger bold section titles).
+    Questions and answers are paired by where they sit on the page; the instructions and policy text in
+    between are left out."""
+    import io
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data))
+    title, form_date, out = "", "", []
+    section, label, value, prev_label, beside = "", "", [], False, False
+
+    def clean(v):
+        v = re.sub(r"\b(1[89]\d|20\d) {1,3}(\d)\b", r"\1\2", v)          # a year the PDF split ("197  1")
+        return re.sub(r"[ \t\xa0]{2,}", " ", v)
+
+    def flush():
+        nonlocal label, value, beside
+        v = clean("\n".join(value)).strip()
+        if label and v:
+            out.append((section, re.sub(r"\s+", " ", label).strip(), v))
+        label, value, beside = "", [], False
+    for page in reader.pages:
+        frags = []
+
+        def vis(text, cm, tm, fd, fs):
+            t = (text or "").strip()
+            if not t:
+                return
+            try:
+                y = tm[5] * cm[3] + cm[5]
+                x = tm[4] * cm[0] + cm[4]
+            except (TypeError, IndexError):
+                return
+            font = str((fd or {}).get("/BaseFont", "")) if hasattr(fd, "get") else ""
+            size = float(fs or 0) * abs(float(tm[0] or 1)) * abs(float(cm[0] or 1))    # as printed on the page
+            frags.append((y, x, "bold" in font.lower(), size, t))
+        page.extract_text(visitor_text=vis)
+        rows_b, rows_r = {}, {}
+        for y, x, b, fs, t in frags:
+            (rows_b if b else rows_r).setdefault(round(y), []).append((x, fs, t))
+        bsizes = sorted(fs for y, x, b, fs, t in frags if b) or [0]
+        label_size = bsizes[len(bsizes) // 2]
+        bold, bold_y = {}, {}
+        for y_, parts in sorted(rows_b.items(), key=lambda kv: -kv[0]):
+            parts.sort(key=lambda p: p[0])
+            key = _nk("".join(p[2] for p in parts))
+            bold[key] = "head" if max(p[1] for p in parts) >= label_size * 1.3 else "label"
+            bold_y.setdefault(key, []).append(y_)               # top to bottom, like the lines below
+        prose = {_nk("".join(p[2] for p in sorted(parts))) for parts in rows_r.values()
+                 if label_size and max(p[1] for p in parts) >= label_size * 0.95}   # instructions, policies
+        chips = {_nk(t) for y, x, b, fs, t in frags if not b and label_size and fs >= label_size * 0.85}
+        run_in = [k for k, kind in bold.items() if kind == "label" and len(k) > 3]
+        try:
+            layout = page.extract_text(extraction_mode="layout")
+        except Exception:
+            layout = page.extract_text()
+        last_y = None
+
+        def split_after(text, n):
+            """text cut after its first n non-space characters."""
+            seen = 0
+            for i, ch in enumerate(text):
+                if not ch.isspace():
+                    seen += 1
+                    if seen == n:
+                        return text[:i + 1], text[i + 1:]
+            return text, ""
+        for raw in layout.split("\n"):
+            s = raw.strip()
+            if not s:
+                prev_label = False
+                continue
+            if re.fullmatch(r"\d{1,3}", s) or s.startswith("Document ID:"):
+                continue
+            k_all = _nk(s)
+            m = re.match(r"^\s*(\S.*?)\s{3,}(\S.*)$", raw)
+            left, right = (m.group(1), m.group(2)) if m else (s, "")
+            kind = bold.get(k_all) or (bold.get(_nk(left)) if m else None)
+            if kind is None and not m:                    # a question run straight into its answer
+                pre = max((k for k in bold if bold[k] == "label" and len(k) > 3 and k_all.startswith(k)
+                           and k != k_all), key=len, default="")
+                if pre:
+                    left, right = split_after(s, len(pre))
+                    left, right = left.strip(), right.strip()
+                    m, kind = True, "label"
+            key_now = k_all if bold.get(k_all) else _nk(left)
+            ys = bold_y.get(key_now)
+            y_now = ys.pop(0) if ys else None
+            near = last_y is not None and y_now is not None and 0 < last_y - y_now < label_size * 1.6
+            if kind:
+                last_y = y_now
+            if kind == "head":
+                flush()
+                section = s if bold.get(k_all) == "head" else left
+                title = title or section
+                prev_label = False
+                continue
+            if kind == "label":
+                text = s if bold.get(k_all) else left
+                if label and (near if y_now is not None else prev_label):
+                    label += " " + text                      # the question carries on onto this line
+                else:
+                    flush()
+                    label = text
+                if m and not bold.get(k_all):
+                    parts = re.split(r"\s{3,}", right.strip())
+                    # several ticked boxes ("Shy and inhibited   Difficulty feeding") vs one answer the PDF
+                    # spaced out ("James   Doe", "(631)   468-8347")
+                    joiner = "; " if len(parts) > 1 and all(_nk(p) in chips and re.search(r"[A-Za-z]", p)
+                                                            for p in parts) \
+                        and any(len(p.split()) > 1 for p in parts) else " "
+                    value.append(joiner.join(parts))
+                    beside = True                            # answered beside the question
+                prev_label = True
+                continue
+            prev_label = False
+            if k_all in prose or any(k_all.startswith(r) and k_all != r for r in run_in):
+                continue                                     # the form's own instructions and policy text
+            if not label:
+                if not form_date and not out and find_date(s):
+                    form_date = parse_date(s) or find_date(s)
+                continue
+            if beside and len(raw) - len(raw.lstrip()) < 20:
+                flush()                                      # full-width text after a side answer: the form's
+                continue                                     # own wording (a policy paragraph), not the answer
+            parts = re.split(r"\s{3,}", s)
+            value.append(("; " if len(parts) > 1 and all(_nk(p) in chips and re.search(r"[A-Za-z]", p)
+                                                         for p in parts)
+                          and any(len(p.split()) > 1 for p in parts) else " ").join(parts))
+    flush()
+    return title, form_date, out
+
+
+def _reg_from_text(text):
+    """The same from plain text (a .docx or .txt form): "Question: answer" lines; a short line on its own
+    ending without a colon starts a section."""
+    out, section, title = [], "", ""
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"^([^:]{2,90}?)\s*:\s+(\S.*)$", s)
+        if m:
+            out.append((section, m.group(1).strip(), m.group(2).strip()))
+        elif len(s) < 60 and not s.endswith((".", ",", "?")) and not re.search(r"\d", s):
+            section = s
+            title = title or s
+    return title, find_date(text or ""), out
+
+
+# (pattern on the question, topic, short label) — first match wins
+_REG_RULES = [
+    (r"policy holder.*date of birth|policy holder.*dob", "Insurance & billing", "Policy holder's date of birth"),
+    (r"policy holder.*phone", "Insurance & billing", "Policy holder's phone"),
+    (r"relationship to policy holder", "Insurance & billing", "Patient's relationship to policy holder"),
+    (r"policy holder", "Insurance & billing", "Policy holder"),
+    (r"insurance company", "Insurance & billing", "Insurance company"),
+    (r"insurance id|member id", "Insurance & billing", "Insurance ID"),
+    (r"paying with insurance|private pay|out-of-pocket", "Insurance & billing", "Paying by"),
+    (r"accident or injury", "Insurance & billing", "Related to an accident or injury"),
+    (r"responsible for the bill", "Insurance & billing", "Responsible for the bill"),
+    (r"patient'?s full name|^patient'?s? name$", "Patient", "Name"),
+    (r"date of birth|\bdob\b", "Patient", "Date of birth"),
+    (r"gender|\bsex\b", "Patient", "Gender"),
+    (r"address", "Patient", "Address"),
+    (r"language", "Patient", "Language spoken at home"),
+    (r"text you", "Contact preferences", "OK to text"),
+    (r"voicemail", "Contact preferences", "OK to leave a voicemail"),
+    (r"preferred (form of|way of|method of)? ?contact", "Contact preferences", "Preferred contact"),
+    (r"therapist'?s name", "Treatment", "Therapist"),
+    (r"first appointment", "Treatment", "First appointment"),
+    (r"reason", "Treatment", "Reason for starting therapy"),
+    (r"psychological and/or psychiatric services|services your child has received in\s*past",
+     "Treatment", "Past mental health services"),
+    (r"special services", "Treatment", "Special services (school or outside agency)"),
+    (r"best hopes", "Treatment", "Hopes for the child"),
+    (r"firearm.*access|access to the firearm", "Safety", "Child has access to the firearm"),
+    (r"firearm|\bgun\b", "Safety", "Firearm in the home"),
+    (r"experienced any of the following", "Safety", "Recent experiences"),
+    (r"primary care", "Medical", "Primary care physician"),
+    (r"prescrib|psychiatrist", "Medical", "Prescriber / psychiatrist"),
+    (r"family stresses|changes in the past year", "Family & home", "Stresses or changes in the past year"),
+    (r"illnesses|allerg", "Medical", "Illnesses and allergies"),
+    (r"grades? (were )?repeated", "School", "Grades repeated"),
+    (r"school grade|^grade", "School", "Grade"),
+    (r"school name", "School", "School"),
+    (r"school phone", "School", "School phone"),
+    (r"marital status", "Family & home", "Parents' marital status"),
+    (r"details regarding this", "Family & home", "About the parents' situation"),
+    (r"family members.*(south shore|elsewhere)|close relations", "Family & home",
+     "Family members in therapy"),
+    (r"family members.*(psychotherapy|counseling|psychiatry)", "Family & home",
+     "Child or family seen for psychotherapy, counseling or psychiatry"),
+    (r"relationship problems|emotional problems", "Family & home", "Problems at home"),
+    (r"family stresses|changes in the past year", "Family & home", "Stresses or changes in the past year"),
+    (r"agree on ways", "Family & home", "Parents agree on how to help"),
+    (r"disciplined", "Family & home", "Discipline"),
+    (r"best things", "Family & home", "Strengths (from the parents)"),
+    (r"foster|adopted", "Family & home", "Foster or adopted"),
+    (r"mother'?s condition|pregnancy", "Development", "Pregnancy"),
+    (r"births before", "Development", "Births before this child"),
+    (r"age of mother", "Development", "Mother's age at the birth"),
+    (r"milestones", "Development", "Developmental milestones on target"),
+    (r"difficulties your child has had", "Development", "Early difficulties"),
+    (r"unusual", "Development", "Other early history"),
+    (r"use and disclose|authori[sz]e .*to:", "Consents", "Release of information to"),
+    (r"released/exchanged|information to be released", "Consents", "Release covers"),
+    (r"covers the period", "Consents", "Release period"),
+]
+REG_TOPICS = ["Patient", "Parents / guardians", "Emergency contact", "Contact preferences", "Treatment", "Safety",
+              "Medical", "School", "Family & home", "Development", "Insurance & billing", "Consents"]
+
+
+def _reg_short(q):
+    q = re.sub(r"\((?:type n/?a|if paying|if you)[^)]*\)", "", q, flags=re.I)
+    q = re.sub(r"\s*(please (describe|explain|elaborate|list)[^?]*|if so,[^?]*)[:.]?\s*$", "", q, flags=re.I)
+    return re.sub(r"\s+", " ", q).strip(" :")
+
+
+def organize_registration(title, form_date, fields):
+    """The form's answers by topic: {"title", "form_date", "fields": [{"topic", "label", "value", "q"}]} —
+    guardians and the emergency contact gathered into one line each, repeats and "Signature" left out."""
+    out, people, signed, seen = [], {}, [], set()
+    for section, q, a in fields:
+        ql = q.lower()
+        a = a.strip()
+        if ql in ("signature",) or not a:
+            continue
+        if ql == "date":
+            signed.append(a)
+            continue
+        g = re.search(r"(parent|guardian)\S*\s*(\d)\s*(name|cell|phone|e-?mail|relationship)", ql)
+        e = re.search(r"emergency contact\s*(name|phone|relationship)", ql)
+        if g or e:
+            key = ("Parents / guardians", f"Parent / guardian {g.group(2)}") if g else \
+                ("Emergency contact", "Emergency contact")
+            part = (g.group(3) if g else e.group(1)).replace("cell", "phone").replace("-", "")
+            people.setdefault(key, {})[part] = a
+            continue
+        rule = next(((t, l) for p, t, l in _REG_RULES if re.search(p, ql)), None)
+        if rule is None and (re.search(r"polic|rights|responsib|consent|privacy|confidential|agreement",
+                                       section, re.I) or
+                             (len(a) > 600 and not q.rstrip().endswith(("?", ":")))):
+            continue                                         # the form's policy pages: wording, not answers
+        topic, label = rule or (re.sub(r"\s+", " ", section).strip() or "Other", _reg_short(q))
+        sig = (label, _nk(a))
+        if sig in seen or (label == "Name" and any(f["label"] == "Name" for f in out)):
+            continue                                         # (the patient's name again on a later page)
+        seen.add(sig)
+        out.append({"topic": topic, "label": label, "value": a, "q": q})
+    for (topic, label), p in people.items():
+        head = p.get("name", "") + (f" — {p['relationship']}" if p.get("relationship") else "")
+        rest = " · ".join(x for x in (p.get("phone"), p.get("email")) if x)
+        out.append({"topic": topic, "label": label, "value": (head + ("\n" + rest if rest else "")).strip(),
+                    "q": label, "who": p.get("name", ""), "role": p.get("relationship", "")})
+    dates = list(dict.fromkeys(signed))
+    if dates:
+        out.append({"topic": "Consents", "label": "Signed", "value": ", ".join(dates), "q": "Date"})
+    order = {t: i for i, t in enumerate(REG_TOPICS)}
+    out.sort(key=lambda f: (order.get(f["topic"], len(order)), 0))
+    return {"title": title, "form_date": form_date, "fields": out}
+
+
+def read_registration(data, ext):
+    """A registration form (file bytes) organized by topic — see organize_registration."""
+    ext = ext.lower()
+    if ext == ".pdf":
+        title, day, fields = _reg_from_pdf(data)
+        if not fields:                                       # (not a two-column form: try "Q: A" lines)
+            title, day, fields = _reg_from_text(text_from_bytes(data, ext))
+    elif ext == ".docx":
+        title, day, fields = _reg_from_text(text_from_bytes(data, ext))
+    else:
+        title, day, fields = _reg_from_text(data.decode("utf-8", errors="replace"))
+    return organize_registration(title, day, fields)
+
+
+def registration_flags(info):
+    """Things on the form worth seeing first (a firearm in the home, recent experiences, a prescriber…)."""
+    f = {x["label"]: x["value"] for x in (info or {}).get("fields") or []}
+    out = []
+    no = lambda v: re.fullmatch(r"\s*(no|none|n/?a|none of the above)\.?\s*", v or "", re.I) is not None
+    if f.get("Firearm in the home") and not no(f["Firearm in the home"]):
+        acc = f.get("Child has access to the firearm", "")
+        out.append("Firearm in the home" + (" — the child HAS access" if acc and not no(acc) else
+                                             " (child has no access)" if acc else ""))
+    if f.get("Recent experiences") and not no(f["Recent experiences"]):
+        out.append("Recent experiences: " + f["Recent experiences"])
+    if f.get("Prescriber / psychiatrist") and not no(f["Prescriber / psychiatrist"]):
+        out.append("Prescriber: " + f["Prescriber / psychiatrist"])
+    if f.get("Illnesses and allergies") and not no(f["Illnesses and allergies"]):
+        out.append("Illnesses / allergies: " + f["Illnesses and allergies"])
+    return out
+
+
+def registration_age(info, today=None):
+    dob = next((x["value"] for x in (info or {}).get("fields") or [] if x["label"] == "Date of birth"), "")
+    d = parse_date(dob)
+    if not d:
+        return None
+    b, t = date.fromisoformat(d), today or date.today()
+    return t.year - b.year - ((t.month, t.day) < (b.month, b.day))
+
+
+def registration_text(info):
+    """The organized form as plain text (Copy)."""
+    lines, topic = [], None
+    if info.get("title"):
+        lines.append(info["title"] + (f" — {fmt_date(info['form_date'])}" if info.get("form_date") else ""))
+    for x in info.get("fields") or []:
+        if x["topic"] != topic:
+            topic = x["topic"]
+            lines.append(f"\n{topic.upper()}")
+        lines.append(f"{x['label']}: " + x["value"].replace("\n", " · "))
+    return "\n".join(lines).strip()
+
+
+# --------------------------------------------------------------------------- #
 # Built-in AI (installer builds): llama.cpp's llama-server instead of LM Studio
 # --------------------------------------------------------------------------- #
 # An installer build ships llama-server in engine\ and one or more GGUF models in models\llm\. The app
@@ -13367,9 +13691,26 @@ def run_gui():
 
         def _on_conf(self, e):
             if time.monotonic() < _SCROLLING_UNTIL[0]:
+                # not while scrolling — but look again once it settles, so a size change that came
+                # during it (a page still laying itself out) isn't lost
+                if not getattr(self, "_retry", None):
+                    wait = int((_SCROLLING_UNTIL[0] - time.monotonic()) * 1000) + 60
+                    self._retry = self.after(max(wait, 60), self._retry_conf)
                 return
             if e.width > 1 and e.width != self._lastw:
                 self._lastw = e.width
+                self._schedule()
+
+        def _retry_conf(self):
+            self._retry = None
+            if not self.winfo_exists():
+                return
+            if time.monotonic() < _SCROLLING_UNTIL[0]:
+                self._retry = self.after(120, self._retry_conf)
+                return
+            w = self.winfo_width()
+            if w > 1 and w != self._lastw:
+                self._lastw = w
                 self._schedule()
 
         def _reflow(self, width_hint=None):
@@ -15527,6 +15868,10 @@ def run_gui():
                 if docs:
                     items.append(("docs", None))
                     lb.insert("end", f"📁  Documents  · {len(docs)}")
+                if client.get("registration_info") or any(x.get("kind") == "registration"
+                                                          for x in client.get("files") or []):
+                    items.append(("reg", None))
+                    lb.insert("end", "🗂  Registration" + ("" if client.get("registration_info") else "  · not read yet"))
                 n_contacts = len(client.get("communications") or []) + \
                     sum(1 for _, d in sessions if d["meta"].get("kind") == "parent")
                 items.append(("comms", None))                  # always there: the patient's contact history
@@ -15566,8 +15911,10 @@ def run_gui():
                                          focus=(val["sid"], val["key"]), query=q)
                     return
                 self.view_select = kind if kind in ("case", "plan", "ask", "insights", "assess", "term", "comms",
-                                                    "docs") else f"day:{val}"
-                if kind == "docs":
+                                                    "docs", "reg") else f"day:{val}"
+                if kind == "reg":
+                    self._render_registration(viewer, client, sessions)
+                elif kind == "docs":
                     self._render_docs(viewer, client, sessions)
                 elif kind == "comms":
                     self._render_comms(viewer, client, sessions)
@@ -15649,7 +15996,7 @@ def run_gui():
                     if isinstance(select, str) and select.startswith("insights:"):
                         self._insight_tab = select[9:]
                     idx = 3
-                elif select in ("assess", "term", "comms", "docs"):
+                elif select in ("assess", "term", "comms", "docs", "reg"):
                     idx = next((i for i, it in enumerate(items) if it[0] == select), idx)
                 elif select == "case" or (select is None and client.get("case_overview")):
                     idx = 0
@@ -15686,7 +16033,8 @@ def run_gui():
             f._refresh = refresh_in_place
             f._client_id = client["id"]
 
-            if not sessions and any(it[0] == select for it in items if select in ("assess", "term", "comms", "docs")):
+            if not sessions and any(it[0] == select for it in items if select in ("assess", "term", "comms", "docs",
+                                                                                  "reg")):
                 idx = next(i for i, it in enumerate(items) if it[0] == select)
                 lb.selection_set(idx)
                 lb.see(idx)
@@ -16873,8 +17221,16 @@ def run_gui():
                     return messagebox.showerror(APP_NAME, f"Couldn't add that file: {friendly_error(ex)}", parent=win)
                 refresh(e["id"])
                 self.set_status(f"{client.get('code', '')}: {e['name']} added (encrypted).")
+                if k == "registration":
+                    try:                                       # every answer, organized (Registration tab)
+                        info = self.registration_read(cid, e)
+                        self.set_status(f"{client.get('code', '')}: {e['name']} added (encrypted) — "
+                                        f"{len(info['fields'])} answers organized on the Registration tab.")
+                    except Exception as ex:
+                        self.set_status(f"{client.get('code', '')}: {e['name']} added, but it couldn't be read: "
+                                        f"{friendly_error(ex)}")
                 if self.client_id == cid:
-                    self.open_client(cid)
+                    self.open_client(cid, select="reg" if k == "registration" else None)
                 if k == "registration" and messagebox.askyesno(
                         APP_NAME, "Read the PHQ-9 and GAD-7 scores from this registration form now? (The local AI "
                                   "reads it; you check the scores before they're saved.)", parent=win):
@@ -17095,6 +17451,126 @@ def run_gui():
                     acts.add(ttk.Button(acts, text="Remove", command=lambda a=x: self.assessment_remove(client, a)))
                 acts.pack(fill="x", pady=(px(6), 0))
             box.realize_all()
+
+        # ---------------------------------------------------------------- registration form, organized
+        def registration_read(self, cid, entry=None):
+            """Read the patient's registration form (the latest, or `entry`) and keep its answers, organized by
+            topic, on the patient. Returns the organized form."""
+            c = vault.load_client(cid)
+            regs = [x for x in c.get("files") or [] if x.get("kind") == "registration"]
+            entry = entry or (regs[-1] if regs else None)
+            if not entry:
+                raise ValueError("There's no registration form on file.")
+            info = read_registration(vault.load_file(entry["id"]), os.path.splitext(entry.get("name", ""))[1])
+            if not info["fields"]:
+                raise ValueError("No answers could be read from it (it may be a scan or picture).")
+            c = vault.load_client(cid)
+            c["registration_info"] = dict(info, file_id=entry["id"], file_name=entry.get("name", ""),
+                                          read=datetime.now().isoformat(timespec="seconds"))
+            vault.save_client(c)
+            self._sig = vault.signature()
+            return c["registration_info"]
+
+        def registration_names(self, client):
+            """[(name, role)] the form names that aren't on the patient's names-to-hide list yet."""
+            info = client.get("registration_info") or {}
+            have = {n.lower() for n, _ in client_name_map(client)}
+            out = []
+            for x in info.get("fields") or []:
+                who = (x.get("who") or "").strip()
+                if x["label"] == "Name" and x["topic"] == "Patient":
+                    who, role = x["value"].strip(), "Patient"
+                elif who:
+                    role = (x.get("role") or "").strip().title() or \
+                        ("Parent" if x["topic"].startswith("Parents") else "Emergency contact")
+                else:
+                    continue
+                if who and who.lower() not in have and not re.fullmatch(r"n/?a|none", who, re.I):
+                    out.append((who, role))
+                    have.add(who.lower())
+            return out
+
+        def registration_hide_names(self, client):
+            new = self.registration_names(vault.load_client(client["id"]))
+            if not new:
+                return messagebox.showinfo(APP_NAME, "Every name on the form is already on the names-to-hide list.")
+            if not messagebox.askyesno(APP_NAME, "Add these names to the patient's names-to-hide list? The AI will "
+                                                 "see the placeholder instead:\n\n" +
+                                       "\n".join(f"{n}  →  [{r}]" for n, r in new)):
+                return
+            c = vault.load_client(client["id"])
+            pairs = client_name_map(c) + [(n, f"[{r}]") for n, r in new]
+            c["names_to_hide"] = "\n".join(f"{n}, {ph.strip('[]')}" for n, ph in pairs)
+            c["names_format"] = 2
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.set_status(f"{c.get('code', '')}: {len(new)} name(s) added to the names-to-hide list.")
+            self.refresh_client_page(client["id"], select="reg")
+
+        def _render_registration(self, v, client, sessions):
+            """The registration form's answers, organized by topic, with what to notice first on top."""
+            client = vault.load_client(client["id"])
+            cid = client["id"]
+            info = client.get("registration_info")
+            regs = [x for x in client.get("files") or [] if x.get("kind") == "registration"]
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Registration", style="H2.TLabel"))
+
+            def read_again():
+                try:
+                    n = len(self.registration_read(cid)["fields"])
+                except Exception as ex:
+                    return messagebox.showerror(APP_NAME, f"Couldn't read the registration form: {friendly_error(ex)}")
+                self.set_status(f"{client.get('code', '')}: {n} answers read from the registration form.")
+                self.refresh_client_page(cid, select="reg")
+            if not info:
+                head.add(ttk.Button(head, text="Organize the registration form", style="Accent.TButton",
+                                    command=read_again), gap=px(16))
+                ttk.Label(v, text="Reads every answer on the form on file (on this computer, no AI) and lays them "
+                                  "out by topic: the patient, parents and contacts, treatment, safety, medical, "
+                                  "school, family, development, insurance and consents.", style="Muted.TLabel",
+                          wraplength=px(560), justify="left").pack(anchor="w", pady=(px(6), 0))
+                return
+            entry = next((x for x in regs if x["id"] == info.get("file_id")), regs[-1] if regs else None)
+            if entry:
+                head.add(ttk.Button(head, text="View form", command=lambda: self.vault_file_view(entry)), gap=px(16))
+            head.add(ttk.Button(head, text="Copy", command=lambda: self.copy(registration_text(info),
+                                                                             "Registration")))
+            if self.registration_names(client):
+                head.add(ttk.Button(head, text="Hide names from AI…",
+                                    command=lambda: self.registration_hide_names(client)))
+            head.add(ttk.Button(head, text="Read again", command=read_again))
+            age = registration_age(info)
+            sub = "  ·  ".join(x for x in (info.get("title", ""),
+                                           f"filled in {fmt_date(info['form_date'])}" if info.get("form_date") else "",
+                                           f"age {age}" if age is not None else "",
+                                           info.get("file_name", "")) if x)
+            ttk.Label(v, text=sub, style="Caption.TLabel", wraplength=px(520), justify="left").pack(
+                anchor="w", fill="x", pady=(px(4), 0))
+            for fl in registration_flags(info):
+                ttk.Label(v, text="⚠  " + fl, style="Warn.TLabel", wraplength=px(520), justify="left").pack(
+                    anchor="w", fill="x", pady=(px(2), 0))
+            sc, box = scrollable(v)
+            sc.pack(fill="both", expand=True, pady=(px(8), 0))
+            topic, grid, r = None, None, 0
+            for x in info.get("fields") or []:
+                if x["topic"] != topic:
+                    topic = x["topic"]
+                    card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                    card.pack(fill="x", pady=(0, px(8)), padx=(0, px(8)))
+                    ttk.Label(card, text=topic, style="Strong.TLabel").pack(anchor="w")
+                    grid = ttk.Frame(card)
+                    grid.pack(fill="x", pady=(px(4), 0))
+                    grid.columnconfigure(1, weight=1)
+                    r = 0
+                ttk.Label(grid, text=x["label"], style="Muted.TLabel", wraplength=px(190), justify="left").grid(
+                    row=r, column=0, sticky="nw", padx=(0, px(14)), pady=px(2))
+                ttk.Label(grid, text=x["value"], wraplength=px(420), justify="left").grid(
+                    row=r, column=1, sticky="nw", pady=px(2))
+                r += 1
+            box.realize_all()
+            v._registration = info
 
         def assessment_save(self, cid, entry):
             """Add or update one assessment (matched by id) on a fresh copy of the patient."""
