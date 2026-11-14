@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.4"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.5"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -198,6 +198,7 @@ DEFAULT_CONFIG = {
     "model": "",
     "lm_context": 16384,        # when Session Scribe has LM Studio load the model: context length (tokens)
     "lm_parallel": 1,           # …and request slots (1 = all the memory for one request at a time: fastest here)
+    "fast_model": "",           # a quicker model for Ask AI and the background checks (blank = the main model)
     "ai_engine": "auto",        # auto = the built-in AI when this copy has one (installer builds), else LM Studio
     "gpu_layers": "",           # built-in AI: model layers on the graphics chip (set by auto_tune for this computer)
     "whisper_threads": 0,       # processor threads for the speech model (0 = its default)
@@ -3041,7 +3042,7 @@ def ask_overview(client, sessions):
     return out
 
 
-def build_ask_prompt(client, sessions, question, history, reference, orientation, budget=24000):
+def build_ask_prompt(client, sessions, question, history, reference, orientation, budget=24000, stable_room=None):
     """The question plus the most relevant parts of the patient's library, within `budget`
     characters. Returns (prompt, sources) — names already hidden."""
     hide = client_hider(client)
@@ -3098,8 +3099,10 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
         index.append(f"{fmt_date(day)}: {day_title(records)} ({', '.join(lbl for lbl, *_ in day_docs(records))})")
     if index:
         add("SESSION INDEX (all dates on file)", "\n".join(index))
-    # the rest of the record, in brief: assessments, progress & risk, contact log, documents, registration
-    over_room = int(budget * 0.3)
+    # the rest of the record, in brief: assessments, progress & risk, contact log, documents, registration.
+    # Everything up to here is the same for every question about this patient (stable_room doesn't change
+    # with the conversation), so LM Studio can reuse its reading of it and follow-up questions start sooner.
+    over_room = int(stable_room if stable_room else budget * 0.3)
     for head_, text_ in ask_overview(client, sessions):
         block_limit = max(800, min(len(text_), over_room))
         if add(head_, text_, limit=block_limit):
@@ -9164,6 +9167,18 @@ def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=
     """Ask the local model (see _llm_chat_once). If the connection to LM Studio drops part-way — most
     often because the computer went to sleep — the request is sent again after a short wait instead of
     failing; finished steps of the notes are kept by the caller, so only this step is redone."""
+    if "_fast_from" in cfg:                         # the fast model, with the main one as the fallback
+        main = dict(cfg)
+        main["model"] = main.pop("_fast_from")
+        try:
+            return llm_chat({k: v for k, v in cfg.items() if k != "_fast_from"}, prompt, on_progress, expected,
+                            system, on_text, temperature, on_eta)
+        except Cancelled:
+            raise
+        except RuntimeError as e:
+            if str(e).startswith("Couldn't reach"):
+                raise                               # LM Studio itself is down: the main model won't help
+            return llm_chat(main, prompt, on_progress, expected, system, on_text, temperature, on_eta)
     _SleepWatch.start()
     keep_awake(True)
     try:
@@ -14935,6 +14950,14 @@ def run_gui():
                     and getattr(self, "page", None) is not None and not getattr(self, "locked", False):
                 self.show_home()                       # keep the Home steps in step with setup
 
+        def fast_cfg(self):
+            """The settings for a quick job (Ask AI, the background checks): the fast model if one is set in
+            Settings › Advanced, else the main one. (If the fast model can't load, llm_chat uses the main one.)"""
+            fm = (cfg.get("fast_model") or "").strip()
+            if fm and fm != (cfg.get("model") or "").strip():
+                return dict(cfg, model=fm, _fast_from=cfg.get("model") or "")
+            return dict(cfg)
+
         def check_lmstudio(self):
             self.lm_status = None
             self.refresh_strip()
@@ -16505,9 +16528,9 @@ def run_gui():
             prompt, sources = build_ask_prompt(c, sessions, question, history,
                                                self.settings.get("reference") or BUILTIN_REFERENCE,
                                                self.settings.get("orientation") or "not specified",
-                                               budget=budget)
+                                               budget=budget, stable_room=int(ai_prompt_chars(cfg, 1800) * 0.3))
             system = ASK_SYSTEM.format(orientation=self.settings.get("orientation") or "not specified")
-            job_cfg = dict(cfg)
+            job_cfg = self.fast_cfg()                      # Ask AI answers with the fast model, if one is set
             live = {"text": "", "at": 0}
 
             def view_ok():
@@ -20693,7 +20716,7 @@ def run_gui():
             goals, todo = goals_todo(client, sessions)
             if not todo:
                 return
-            job_cfg, key = dict(cfg), goals_key(goals)
+            job_cfg, key = self.fast_cfg(), goals_key(goals)
             code = client.get("code", "")
 
             def job(p):
@@ -20774,7 +20797,7 @@ def run_gui():
             todo = risk_todo(vault.sessions_for(client["id"]))
             if not todo:
                 return
-            job_cfg, code = dict(cfg), client.get("code", "")
+            job_cfg, code = self.fast_cfg(), client.get("code", "")
             need_ai = [(sid, d, src, key) for sid, d, src, key in todo if RISK_RE.search(src)]
 
             def job(p):
@@ -20990,7 +21013,7 @@ def run_gui():
 
         def read_measures_from_file(self, client, entry):
             """Read PHQ-9 / GAD-7 answers from a registration form with the local AI, then confirm before saving."""
-            code, job_cfg = client.get("code", ""), dict(cfg)
+            code, job_cfg = client.get("code", ""), self.fast_cfg()
             ext = os.path.splitext(entry["name"])[1].lower()
             default_day = (entry.get("added") or date.today().isoformat())[:10]
 
@@ -21044,7 +21067,7 @@ def run_gui():
             """A half-page brief to read just before the next session."""
             client = vault.load_client(client["id"])
             sessions = vault.sessions_for(client["id"])
-            code, job_cfg, orient = client.get("code", ""), dict(cfg), self.settings.get("orientation", "")
+            code, job_cfg, orient = client.get("code", ""), self.fast_cfg(), self.settings.get("orientation", "")
 
             def done(text):
                 rid = vault.save_report({"kind": "brief", "client_id": client["id"], "code": code, "text": text,
@@ -21120,7 +21143,7 @@ def run_gui():
                           wraplength=px(740), justify="left").pack(anchor="w", pady=(px(6), 0))
 
         def suggest_for(self, client, sid):
-            code, job_cfg, cat = client.get("code", ""), dict(cfg), self.worksheet_catalog()
+            code, job_cfg, cat = client.get("code", ""), self.fast_cfg(), self.worksheet_catalog()
             d = vault.load_session(sid)
             day = d["meta"].get("session_date", "")
 
@@ -21609,7 +21632,7 @@ def run_gui():
             todo = followups_todo(vault.sessions_for(client["id"]))
             if not todo:
                 return
-            code, job_cfg = client.get("code", ""), dict(cfg)
+            code, job_cfg = client.get("code", ""), self.fast_cfg()
 
             def job(p):
                 steps = _Steps(p, [(f"Finding follow-ups in the {fmt_date(d['meta'].get('session_date'))} session", 300,
@@ -21775,7 +21798,7 @@ def run_gui():
                 if not total_items:
                     self.set_status("No session records to check yet.")
                     return False
-            job_cfg = dict(cfg)
+            job_cfg = self.fast_cfg()                      # (risk, goals and follow-up checks: the fast model)
             single_code = clients[0].get("code", "") if only_client is not None else ""
             owner = ("insights", clients[0]["id"]) if only_client is not None else ("insights", "*")
             label = (
@@ -21826,6 +21849,7 @@ def run_gui():
             cid, code = w["id"], w["code"]
             bundles, ins_plan, needs_case = w["bundles"], w["plan"], w["case"]
             job_cfg, orient = dict(cfg), self.settings.get("orientation", "")
+            fast = self.fast_cfg()                         # the checks: the fast model; the overview: the main one
 
             def job(p):
                 ins_share = (50.0 if needs_case else 100.0) if bundles else 0.0
@@ -21834,7 +21858,7 @@ def run_gui():
                     def ins_p(t, pct=None):
                         p(t, (float(pct) * ins_share / 100.0) if pct is not None else 0.0)
                     steps = _Steps(ins_p, ins_plan) if ins_plan else None
-                    _, n_pat, n_risk, n_goals, n_fu = self._run_insights_bundles(job_cfg, bundles, steps, 0, ins_p)
+                    _, n_pat, n_risk, n_goals, n_fu = self._run_insights_bundles(fast, bundles, steps, 0, ins_p)
                 done_case = 0
                 if needs_case:
                     def case_p(t, pct=None):
@@ -25622,8 +25646,8 @@ def run_gui():
 
             prefs = ttk.LabelFrame(outer, text="Preferences", padding=10)
             sv = {k: tk.StringVar(value=str(cfg[k])) for k in
-                  ("lmstudio_url", "model", "whisper_model", "language", "max_chars", "previous_notes",
-                   "autolock_minutes", "min_speakers", "max_speakers")}
+                  ("lmstudio_url", "model", "fast_model", "whisper_model", "language", "max_chars",
+                   "previous_notes", "autolock_minutes", "min_speakers", "max_speakers")}
             orient_var = tk.StringVar(value=self.settings.get("orientation", ""))
             token_var = tk.StringVar(value=self.settings.get("hf_token", ""))
             delete_var = tk.BooleanVar(value=bool(cfg.get("delete_audio", True)))
@@ -25886,6 +25910,7 @@ def run_gui():
                 try:
                     assert_local_url(url)
                     new = {"lmstudio_url": url, "model": sv["model"].get().strip(),
+                           "fast_model": sv["fast_model"].get().strip(),
                            "whisper_model": sv["whisper_model"].get(), "language": sv["language"].get().strip(),
                            "max_chars": max(4000, int(sv["max_chars"].get())),
                            "previous_notes": max(0, int(sv["previous_notes"].get())),
@@ -26180,10 +26205,21 @@ def run_gui():
                 show_fit()
                 pr(4, 0, "AI model (built in)", mf)
                 pr(4, 2, "This computer", hwf)
+                pr(4, 4, "Fast model (Ask AI and checks)", ttk.Combobox(
+                    pga, textvariable=sv["fast_model"], values=[""] + [m["name"] for m in model_files()],
+                    state="readonly"))
             else:
                 show_fit = lambda: None
                 pr(4, 0, "LM Studio address", ttk.Entry(pga, textvariable=sv["lmstudio_url"]))
                 pr(4, 2, "AI model (blank = loaded one)", ttk.Entry(pga, textvariable=sv["model"]))
+                pr(4, 4, "Fast model (Ask AI and checks)", ttk.Entry(pga, textvariable=sv["fast_model"]))
+            pr(4, 6, None, ttk.Label(pga, text="Optional. A quicker model — e.g. openai/gpt-oss-20b — answers Ask AI "
+                                               "questions and runs the risk, goal, follow-up and score checks and "
+                                               "pre-session briefs; notes, case overviews, plans and summaries stay "
+                                               "with the AI model above. Blank = use the AI model for everything. "
+                                               "If it can't be loaded (e.g. not enough memory for both), the AI "
+                                               "model is used instead.", style="Caption.TLabel",
+                                     wraplength=px(360), justify="left"))
             pr(5, 0, "Appearance", ttk.Combobox(pg, textvariable=appear_var, values=list(APPEARANCE.values()),
                                                 state="readonly", width=16))
             datefmt_var = tk.StringVar(value=DATE_FORMATS.get(cfg.get("date_format", "iso"), DATE_FORMATS["iso"]))

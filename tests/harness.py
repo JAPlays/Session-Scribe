@@ -18,6 +18,8 @@ SCR = os.path.dirname(os.path.abspath(__file__))
 
 class H:
     PROMPTS = []
+    MODELS = []        # the model each AI request asked for
+    FAIL_MODELS = set()  # models the mock AI refuses (as if they couldn't be loaded)
     RESP = []          # [(substring, reply)] — first match wins
     DEFAULT = "OK."
     ss = None
@@ -52,6 +54,12 @@ class H:
 
             def do_POST(self):
                 req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                cls.MODELS.append(req.get("model"))
+                if req.get("model") in cls.FAIL_MODELS:          # a model that can't be loaded
+                    b = json.dumps({"error": f"model {req.get('model')} could not be loaded"}).encode()
+                    self.send_response(400); self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+                    return
                 prompt = "\n".join(m["content"] for m in req["messages"])
                 cls.PROMPTS.append(prompt)
                 user = req["messages"][-1]["content"]
