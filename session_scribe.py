@@ -32,13 +32,32 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.12.10"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.32"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN_DIR = os.path.join(APP_DIR, "bin")
 DOWNLOAD_MODE = "--download-models" in sys.argv
 TRANSCRIBE_MODE = "--transcribe-worker" in sys.argv     # a child process that transcribes one recording
+
+
+def _read_bundle():
+    """bundle.json, written by the installer build (installer/build.ps1): which edition this is and what
+    it ships (Python, the built-in AI, the models). {} for a plain copy of the program."""
+    try:
+        import json as _json
+        with open(os.path.join(APP_DIR, "bundle.json"), encoding="utf-8-sig") as f:    # PowerShell adds a BOM
+            b = _json.load(f)
+        return b if isinstance(b, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+BUNDLE = _read_bundle()
+if BUNDLE:      # the installer's own copies of the speech, alignment and speaker models: no download, no token
+    os.environ["HF_HOME"] = os.path.join(APP_DIR, "models", "hf")
+    os.environ.pop("HF_HUB_CACHE", None)
+    os.environ["TORCH_HOME"] = os.path.join(APP_DIR, "models", "torch")
 
 # The environment as it was (proxy settings included) — only for the installers and the model
 # download, which carry no patient data and may need a proxy to reach the internet.
@@ -171,13 +190,19 @@ LEGACY_CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 SHARED_SETTINGS = "settings.json"            # in the data folder; contains no patient data
 SHARED_KEYS = {"language", "min_speakers", "max_speakers", "max_chars", "previous_notes",
                "smooth_flicker", "delete_audio", "autolock_minutes", "role_labels", "date_format",
-               "phone_page_url", "phone_client_id"}
+               "phone_page_url", "phone_client_id", "ai_names"}
 TEMPLATE_DIR = os.path.join(APP_DIR, "templates")     # updated by set_data_paths()
 DEFAULT_CONFIG = {
     "lmstudio_url": "http://127.0.0.1:1234/v1",
     "model": "",
     "lm_context": 16384,        # when Session Scribe has LM Studio load the model: context length (tokens)
     "lm_parallel": 1,           # …and request slots (1 = all the memory for one request at a time: fastest here)
+    "ai_engine": "auto",        # auto = the built-in AI when this copy has one (installer builds), else LM Studio
+    "gpu_layers": "",           # built-in AI: model layers on the graphics chip (set by auto_tune for this computer)
+    "whisper_threads": 0,       # processor threads for the speech model (0 = its default)
+    "tuned_for": "",            # the hardware the settings were last fitted to (auto_tune)
+    "ai_names": True,           # the local AI reads patients' real names (per patient: "Keep names hidden")
+    "touch_scroll": "auto",     # finger drags scroll: auto (touchscreens, Windows) / on (every drag) / off
     "whisper_model": "large-v3-turbo",
     "language": "en",
     "batch_size": 8,
@@ -194,6 +219,7 @@ DEFAULT_CONFIG = {
     "appearance": "system",     # system / light / dark
     "theme_install_tried": "",
     "session_sort": "desc",     # date list order: desc = newest first, asc = oldest first
+    "contact_sort": "desc",     # the Contact log's order, the same way
     "doc_zoom": 0,              # document text size step (A−/A+)
     "export_format": "docx",    # last export format (docx / pdf)
     "setup_assistant_offered": False,   # first Setup visit: offered to install everything for this computer
@@ -265,12 +291,14 @@ def load_config():
         cfg.update({k: v for k, v in shared.items() if k in SHARED_KEYS})
     derived = not cfg.get("vault_dir")
     set_date_format(cfg.get("date_format"))
+    set_ai_names(cfg.get("ai_names", True))
     set_data_paths(cfg)
     cfg["_vault_derived"] = derived
     return cfg
 
 
 def save_config(cfg):
+    set_ai_names(cfg.get("ai_names", True))
     os.makedirs(LOCAL_DIR, exist_ok=True)
     local = {k: v for k, v in cfg.items() if k in DEFAULT_CONFIG and not k.startswith("_")}
     if cfg.get("_vault_derived", True) and cfg.get("vault_dir") == os.path.join(data_root(cfg), "vault"):
@@ -446,9 +474,11 @@ Rules you must follow:
 Never invent quotes, history, symptoms, diagnoses, interventions, or plans. (The one exception is a \
 "Planned Interventions" list, where you may propose next steps that follow from this session and the \
 treatment plan, for the clinician to review.)
-- Use the term "patient", never "client". Refer to the clinician as "Counselor". Names have been \
-replaced with bracketed placeholders such as [Patient] or [Husband]. Write "patient" for [Patient] \
-and keep other placeholders as roles (e.g. "patient's husband"); never guess at real names.
+- Use the term "patient", never "client". Refer to the clinician as "Counselor". Refer to the patient \
+and the people in their life by the names used in the material, so it's clear who said and did what. \
+Where a name has been replaced by a bracketed placeholder such as [Patient] or [Husband], write \
+"patient" for [Patient] and keep other placeholders as roles (e.g. "patient's husband"). Never guess \
+at a name that isn't in the material.
 - If something is unclear or missing, write [VERIFY: ...] instead of guessing.
 - Never minimize risk. Any mention of suicidal ideation, self-harm, homicidal ideation, abuse or \
 neglect, or other safety concerns must be documented. Never state that risk was assessed or denied \
@@ -1914,7 +1944,7 @@ async function showAsk(cid, chatId) {
     if (S.keys && S.view.name === "ask" && S.view.cid === cid && !q.value.trim()) showAsk(cid, chatId);
   }, 10000));
   screen("Ask · " + clientCode(cid), { back: () => go({ name: "patient", cid }) }, pickRow, thread, live, q, send, where,
-    h("p", { class: "muted small", text: "Answers are saved with the patient (as on the computer). Names are hidden from the AI as usual." }));
+    h("p", { class: "muted small", text: "Answers are saved with the patient (as on the computer). Names are handled as set on the computer." }));
 }
 
 // --- the recording queue on each computer
@@ -2484,7 +2514,118 @@ def compare_appointments(appts, sessions, first_number=1):
 EXPORT_KINDS = [("notes", "Progress notes"), ("intake", "Intake assessments"), ("overviews", "Session overviews"),
                 ("transcripts", "Transcripts"), ("plan", "Current treatment plan"),
                 ("plans_old", "Earlier treatment plan versions"), ("case", "Case overview"),
+                ("contacts", "Contact log"), ("assessments", "Assessments"),
                 ("chats", "Ask-AI conversations")]
+
+
+def _paras(text):
+    return [p.strip() for p in re.split(r"\n\s*\n", (text or "").strip()) if p.strip()]
+
+
+def thread_export_blocks(text):
+    """A logged thread for an export: each email under its own "who → whom · date time" heading (and its subject
+    when the conversation changes), then its paragraphs; a day's texts as one "time  who: message" list."""
+    pre, subject, blocks = contact_blocks(text)
+    if not blocks:
+        return [("p", p) for p in _paras(text)]
+    out = [("p", "Subject: " + subject)] if subject else []
+    out += [("p", p) for p in _paras(reflow_paragraphs("\n".join(pre)))]
+    texts, last = [], re.sub(r"^((re|fwd?)\s*:\s*)+", "", subject, flags=re.I).lower()
+
+    def flush():
+        if texts:
+            out.append(("p", "\n".join(texts)))
+            texts.clear()
+    for d, _mins, tm, block in sorted(blocks, key=lambda b: b[1]):
+        first, _, rest = block.partition("\n")
+        m = re.match(r"^\[[^\]]*\]\s*(.*)$", first, re.S)
+        who_line = m.group(1) if m else first
+        esubj = ""
+        if rest.startswith("Subject: "):
+            s_line, _, rest = rest.partition("\n")
+            esubj = s_line[9:].strip()
+        if rest.strip() or who_line.endswith(":") or esubj:      # an email
+            flush()
+            out.append(("h3", f"{who_line.rstrip(':').strip()}  ·  {fmt_date(d)}" + (f" {tm}" if tm else "")))
+            key = re.sub(r"^((re|fwd?)\s*:\s*)+", "", esubj, flags=re.I).lower()
+            if esubj and key != last:
+                out.append(("p", "Subject: " + esubj))
+                last = key
+            out += [("p", p) for p in _paras(reflow_paragraphs(rest))]
+        else:                                                     # a text message (or a reaction)
+            texts.append(f"{tm}   {who_line}" if tm else who_line)
+    flush()
+    return out
+
+
+def _export_party(x):
+    if x.get("mixed"):
+        return "several people"
+    w, who = x.get("with", "patient"), (x.get("who") or "").strip()
+    return {"patient": "the patient", "parent": "parent / guardian"}.get(w, who or "other contact")
+
+
+def assessment_export_blocks(client, inr):
+    """Every assessment in the date range, oldest first: its result, warnings, what it means, the change since the
+    last time and (taken here) every answer."""
+    out = []
+    linked = {a.get("measure_id") for a in client.get("assessments") or [] if a.get("measure_id")}
+    rows = [("m", m.get("date", ""), m) for m in client.get("measures") or [] if m.get("id") not in linked] + \
+           [("a", a.get("date", ""), a) for a in client.get("assessments") or []]
+    rows.sort(key=lambda r: (r[1], r[2].get("added", "")))
+    done = {}
+    for kind, day, x in rows:
+        if not inr(day):
+            continue
+        if kind == "m":
+            band = measure_band(x.get("kind"), x.get("total"))
+            out.append(("h2", f"{x.get('kind', 'Measure')} — {fmt_date(day)}"))
+            lines = [f"Score: {x.get('total')}" + (f" ({band})" if band else "") + f"  ·  {x.get('source', 'manual')}"]
+            if x.get("items"):
+                lines.append("Answers: " + " ".join(map(str, x["items"])))
+                if x.get("kind") == "PHQ-9" and len(x["items"]) > 8 and x["items"][8]:
+                    lines.append(f"⚠ Item 9 answered {x['items'][8]}.")
+            out.append(("p", "\n".join(lines)))
+            continue
+        inst = ASSESS_INSTRUMENTS.get(x.get("instrument"), {})
+        r = x.get("result") or {}
+        out.append(("h2", f"{x.get('name', 'Assessment')} — {fmt_date(day)}" + (f" {x['time']}" if x.get("time") and
+                                                                                   x.get("administered") else "")))
+        if inst.get("title") and inst["title"] != x.get("name"):
+            out.append(("p", inst["title"]))
+        lines = []
+        summary = r.get("summary") or x.get("score") or ""
+        if summary:
+            lines.append("Result: " + summary)
+        if x.get("administered") and not x.get("completed", True):
+            lines.append(f"Stopped early: {x.get('answered', 0)} of {x.get('of', 0)} questions answered.")
+        lines += [f"⚠ {fl}" for fl in r.get("flags") or []]
+        prev = done.get(x.get("instrument"))
+        if x.get("administered") and x.get("completed", True) and prev and r.get("total") is not None \
+                and (prev.get("result") or {}).get("total") is not None:
+            ch = r["total"] - prev["result"]["total"]
+            lines.append(f"Change: {'+' if ch > 0 else ''}{ch} since {fmt_date(prev.get('date', ''))}"
+                         if ch else f"No change since {fmt_date(prev.get('date', ''))}")
+        if lines:
+            out.append(("p", "\n".join(lines)))
+        if r.get("lines"):
+            out.append(("p", "\n".join(r["lines"])))
+        if x.get("notes"):
+            out.append(("p", "Notes: " + x["notes"]))
+        answers = x.get("answers") or {}
+        items = [q for q in inst.get("items") or [] if q["id"] in answers]
+        if items:
+            out.append(("h3", "Answers"))
+            al = []
+            for n, q in enumerate(items, 1):
+                v = answers[q["id"]]
+                shown = _label_of(inst, q["id"], v) if q["kind"] == "choice" else (
+                    f"{v} {q.get('unit', '')}".strip() if q["kind"] == "number" else (v or "—"))
+                al.append(f"{n}. {q['text']} — {shown}")
+            out.append(("p", "\n".join(al)))
+        if x.get("administered") and x.get("completed", True):
+            done[x.get("instrument")] = x
+    return out
 
 
 def collect_export(client, sessions, include, start="", end=""):
@@ -2505,7 +2646,7 @@ def collect_export(client, sessions, include, start="", end=""):
         for para in re.split(r"\n\s*\n", (text or "").strip()):
             blocks.append(("p", para.strip()))
     if "case" in include and (client.get("case_overview") or {}).get("text"):
-        section("Case overview", client["case_overview"]["text"])
+        section("Case overview", strip_case_title(client["case_overview"]["text"]))
     plans = client.get("treatment_plans") or []
     cur = current_plan(client)
     if "plan" in include and cur:
@@ -2518,8 +2659,8 @@ def collect_export(client, sessions, include, start="", end=""):
             section(f"Treatment plan (version {pl.get('version', '')}, {fmt_date(str(pl.get('created', ''))[:10])})",
                     plan_for_ehr(pl["text"]))
     for day, records in group_by_date(sessions):
-        if not inr(day):
-            continue
+        if not inr(day) or ("contacts" in include and is_contact_day(records)):
+            continue                                     # (contact notes go in the Contact log section then)
         parts = []
         for label, key, _sid, d in day_docs(records):
             kind = d.get("meta", {}).get("kind")
@@ -2537,6 +2678,48 @@ def collect_export(client, sessions, include, start="", end=""):
             blocks.append(("h2", label))
             for para in re.split(r"\n\s*\n", text.strip()):
                 blocks.append(("p", para.strip()))
+    if "contacts" in include:
+        rows = [(x.get("date", ""), x.get("time", ""), "log", x) for x in client.get("communications") or []
+                if inr(x.get("date", ""))]
+        rows += [(day, "", "note", records) for day, records in group_by_date(sessions)
+                 if inr(day) and is_contact_day(records)]
+        rows += [(s.get("end", ""), "11:59 PM", "sum", s) for s in client.get("contact_summaries") or []
+                 if inr(s.get("end", "")) and (not start or s.get("start", "") >= start)]
+        if rows:
+            if not first:
+                blocks.append(("break", ""))
+            first = False
+            blocks.append(("h1", "Contact log"))
+            for day, tm, kind, x in sorted(rows, key=lambda r: (r[0], _clock(r[1]) if r[1] else -1)):
+                if kind == "log":
+                    blocks.append(("h2", f"{fmt_date(day)}" + (f" {tm}" if tm else "") +
+                                   f" — {x.get('method', 'Contact')} with {_export_party(x)}"))
+                    if x.get("notes"):
+                        blocks.append(("p", "Note: " + x["notes"]))
+                    blocks += thread_export_blocks(x.get("text", ""))
+                elif kind == "sum":
+                    blocks.append(("h2", f"Contact summary — {fmt_date(x.get('start', ''))} to {fmt_date(day)}"))
+                    for para in _paras(x.get("text", "")):
+                        head, _, rest = para.partition("\n")
+                        if head.isupper() and len(head) < 60:            # its plain-text headings
+                            blocks.append(("h3", head))
+                            if rest.strip():
+                                blocks.append(("p", rest.strip()))
+                        else:
+                            blocks.append(("p", para))
+                else:
+                    blocks.append(("h2", f"{fmt_date(day)} — {day_title(x)} note"))
+                    for _label, key, _sid, d in day_docs(x):
+                        if key == "note" and (d.get("note") or "").strip():
+                            blocks += [("p", p) for p in _paras(d["note"])]
+    if "assessments" in include:
+        ab = assessment_export_blocks(client, lambda d_: (not start or d_ >= start) and (not end or d_ <= end))
+        if ab:
+            if not first:
+                blocks.append(("break", ""))
+            first = False
+            blocks.append(("h1", "Assessments"))
+            blocks += ab
     if "chats" in include:
         for ch in client.get("chats") or []:
             if not inr(str(ch.get("created", ""))[:10]):
@@ -2567,7 +2750,7 @@ def write_docx(path, blocks, footer=""):
         if kind == "break":
             body.append('<w:p><w:r><w:br w:type="page"/></w:r></w:p>')
             continue
-        style = {"title": "Title", "sub": "Subtitle", "h1": "Heading1", "h2": "Heading2"}.get(kind)
+        style = {"title": "Title", "sub": "Subtitle", "h1": "Heading1", "h2": "Heading2", "h3": "Heading3"}.get(kind)
         ppr = f'<w:pPr><w:pStyle w:val="{style}"/></w:pPr>' if style else ""
         runs = []
         for i, line in enumerate(text.split("\n")):
@@ -2599,6 +2782,9 @@ def write_docx(path, blocks, footer=""):
               '<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/>'
               '<w:next w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="200" w:after="80"/><w:outlineLvl w:val="1"/>'
               '</w:pPr><w:rPr><w:b/><w:color w:val="2E74B5"/><w:sz w:val="24"/></w:rPr></w:style>'
+              '<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/>'
+              '<w:next w:val="Normal"/><w:pPr><w:keepNext/><w:spacing w:before="160" w:after="40"/><w:outlineLvl w:val="2"/>'
+              '</w:pPr><w:rPr><w:b/><w:color w:val="262626"/><w:sz w:val="22"/></w:rPr></w:style>'
               '<w:style w:type="paragraph" w:styleId="Footer"><w:name w:val="footer"/><w:basedOn w:val="Normal"/>'
               '<w:rPr><w:color w:val="7F7F7F"/><w:sz w:val="18"/></w:rPr></w:style>'
               '</w:styles>')
@@ -2650,9 +2836,10 @@ def write_pdf(path, blocks, footer=""):
     W_, H_, M = 612, 792, 72
     styles = {"title": ("F2", 22, 10, (0.12, 0.22, 0.39)), "sub": ("F1", 10, 18, (0.35, 0.35, 0.35)),
               "h1": ("F2", 15, 8, (0.12, 0.22, 0.39)), "h2": ("F2", 12, 5, (0.18, 0.45, 0.71)),
-              "p": ("F1", 11, 7, (0.1, 0.1, 0.1))}
+              "h3": ("F2", 11, 3, (0.15, 0.15, 0.15)), "p": ("F1", 11, 7, (0.1, 0.1, 0.1))}
 
     def enc(t):
+        t = t.replace("→", "->").replace("⚠", "(!)").replace("─", "-")      # (not in the PDF's built-in font)
         return t.encode("cp1252", "replace").decode("latin-1")
 
     def width(t, size, bold):
@@ -2686,9 +2873,9 @@ def write_pdf(path, blocks, footer=""):
         font, size, after, rgb = styles.get(kind, styles["p"])
         lead = size * 1.35
         lines = wrap(text, size, font == "F2")
-        if kind in ("h1", "h2") and y - lead * (len(lines) + 2) < M:
+        if kind in ("h1", "h2", "h3") and y - lead * (len(lines) + 2) < M:
             new_page()                                    # keep headings with what follows
-        if kind in ("h1", "h2") and y < H_ - M:
+        if kind in ("h1", "h2", "h3") and y < H_ - M:
             y -= size * 0.6
         for ln in lines:
             if y - lead < M:
@@ -2744,7 +2931,8 @@ history, quotes, diagnoses, dates or scores.
 clinician's orientation ({orientation}); you are not making decisions for them.
 - If anything suggests risk (self-harm, harm to others, abuse, neglect), point it out first and \
 recommend discussing it with the supervisor promptly.
-- Names are replaced by placeholders like [Patient]; keep them as they are.
+- Use names as they appear in the material; where a name was replaced by a placeholder like [Patient], \
+keep the placeholder as it is. Never guess at a name.
 - Be concise: short paragraphs or bullet points, plain text (no markdown tables)."""
 
 ASK_STOP = set("""a an the and or but if of to in on at for from with about into over after before is are was
@@ -2794,6 +2982,9 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
     if client.get("background"):
         prof.append("Background: " + client["background"])
     add("PATIENT PROFILE", "\n".join(prof))
+    meas = measures_text(client)
+    if meas:
+        add("QUESTIONNAIRE AND ASSESSMENT RESULTS (latest)", meas)
     plan = current_plan(client)
     if plan:
         add(f"CURRENT TREATMENT PLAN (v{plan.get('version', '')}, {str(plan.get('created', ''))[:10]})",
@@ -2837,6 +3028,36 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
                 cands.append({"day": day, "num": num, "label": label + (f" (part {ci + 1})" if len(chunks) > 1 else ""),
                               "key": key, "text": chunk, "rank": (1000 if focus else 0) + score * 5 + base,
                               "recent": day})
+    # the External communication log (texts/emails kept as they are): in when the question is about them,
+    # mentions their words, or names their date
+    about_msgs = re.search(r"\b(texts?|texted|messages?|emails?|emailed|contact|reached out|communication)\b",
+                           question, re.I) is not None
+    for cm in client.get("communications") or []:
+        text = scrub_contact_details(cm.get("text") or "")
+        if not text.strip():
+            continue
+        low = text.lower()
+        score = sum(low.count(w) for w in words)
+        focus = bool(want_day and cm.get("date") == want_day)
+        cands.append({"day": cm.get("date", ""), "num": None,
+                      "label": f"{cm.get('method', 'Messages')} (external communication)", "key": "comm",
+                      "text": text[:4000] + (" …[shortened]" if len(text) > 4000 else ""),
+                      "rank": (1000 if focus else 0) + score * 5 + (6 if about_msgs else 0),
+                      "recent": cm.get("date", "")})
+    # imported documents (psychological assessments, records…): in when the question names their type or words
+    for doc in client.get("documents") or []:
+        text = strip_word_xml(doc.get("text") or "")
+        if not text.strip():
+            continue
+        low = text.lower()
+        score = sum(low.count(w) for w in words)
+        named = any(w in (doc.get("type") or "").lower() for w in words if len(w) > 3) or \
+            re.search(r"\b(assessment|evaluation|report|records?|testing|document)\b", question, re.I) is not None
+        focus = bool(want_day and doc.get("date") == want_day)
+        cands.append({"day": doc.get("date", ""), "num": None,
+                      "label": f"{doc.get('type', 'Document')} (imported document)", "key": "doc",
+                      "text": text[:6000] + (" …[shortened]" if len(text) > 6000 else ""),
+                      "rank": (1000 if focus else 0) + score * 5 + (8 if named else 0), "recent": doc.get("date", "")})
     picked = []
     room = budget - used - 4000                       # leave space for the manual + conversation
     notes = sorted([c for c in cands if c["key"] == "note"], key=lambda c: c["recent"], reverse=True)
@@ -2864,6 +3085,12 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
         sources.append(f"{n_ov} overview{'s' if n_ov != 1 else ''}")
     if n_tr:
         sources.append(f"{n_tr} transcript excerpt{'s' if n_tr != 1 else ''}")
+    n_doc = sum(1 for c in picked if c["key"] == "doc")
+    if n_doc:
+        sources.append(f"{n_doc} imported document{'s' if n_doc != 1 else ''}")
+    n_cm = sum(1 for c in picked if c["key"] == "comm")
+    if n_cm:
+        sources.append(f"{n_cm} logged message thread{'s' if n_cm != 1 else ''}")
 
     ref = reference or {}
     manual = []
@@ -3421,6 +3648,7 @@ class Vault:
                 "check": Fernet(key).encrypt(self.CHECK).decode()}
         self._atomic_write(self.meta_path, json.dumps(meta).encode())
         self.fernet = Fernet(key)
+        self._raw_key = key
         set_checkpoint_secret(key)
 
     def _key_for(self, password):
@@ -3438,12 +3666,48 @@ class Vault:
         key = self._key_for(password)
         if key:
             self.fernet = Fernet(key)
+            self._raw_key = key
             set_checkpoint_secret(key)
             self._dirs()
             self._load_local_index()
             self.migrate()
             self.save_local_index()
         return key is not None
+
+    def key_ok(self, key):
+        """Is this the vault's key? (Windows Hello unlock hands back the key, not the password.)"""
+        from cryptography.fernet import Fernet, InvalidToken
+        try:
+            with open(self.meta_path, encoding="utf-8") as f:
+                meta = json.load(f)
+            return Fernet(key).decrypt(meta["check"].encode()) == self.CHECK
+        except (InvalidToken, ValueError, TypeError, OSError, KeyError):
+            return False
+
+    def unlock_key(self, key):
+        """Unlock with the key itself (from Windows Hello) — the same as unlock() after the password step."""
+        from cryptography.fernet import Fernet
+        if not key or not self.key_ok(key):
+            return False
+        self.fernet = Fernet(key)
+        self._raw_key = key
+        set_checkpoint_secret(key)
+        self._dirs()
+        self._load_local_index()
+        self.migrate()
+        self.save_local_index()
+        return True
+
+    def raw_key(self):
+        return getattr(self, "_raw_key", None)
+
+    def vault_id(self):
+        """Tells vaults apart (a Windows Hello setup belongs to one vault)."""
+        try:
+            with open(self.meta_path, encoding="utf-8") as f:
+                return hashlib.sha256(json.load(f)["salt"].encode()).hexdigest()[:16]
+        except (OSError, ValueError, KeyError):
+            return ""
 
     # --- speed: what's already been decrypted & parsed stays in RAM (512 MB budget)
     CACHE_BUDGET = 512 * 1024 * 1024       # decrypted sessions kept in memory (most recently used)
@@ -4007,8 +4271,13 @@ def models_status(cfg, hf_token):
                 align = False
             with _PROBE_LOCK:
                 _SETUP_PROBES["align_en"] = align
-    speaker = speaker_model_cached() if hf_token else None
+    speaker = speaker_model_cached() if speakers_on(hf_token) else None
     return {"whisper": model in cached, "cached": cached, "align": align, "speaker": speaker}
+
+
+def speakers_on(hf_token):
+    """Speaker labels: with a Hugging Face token, or without one when the installer brought the model."""
+    return bool(hf_token) or bool(BUNDLE and speaker_model_cached())
 
 
 def speaker_model_cached():
@@ -4272,264 +4541,614 @@ def _inside(path, folder):
 # --------------------------------------------------------------------------- #
 # The app's icon (title bar, taskbar, desktop shortcut): small PNGs kept in the program itself
 # --------------------------------------------------------------------------- #
+APP_ICON_VERSION = 2    # 2: a hand writing on paper. Raise it when the icon changes so desktop shortcuts pick it up.
 APP_ICON_PNG = {
     16: (
-        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAACqUlEQVR42n2TT4iVZRTGf+f93vs3595R505ZYzlYGEhEVBAuQpgsCjfhLgjG"
-        "wJW7oIW4uAwR7iOqpdlScFMbEYkiKIqSFrMo0P5J09g009zr3Pnu977nHBeSM0r07H+Hc57zPEK/H1hYsD1vfjYlnZk599zFFDcTtklCcEKB"
-        "EAZWLV/+88zzf9HvBwG4//SVwxTtj2IRHhYBuIvdJscd1Ox3q8rjN848eVkeOPV9T9UWY7vT21hfz2XWgAQHvwcWcJNGLGxHpxvz5vBvKaqD"
-        "MWd9oag3e8PVFX1mXye+cWiaZi0gsrWHA+5QJuPs1zfCN9dW9L6Jzu40Ti9F1/FkStHbNeHc/KPs3dng/zR3oMvT71yhSskLs24UE62qLFNt"
-        "4aHJOl/8uMa7n/5MaBWY3T4jBME2MydfmeXw47uYbArXb2ZpiWvUPBaXgKpRZWfv7iYvP9Uj1ALuIAKxECwZ+3otKjU0Z1wDRpaIGUrG1AgC"
-        "w83M1eURoR5wIGVnWGasVA7M7GBmZxNTxdRRSURVxTyDOQKoOWZOgZDLzBOzHV4/9OAdD0aVUmBYVkCJlhMhRAYbFWU2Znttnt3fxYtATeCR"
-        "6fZdJmZ1/rlZIl7DPBMtq4e6sjbYZP6D73jr6GMce24PAJUaP10f8u3VNcydcTbeu3iNlbURrYkJ0lg9qqaCKno9woWvfuPCl7/yy4dHGZaZ"
-        "F9/+nKXV8rahgJuDOc1WJKfkeA7Rkq2LqHiqqMeCRrPg4g9LLJxfZGllg1a7duedRBARLFVAFNc8EF49Nx1jbZFaa8rTKMdCpEqGm1NvbGVh"
-        "ex2otSN5tJo9HhSA4tjHc140zgoy4zgiggD3sltD/A8hz+v51y7Jv3XmyPvTdHcdCZq6kMX+k4xOKAZUG5f45MQy/X64BTHrbi6Y77T5AAAA"
-        "AElFTkSuQmCC"
+        "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAADKUlEQVR42k3OS2tcZRzA4d97OZeZSSbJJG28pBax1qag0ksaSu1Gqy6U0kXdKGJR"
+        "F4pupKJQkAhupAju3Cl+grpRKAouJFjFGCrSIlrtkFg7SWcymUwyZ8457/v+3YnPJ3gUwKMLN8elUj+vxB9FnNEiSmn+IwG8gKAEpbxO68ujZ6sf"
+        "Le5VXXVwYaWhjboc1RpzZT7AByg9uCCEAEqB1ZBEGqsCRFWk9zfZ9S+Xx86df9pKCG+ramOu126VFatMo6aZbhj2TETcPxWxbzpmsqZ5/4sWN7qW"
+        "hB5bl9701bmXD2fXtt+1SsKxXrcfXj85al452dC7Rg3/y9PaKJiqWw7da/hlTSGLH2Bn5rAHzwS3eWvOErxkean3766ELCv49MompQvkTjBagQjP"
+        "zDU4sHeK7OMLVKOIaP4N3HZHSwhiffBIMFxbzTg0k3LXREwtNfgglF7Y3HHEScLNxc8ZdprEZy9S5jtgEiQI1pcCIbDSyakkmtsbBbVUE1tIk4ix"
+        "rd/wS39iVn/g4VPnWBnGJJIRpTHBe7RzDoPQXM8ZSQ0zUwlJpCmdcLvr6LmUMNjgvRfm+eb5Lp8d/Y5J06d0QnAeG5ygVWBto6A3cCigXjVoZXmw"
+        "Ity9/T2u8hjt1nWs2+LxXRnj3MNKMU0dh/auRBNY7xUM8kBWBH5t7nBtdcjt9ha79z3LfbPH8K5AxylDXeXD403GZZOBM1jnAtYI2wNH886QU4cm"
+        "SKNJrFEABA+dn78i8tu4MsFjmD+gePXWTS5ceQDrfcAET1F4mmtDTj0yQV4KIQSU1pTrN0g3f0dP7Ga7c4coTcmLCm8d71NkV9HBBxWcD84FVttD"
+        "lFKksSaODJFRJJN7aFf2U/bb6DjB5TnFICOtpWHhyULZ4P2Sk+iJxEj57dUOR/ZaVtZ3+Ks1oNnK+KfrWO1W+eSE5szskDUXI8F54ija6SdLavTF"
+        "Hycp8q9NMn64GO4wyIYgCpRBW01sNaItYybj0uk/OPGQgUqdfLN/tYjdUwqg/tzlhqiRd7TiiFZiFKIEQQIEEYwKdIuY2ZGO/PTaHV+r15a3suLi"
+        "2PxLnX8BjyCfeMHTcZwAAAAASUVORK5CYII="
     ),
     24: (
-        "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAAEUklEQVR42pWW24uWVRTGf2vt/X6H+bRxGnXSC43KLEih0AgsSroqDPEiEzKv"
-        "QkiEgugcDBMUdgAlqEjoQGiYUv4BgUGlnUBNzVILSw2Po47OzHd691pdfN94StRZsOBlXzxrred59tqvMBK9vUpfnwH0vP3nRB2slRhF2Jju"
-        "2tHnJh27FEtaB670ifW8unORhGyZeLrNLY2qABLqqO4RTx8cfu2OtSNF5Bz4S1tX6pjxz9Cs4XkDcEYXgsQCkpXJzx5/79iKu5bT6yoAE17c"
-        "9mjo6Fpvw6eauGlQ0dwcu8YaKhBVSOaGiGmlO7Oh44uPrZi1VnCXCc//8oMUxsz2xpCLSDhTy+ksR8qZXlOBWtM4Xc25rhRx9ySFinh9cPvx"
-        "yuzZ0vPs5omJ+AchdKklH2qYLHtgEkvv7aEjU0SuDO4O1abx0ZajvLvpMJWCukkQLJ1xjbfHepWyFi1GFQaGG8yb2c1bC6Yy2nhj/lT2H6/y"
-        "1bYTjKsUyd1iqHk5SjR3M3Cl3siZe+t1mMNwI7F57ynqTRvx2mXah0KmzJnWRaUYmDu9k3U/HYGODLdEI+QeW2MabgncSOaoQP9ggyc//o3B"
-        "Wo6o4JcILgKYUy4Gvnv5bsZO7MCSQRvLzUCFCDXcstaBGdq259TuMgdX3j86owpghrcTDURq4NHOFbB2qwdP1pi3citD1RwJF08QVM5PUAhs"
-        "fPpObhxfxsyh3b2bIfVAiyJLuAmkxAhSVyXjlUduot4wUC4qcHq42boj7hSzwLiO7LwoNkJRQiQRq0BIhomBJ7yNpAKd5Ug9XiCyQyEqS+ZM"
-        "vlTr9oeBpZYWuUGmRKjiFnFXSAkFkjknzjZYvuZ3BodbFLU2mlPKAl+/MIup3WXMHRXB2w0FabHgnjBLNGpKpAoEw7VFz86DAwQVpnSX2ffm"
-        "fVe8YKE9mrujKuw4MADueGprKnW0NZmR5znlkrLm239Y8/1B0gWLyNwv65iRRGDdlkN8+s3flEtKnrc0AJDSE+un4HEXGsYK5smQPBnTJlR4"
-        "eNYk3nl8BqrC6eEmS1dv5VB/lRgvdtWZas6OAwMUohJU3BHB0rBnhRmRpOJiYIJ7QkXoKCh79p/khutLqApHBmrMX7GZn3cfg2L8/yZXKBci"
-        "jmEJEG0JPtyQGFSqzTzlBGlZDCG5owF6OgscOV3jwd5N7D4wQKWzeBF1FwqSUjrvKQHc82B5TcAle+yLH4kds8iHHDSIQF5PzLy5i9ycXfv6"
-        "KY8tkie76qMDnohl8Wb119x1toJ4MlvlGtTNzS1PlpJrhm//q9937e/3Qkf0RjN3N7tK5snNzDVTs7SKDQtToNfV35+5U255aAKlzntwV8wE"
-        "R0IQUVUxo+2Vq2QoKFklUD212r5c/PrIkyn09gp9faYLPlviGp/C03TcijKal1m0jsa9kpof2sYln0CvQp/L5X5bWPT5ZBpegto1opcgZHU2"
-        "LPy3LbSAOMB/K+2TasvkSnMAAAAASUVORK5CYII="
+        "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"
+        "zLADy3cAAAAASUVORK5CYII="
     ),
     32: (
-        "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"
-        "Xf8FkgU9ByIJ/OsAAAAASUVORK5CYII="
+        "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"
     ),
     48: (
-        "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"
-        "M/7E4T95GTcmPjAj9gAAAABJRU5ErkJggg=="
+        "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAYAAABXAvmHAAARJUlEQVR42sWaaZBcV3XHf/e+pfee7p5d60gjL9q8xLKMZTvGNiZ2MDEkGZdxAQ6E"
+        "KgKVIlCGD5hFqIoUKSpAQSgTUxACSYBIkFCUE0Kwhe3YhpSxsbAly5I8Gkmj2Wd6lt7edk8+vO4ZjTQStkPIrbo93W/u6z7nnvP/n+U+xblDDewV"
+        "ve8uFbUu7Pyi5Ov16XyEp/ktDBUkJdlVmn/mvWqudW1gr1j77sKAkmVrl90polDxgss/M9qncO4xRG8UiTYpkRyCAjnntt/caMqmlICqKG29LKiH"
+        "Q2l8+9D9646dLeNyBVr/GNhrbb/ixk8ore+zEpmsCX0k8sFE/FaH0ijbRdsJosZCXUz0xejAg7sP7dvjs3u3Zs8es6SAiAK45LNTWdcPvm+lC7dG"
+        "tTIiUQhKgWj+X4YyIpFoJ23bmRKRV388tKK3HrqvMNNSwgJRA4fQW0FNj04/ZGWKbwgqUwEYrVAWoJuK/u+mQimU0kophVIiv+4epURCrRM5HYwc"
+        "kPl//1iogtpGu23DDfm3/PU/3fLMpBw6tBc9sBe9b5+KDh468XE7035LWJnyFcpBUCLCq5ktk2q1NFUTNWEo1P2IuVpIxYuahj/fd4GYEGWnCaeP"
+        "U3nkr1Q0M+QsPP4lXyrjuxLV8l/u23dXNLAXrQC2fuzoWtzUEQEHE+r4Z1cwaPNFEa9QZ0AvMhAZIYiE0AhRFCtkaUg5kE9q2jMWq4s2c7WIZ096"
+        "pBJ2zAvnYNmA5SB+jeqPPkY0P4LSNipVkOzvf8bodEmMV9ny4qc3HbUBjGW/007kkkFlOlRaqxYbqKYAoBARIoEwksUZmVh8W0PKUbSlNJ05TW+b"
+        "zdqiw7r2+O/qok1nzqaYttDxnrH7X07zd08uUMiliORsJlIoUdQf/wLR7EmUmwETkrr+A4pUUZSdsAka7wY+ascKy20m8ASlFCKLRBkJzNYiRARH"
+        "Q9pVtKc0nTmLVQWbtSWHdSWHtSWbVQWHrrxNIW1dEJZhJNiW4u6dbfz9Y+NEkQtKL9t95eao//wBguGnUaki0pgndf1fYPdchqnPaqO0YMwbEbnf"
+        "3rR7Ki/RXL8JPIUxWpRCAaERUg687focF3W7rC05rCrEO5lPXVhIIyxi4uzRskAxY5O1AvwgxHEdRAAToZIFvBe+j//iQ7HwtTKJK96Gs+kNmPos"
+        "KK0k8JQR+jZ+aqzTdhtzhdAiKypaAqJSeH7El+7u4bbtuVctpDRflAKt1IqI6si7lDKKk9UAx3GQKEQl8gRDT9B45puoZAGpz+L034R7+dswjfkm"
+        "IQpiIhBJO1G9qBvxpRj9CIgQRoZ8QtjRl2wCMwbomdOYmC0gFtLSS9PWCtuK3ysV3zsx63PgeAUvMIiAbWl62xz8IIyDpJMmmjpG46kvo+wE4lex"
+        "ujbjXvNnSNBoyncGcxHHLjvezta2xrunFVRqASNln46cg5LYKhdKIIJQmJoPGJnxODHR4OXROsdG67w8WufUZIPJ+YDytMcPP30Fb76mA4C17S7B"
+        "kSpYBUytTOOJz0HkgVLoTDuJ6z4EykYiL8aJkSU6FCBoKnA2l2utqPmG4WmPy9ZlEBG0UjR8w9R8wOnp5UIOjtU5OekxOedTqUeIQDKhac85rOlI"
+        "8DubcvT3prhoVZobthWIjGBpxfqOJFG0AMbgPfVFzMIIysmARLi7PgjpDsSvgraWhG85aTMS2lBHxF2mABLz+skpr8nlik/+43G+/NAwkYH5WghA"
+        "OqHpyDus6Uiya3Oe/t4Um3pT9HWnWNOeoLPNIZM8F/BhU5i17QmU5eD94uuY0QOoZBv4FZxrP4Du2Ix486DOFj4WUMSgCWnRKKKWFGjpMdRUQAT6"
+        "e1P83pUlLtuYZUN3kr6uFKvbXTraXFLuq0uVNGBEuHhDD4mhbxAMPgypAtTL2Jfdg7X+RkxjLhZ+RaKIZfUWMdDa/eZiY8DSmlNT/iKr3HtLD/fe"
+        "0vOqBI2MMLMQMj7rc2ykSrURMXBdJ1qDbdsMHniK4PC/4ebySGMWvfFmrC1/hDTmY58/D8u1XAgFNnUQ28QJZ8sCBmxLcbrsL/prZFpR+SzwRsLM"
+        "QsDojB/jYqzOsZEYFycmGozP+szXQiJcejvT3Lqzl64MHHzxGB/88B4SqRTiL6A6t2Jf+adIUF/OxedRQCTmaXvRZWRpvUGwtWJyPqRcCejIuygF"
+        "zw1WODpSY2i8wdGRFngbTMwGzNdDxAgJ16KUs1lVSrBtfYY7X9fBxWty5BdeoqfyFOrQKEOZtdz9nk9xeqZGZ85FZ7qwd74fQRFn8PoCwrPk5v4Z"
+        "LMQZLoSApWCuZhib9enIu5QXAm7/5AHGJhukszalnMPq9gRXbcqxqTdFf2+KDT0xeLsKLrkzorVMHGV8/0OkV6+lNvo8wdyT3Hd9lp8Wi/xsqMb0"
+        "1vfiJFaTiuawlCASIegLqBBbQKFaGGCZAtKk0nogDM94bFuXpS1js+/+bRgjrO9K0pFfmWFWGuWXn8OkSkjnZhx3jL7ekIsu38Y9s9McHZrk0eFD"
+        "PDK1wIGgn1lVxLEgqXyUGAwrxZ8lWe2mPsst0IwVYSScmPQWL1y/pe2VVbYC5UrA2EyD41MREwdt7ihVSVROkHAsIlH41QY62cbm7SW2XrrAn5SP"
+        "88LwS+wfLrC/3MfhoA9jJ3AJVki5WxbwV2ahFpBBMTTRuCDDjJU9Tkx6DJ4ReU9MNBgr+8zVQsJQSCS7iK7r5ebGEIl0ilJ3D47jxDmXF2BIYbXn"
+        "uKYz4potC7xv5gV+dvQZPjF4E6OqFwf/LCVaIAa7DthyrgWMxG7UsoClFC+eqvLZ751kbNZnaLzBWJNhTCS4jqaYdegtuVy0OsXtO0r096To701S"
+        "SAZU/Ys5vjDGL3/wNd64bohi7xrcVIpcqYSbSCJiqHkRorIke9q5vXuKk7X/5v7hO3HtmFiWKWAE3wKbBuAs5UJnLMHWitMzHlFksCzNiYkGDz09"
+        "zcaeFNv7Mrylt4NNvWk2dCdZ2xmDty1tn0u1L9zP8dkc5Y73cOO7PkLixb1k84p6zWNs8GVsxyFTKJItlbAsiyAMIZGlKzWDMkHs4kYtLw0NEIIN"
+        "DUScVn68ZIFmLJiYC5irhZRyLrdd1c7pb+3CtV9Z5DVGiGonGD7yX+SZwLJg1bUfha4Bxh/5Guu3bMWr16kvLFApzzA6eIx8Rxf5UonRIyM8eOJq"
+        "sBJgqohY57oQCn2+4to0A1i5GjE+6y/6/a8TfrYa8tLpGj95dhJfFOXD3+H0yUFS/e+gf8c7SOmIVOdanHU7mB4+gWU7pPN51lyymWyhSHV2lsbC"
+        "HJPlOj1WGTus0hAXJdGKTYSlOICcE7otpah5wvC0x+a12cXrU/MBE7M+Jyc9BseWwDs00WB0xmOuGuDXLf75w6fZOv04l73lQfJ9dyx2IhRC91W3"
+        "cvibj5Ft7wQUjVqV3v5NjBw9QqF3Dd19G7h660m+9/QPuH/wVhZ0ERcf08ylRQSlzsiFVlJANVOFoYn6Ylb65185wlf/YwSlFH4QYduaQsamt+TS"
+        "15Xk5ssK9PckuXR9kS25YxSv/ltShfWIGJRq/bhi5LHvkkk7TA2fpmfDBgLPQ1sW+Y5ORo4dYfXFlxLl1nHXzXOk7B/zvsN3ENkplISxZM3C/YIW"
+        "iD8qjjepVCSOBVrB9g1Z+rqSrO1M0lNwKWTtFRzqiuZ9EUpZiIlQWjPxqydwKidZd/W1HPv5U8xPT5ErthN4HvmOThZmpmlUFkhmMlRVG29+ncez"
+        "00/wuYnbaLMDImnFAe+MXGiF3MmYmEpbscCIcPeN3dx9Y/d56mRZZGPVamwBSllxt0HHQJw/9DilYo6Tv3oOpTVTp06RLZawXRdt6cWYpLRGBQ3C"
+        "dBdv33aY7+4fYVq6cIjiEsH/NRYwBmytGZ7yEGllpUu1sFoUMH6jz+x2nW1KpWnMTjH+7MME85PUE11kC0Xy7e3MjI5y6tBB2tesoVKeRWtNKp/H"
+        "RCFaK4LA0LemwE25l/j63Bq6nCphXBJfGANC3MNpBay2jBN3GV5F/RL7vmZhZJCxR75BR1eBniuvQmsLEUPg+xS6u7Edh7nJSWpzc2y8/ApMFC01"
+        "z02ASXfy0WuPceSRX/Lz8EraVNyl0NSbFdl5qNTWUK7EKcNi3vRq+svNrt7UL37EqnW95LrXIFFEGPiYMIwbaEFAvqOTno39JLNZ0MuLGaUUQRix"
+        "5qJNPHjDQbaqw8xFaXIsoBvUL9iw1QqqDcPwdGNZufnKNVBEYYAOqziZHEG9ttR61RrLcbBdlzDwGTl6hExbAaXOTaW1gppn6N9yCV/b9Qx9cpyX"
+        "vB3nqQfO2kM/EobG669NAREsx8U4WfyFOZKlLkzgo7QmaDSYn5ykvjBPZXaWdC5PsaeHKIqwbJsoDJvU24pLhqqv2X7lRXyl8TR/8+jhs/pCKwmn"
+        "Y94eHKu/5kMjhdC58w5Gf/J1CtUKlptmoVzGb9RIpDPkO7vo6tvAqUMHOXnwBZTWFLp7yBaLZymh0Bi80Oaaqzawc+PxWAEjgjqPBYyJ2eV40wJK"
+        "vYJTrjPotFUiZbvXsf7OD1E5/hxTBx4lk7bo3bodrTVRFKEtm1QuR6ZQJJXNcurwi1iWRSqfw0RmmUsqDCE2VvslaFKpOZCqNMG2IpAtxfBUA9Ns"
+        "cElT6ah5DhBGhjCSeCOaoNNaYVlxi9FudgPsbBty8euZ69pBKhX3hPxGo7nLMZi1ZeGm03SuW8fs5EQcAM/cWBEsrVGYWlgN5+zyV3fMFe55alDb"
+        "drdEvoFlaR9iBMfSDE97hKHgOmqRGZY4X53RYoyYnmswMlXlxHiF46MLDI4sMDReYXiyxuiMj/h1/vXWUXa2d2C5CSytmB0fR0RI5XKEnoftuIgx"
+        "K/i1EsuxFUF0IvPo8Ylm/Df/iXJ2rdRuNgKurTg95fO57x/lvj/ehDHC9GyD09NVTowtnCFkldNTNSZmfeZqEV4gcbtG2yjHxnEckm6SanIVn39+"
+        "ns8nnoDOTUSNKpVymYuu3ollxyJND75MOp9fgVPE4DpaNfyH1Z49cZXQNvDYBuU6hxEsJNIrHQSLGOqVeS7p0ZjQY2y6znw9Iggk7rVZNsp2cFwH"
+        "x3GwbRvLslBKg9KLJWHrNLcSJbhv9X4+frOHKW2gOj1OpVwmmc3iVas4ySTdfRuaAW2plNcao7WlGoHZlr/23hctBvZa3r43zSQ235vRycLvSlgP"
+        "4p7euSPhuozORsxUFWKnSaTzZPIF0rk2UtkcqXQGx02hbRe0jWBj0BhRSGs2JXG04aczG8jUTnHzxQantIZkKgFArtROsbtnmfBNdw5TxTa7Uak9"
+        "kNv1rm/J3r2WAlEM7NOwxcrr8n6VyF8njXKAUvbZnKMWWUgWM1XhtQ1FnB/VfeELWx/m/bd3UnfasYhAhCiKlsUAYyRIF7JOY6H6bNLybtg3WPQG"
+        "BgaMBiXsGzDs2+ZjrD8Qr/KEShTjY1ZjQowxca5hRMSIMSLGtEgqvv5aphEEE4rrKPnICzfKt/ePScrMSRAhURQK8SmvEZFQQNLteSeseU9HNXmT"
+        "2vHe2sDBg6KUajHOHti9W3sPvLPmrb38245VTKHtHcrJOYJWcc+P5qnvb24KWlkYZayk+vHpXrVdnldb+3PKkFC2hUokXOVkUxoTmagePOCM1t6e"
+        "uO09Zdm9W6tljxoseZlqPQ2S/cMnL1WWvFOQW0TMRiWSpXms85t+vMNSQkNcijLFd17/NDe8rl9CY1eVxZCl9f6G5/9Dbte7nwfYvXu33tMUnpUf"
+        "O2liYt9diwjKvPXJLq10G1bt/+SZCQ/owGfE6+Mmfsj+D0dCYeucuuzO8UWp9u61GBgwSi1/3OZ/AN+pztZ2nh4dAAAAAElFTkSuQmCC"
     ),
     64: (
-        "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"
+        "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"
     ),
     256: (
-        "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"
+        "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"
+        "TkSuQmCC"
     ),
 }
 
@@ -4600,7 +5219,12 @@ def app_icon_file():
     path = os.path.join(LOCAL_DIR, "session-scribe.ico")
     try:
         data = app_icon_ico()
-        if not os.path.isfile(path) or os.path.getsize(path) != len(data):
+        try:
+            with open(path, "rb") as f:
+                same = f.read() == data
+        except OSError:
+            same = False
+        if not same:                                  # first time, or the icon changed in a new version
             os.makedirs(LOCAL_DIR, exist_ok=True)
             with open(path, "wb") as f:
                 f.write(data)
@@ -4916,7 +5540,10 @@ def extract_text(path, src=None):
             # page breaks become form feeds, so multi-page documents can be reassembled
             p = re.sub(r"<w:br[^>]*w:type=\"page\"[^>]*/>|<w:lastRenderedPageBreak/>", "<w:t>\f</w:t>", p)
             p = re.sub(r"<w:br[^>]*/>", "\n", p)
-            paras.append(html.unescape("".join(re.findall(r"<w:t[^>]*>(.*?)</w:t>", p, flags=re.S))))
+            # only <w:t> itself — "<w:t[^>]*>" also matched <w:tabs>, <w:tc>, <w:tbl>…, pulling the paragraph's
+            # formatting XML into the text
+            runs = re.findall(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>", p, flags=re.S)
+            paras.append(html.unescape(re.sub(r"<[^>]+>", "", "".join(runs))))
         return _normalize("\n".join(paras))
     if ext == ".pdf":
         try:
@@ -4936,6 +5563,14 @@ def extract_text(path, src=None):
         return _normalize(src.read().decode("utf-8", errors="replace"))
     with open(path, encoding="utf-8", errors="replace") as f:
         return _normalize(f.read())
+
+
+def strip_word_xml(text):
+    """Text imported before the .docx fix could carry Word formatting XML (<w:pPr>…); keep only the words."""
+    if "<w:" not in (text or ""):
+        return text or ""
+    import html
+    return _normalize(html.unescape(re.sub(r"<[^>]+>", "", text)))
 
 
 def _normalize(text):
@@ -6179,7 +6814,9 @@ def transcribe(audio_path, cfg, hf_token, progress):
     Interrupted part-way (the worker died, hung, or the computer slept long enough to break it), it is
     started again automatically and carries on from the last finished piece (see checkpoint_for)."""
     check_cancelled()
-    ckpt = checkpoint_for(audio_path, cfg, bool(hf_token))
+    ckpt = checkpoint_for(audio_path, cfg, speakers_on(hf_token))
+    if ai_engine(cfg) == "builtin":
+        ENGINE.make_room(cfg)          # a computer short on memory unloads the AI while it transcribes
     if os.environ.get("SESSION_SCRIBE_INPROC_TRANSCRIBE"):
         return transcribe_here(audio_path, cfg, hf_token, progress, ckpt)
     _SleepWatch.start()
@@ -6274,7 +6911,7 @@ def _transcribe_run(audio_path, cfg, hf_token, progress, ckpt, attempt=0):
     try:
         mname = cfg.get("whisper_model") or "large-v3-turbo"
         job = {"audio": audio_path, "hf_token": hf_token or "", "parent_pid": os.getpid(),
-               "cfg": dict({k: cfg.get(k) for k in ("whisper_model", "language", "batch_size",
+               "cfg": dict({k: cfg.get(k) for k in ("whisper_model", "language", "batch_size", "whisper_threads",
                                                     "min_speakers", "max_speakers") if cfg.get(k) is not None},
                            timing=timing_tx(mname), duration_hint=audio_seconds(audio_path)),
                "ckpt": ckpt}
@@ -6546,7 +7183,7 @@ def transcribe_here(audio_path, cfg, hf_token, progress, ckpt=None):
     """progress(text, percent) — percent is overall 0-100 across every step, in proportion to how long
     each step takes on this computer; set_eta() carries the time left alongside. With ckpt (see
     checkpoint_for) every finished piece is saved as it's done, and a later run carries on from there."""
-    diarize = bool(hf_token)
+    diarize = speakers_on(hf_token)
     mname = cfg.get("whisper_model") or "large-v3-turbo"
     prof = cfg.get("timing") or timing_tx(mname)
     dev_guess = prof.get("last_device") or "cpu"
@@ -6611,8 +7248,9 @@ def transcribe_here(audio_path, cfg, hf_token, progress, ckpt=None):
             plan.update(0, f"Loading the speech model ({mname}, " + ("graphics card" if device == "cuda" else
                            "processor — can take a minute or two") + ")…")
             t1 = time.time()
-            m = _stage(f"loading the speech model ({mname})", whisperx.load_model,
-                       mname, device, compute_type=compute, language=lang)
+            threads = int(cfg.get("whisper_threads") or 0) if device == "cpu" else 0
+            m = _stage(f"loading the speech model ({mname})", _call_with_optional, whisperx.load_model,
+                       {"threads": threads} if threads else {}, mname, device, compute_type=compute, language=lang)
             print(f"[worker] model {mname} loaded on {device}/{compute} in {time.time() - t1:.1f}s",
                   file=sys.stderr, flush=True)
             return m
@@ -6706,9 +7344,9 @@ def transcribe_here(audio_path, cfg, hf_token, progress, ckpt=None):
 
                 def make_dp():
                     try:
-                        return DP(use_auth_token=hf_token, device=device)
+                        return DP(use_auth_token=hf_token or None, device=device)
                     except TypeError:
-                        return DP(token=hf_token, device=device)
+                        return DP(token=hf_token or None, device=device)
                 dm = _stage("loading the speaker model (pyannote)", make_dp)
                 # pyannote's steps and how much of the speaker step each one takes
                 spans = {"segmentation": (0.0, 0.30), "speaker_counting": (0.30, 0.35),
@@ -6886,7 +7524,31 @@ def client_name_map(client):
     return parse_name_map(client.get("names_to_hide", ""), legacy=client.get("names_format") != 2)
 
 
-def client_hider(client):
+_AI_NAMES = {"on": True}
+
+
+def set_ai_names(on):
+    _AI_NAMES["on"] = bool(on)
+
+
+def names_to_ai(client=None):
+    """Whether the local AI reads this patient's real names: Settings › "Patient names for the AI" (on
+    unless turned off), unless the patient is set to keep names hidden. The AI runs on this computer, so
+    names never leave it either way; names help it keep straight who said and did what."""
+    return _AI_NAMES["on"] and not (client or {}).get("hide_names")
+
+
+def names_note(client=None):
+    return "names included" if names_to_ai(client) else "names hidden"
+
+
+def client_hider(client, always=False):
+    """What every AI step passes the patient's material through: names → placeholders ([Patient],
+    [Husband]…) when names are hidden, the text as it is when the AI may read them. always=True hides
+    regardless — for what's shared beyond you (the supervision packet) or kept for every patient (the
+    preferences learned from your edits)."""
+    if not always and names_to_ai(client):
+        return lambda s: s or ""
     pairs = client_name_map(client)
     return lambda s: apply_name_map(s or "", pairs)
 
@@ -6896,12 +7558,457 @@ _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d
 _URL_RE = re.compile(r"\bhttps?://\S+|\bwww\.\S+", re.I)
 
 
+_SPELLED_PHONE_RE = re.compile(r"(?<!\d)(?<!\d )(?:\d ){9,10}\d(?! ?\d)")       # "6 3 1 4 5 6 1 2 3 4" (screen-reader text)
+
+
 def scrub_contact_details(text):
     """Email addresses, phone numbers and links -> placeholders (messages often carry them in signatures
     and headers, and the patient's names-to-hide list doesn't cover them)."""
     text = _EMAIL_RE.sub("[EMAIL]", text or "")
     text = _URL_RE.sub("[LINK]", text)
+    text = _SPELLED_PHONE_RE.sub("[PHONE]", text)
     return _PHONE_RE.sub("[PHONE]", text)
+
+
+_INVISIBLE_RE = re.compile("[​-‏‪-‮⁦-⁩﻿]")
+_WEEKDAYS = "Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday"
+_MSG_FROM_RE = re.compile(
+    r"^Message from (?P<who>[^,]+), (?P<body>.*), (?:" + _WEEKDAYS + r"), (?P<mon>[A-Za-z]+) (?P<day>\d{1,2}),? "
+    r"(?P<year>\d{4}),? (?P<time>\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?)\.?$", re.S)
+# the sender/time header shown above a message: "(631) 456-1234 • 1:15 PM", "Christina • Sep 14, 10:02 AM",
+# or just "Sep 16, 11:46 AM" above your own
+_STAMP_CORE = r"(?:[A-Z][a-z]{2}\s+\d{1,2},\s+)?\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?"
+_MSG_STAMP_RE = re.compile(r"^(?:.{0,80}?\s*•\s*)?" + _STAMP_CORE + r"$")
+_MSG_STAMP_TAIL_RE = re.compile(r"\s+\S.{0,80}?\s*•\s*" + _STAMP_CORE + r"$")       # glued onto the line before
+_REACTION_RE = re.compile(r"^(Liked|Loved|Disliked|Laughed at|Emphasized|Questioned)\s+[“\"](?P<what>.*)[”\"]$", re.S)
+# (month names use _MONTHS from the date code above — "jan"…"dec" — looked up by their first three letters)
+
+
+def tidy_message_thread(text, other="Patient"):
+    """Text messages copied from a phone or messages web app, as plain one-line-per-message text.
+
+    Handles the screen-reader form some apps copy ("* Message from 6 3 1 …, <text>, Friday, November 13
+    2026, 1:08 PM." followed by the same text again, and "(631) 456-1234 • 1:15 PM" lines): each message
+    becomes "[2026-11-13 1:08 PM] Patient: <text>", the repeated copy and the number/time lines are
+    dropped, and the sender's number never appears. Lines it doesn't recognize are kept as they are."""
+    out, dup = [], ""
+    norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()
+    for raw in _INVISIBLE_RE.sub("", text or "").replace("\r\n", "\n").split("\n"):
+        line = re.sub(r"^\s*[*•·-]\s*", "", raw).strip() if re.match(r"^\s*[*•·]", raw) else raw.strip()
+        if line and not _MSG_STAMP_RE.match(line):
+            line = _MSG_STAMP_TAIL_RE.sub("", line).strip()   # "…last words Christina • Sep 22, 2:44 PM"
+        if not line:
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        m = _MSG_FROM_RE.match(line)
+        if m:
+            who = m.group("who").strip()
+            if re.fullmatch(r"[\d\s+().-]+", who):
+                who = other                          # a phone number: the person on the other end
+            elif who.lower() in ("you", "me", "myself"):
+                who = "Counselor"
+            mon = _MONTHS.get(m.group("mon").lower()[:3])
+            when = (f"{int(m.group('year')):04d}-{mon:02d}-{int(m.group('day')):02d} " if mon else "") + \
+                re.sub(r"\s+", " ", m.group("time")).upper().replace(".", "")
+            body = m.group("body").strip()
+            r_ = _REACTION_RE.match(body)
+            if r_:                                   # an iPhone reaction, not a new message
+                what = re.sub(r"\s+", " ", r_.group("what")).strip()
+                out.append(f"[{when}] {who} reacted ({r_.group(1).lower()}) to: “"
+                           + (what[:80] + "…" if len(what) > 80 else what) + "”")
+            else:
+                out.append(f"[{when}] {who}: {body}")
+            dup = norm(body)
+            continue
+        if _MSG_STAMP_RE.match(line):
+            continue                                 # the sender/time header the app shows above a message
+        if re.fullmatch(r"[A-Z]{1,2}", line) and out and out[-1].startswith("["):
+            continue                                 # the contact's initial (their picture) under the header
+        if dup and norm(line) and norm(line) in dup:
+            continue                                 # the message's text again, right after its description
+        dup = ""
+        out.append(line)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+_MAIL_HEAD_RE = re.compile(
+    r"^(?P<who>[^<\n]{1,80}?)\s*<(?P<addr>[^>\s]+@[^>\s]+)>\s+(?:[A-Z][a-z]{2},\s+)?(?P<mon>[A-Z][a-z]{2,8})\.?\s+"
+    r"(?P<day>\d{1,2}),\s+(?P<year>\d{4})(?:,)?\s+(?:at\s+)?(?P<time>\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?)"
+    r"(?:\s*\(.*\))?\s*$")
+_MAIL_JUNK_RE = re.compile(r"^\s*(\[Quoted text hidden\]|\d+ messages?|To:\s.*|Cc:\s.*|Bcc:\s.*|"
+                           r"https?://mail\.google\.com/\S*|\d{1,2}/\d{1,2}/\d{2,4},\s+\d{1,2}:\d\d\s*[AP]M\s.*Mail\s+-\s+.*)"
+                           r"\s*$", re.I)
+_MAIL_NOTICE_RE = re.compile(r"^\s*(confidentiality notice|this (e-?mail|message|communication)( message)? (and any "
+                             r"attachments )?(is|are|may) (confidential|intended))", re.I)
+
+
+def reflow_paragraphs(text, wrap_at=60):
+    """Join lines a PDF or print-out broke mid-sentence back into paragraphs: a line that ran close to the page
+    width carries on into the next one. Short lines (greetings, sign-offs, table rows), list items and blank
+    lines stay as they are."""
+    out, cur, last_len = [], "", 0
+    for raw in (text or "").split("\n"):
+        l = raw.strip()
+        if not l:
+            if cur:
+                out.append(cur)
+                cur = ""
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        listy = re.match(r"^([-*•·]|\d{1,2}[.)])\s", l) is not None
+        ends = re.search(r"[.!?:]\W{0,4}$", cur) is not None and l[:1].isupper()   # a sentence ended there
+        if cur and last_len >= wrap_at and not listy and not ends:
+            cur += ("" if cur.endswith("-") else " ") + l
+        else:
+            if cur:
+                out.append(cur)
+            cur = l
+        last_len = len(l)
+    if cur:
+        out.append(cur)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+def _clean_mail_body(lines, who=""):
+    """An email's own words: without the confidentiality notice, print junk, the sender's signature and blank
+    edges."""
+    body = []
+    for l in lines:
+        if _MAIL_NOTICE_RE.match(l):
+            break                                     # the confidentiality notice runs to the end
+        if _MAIL_JUNK_RE.match(l):
+            continue
+        body.append(l.strip())
+    # the signature: from the sender's own name on a line of its own, near the end
+    name = (who or "").lower()
+    for i in range(len(body) - 1, max(-1, len(body) - 14), -1):
+        if body[i].strip().lower() in (name, name.split()[0] if name else "", "-- ", "--"):
+            body = body[:i]
+            break
+    while body and not body[-1].strip():
+        body.pop()
+    while body and not body[0].strip():
+        body.pop(0)
+    return body
+
+
+def _cut_quoted(lines):
+    """An email body without the earlier emails quoted under it ("On … wrote:", "-----Original Message-----",
+    Outlook's "From: … Sent: …") and without "> " quoted lines or "Sent from my iPhone"."""
+    out = []
+    for i, l in enumerate(lines):
+        s = l.strip()
+        if s.startswith(">"):
+            continue
+        if re.match(r"^On\s.{4,}", s) and re.search(r"wrote:\s*$", " ".join(x.strip() for x in lines[i:i + 3])):
+            break
+        if re.match(r"^-{2,}\s*Original Message\s*-{2,}", s, re.I) or re.match(r"^(Sent from my |Get Outlook for )",
+                                                                                 s, re.I):
+            break
+        if (re.match(r"^From:\s", s) or re.fullmatch(r"_{8,}", s)) and \
+                any(re.match(r"^\s*(Sent|Date|From):\s", x) for x in lines[i + 1:i + 4]):
+            break
+        out.append(l)
+    return out
+
+
+_EML_HEAD_RE = re.compile(r"^(From|To|Cc|Date|Subject): ?(.*)$")
+
+
+def _eml_date(v):
+    from email.utils import parsedate_to_datetime
+    try:
+        dt = parsedate_to_datetime((v or "").strip())
+    except (TypeError, ValueError, IndexError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()                          # this computer's time, so every email lines up
+    return dt.replace(tzinfo=None)
+
+
+def eml_messages(text):
+    """The emails in text loaded from .eml files (each one a "From:/To:/Date:/Subject:" header block, a blank line
+    and its body): [{"dt", "from", "to", "subject", "body"}], oldest first. A header block counts only when its
+    Date is a real email date, so a quoted email inside a body stays part of that body."""
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    heads = []                                        # (start, end of header, header dict)
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("From:") and (i == 0 or not lines[i - 1].strip()):
+            j, head = i, {}
+            while j < len(lines) and _EML_HEAD_RE.match(lines[j]):
+                k, v = _EML_HEAD_RE.match(lines[j]).groups()
+                head.setdefault(k, v.strip())
+                j += 1
+            dt = _eml_date(head.get("Date"))
+            if dt is not None and (j == len(lines) or not lines[j].strip()):
+                heads.append((i, j, head, dt))
+                i = j
+                continue
+        i += 1
+    msgs = []
+    for n, (s, e, head, dt) in enumerate(heads):
+        end = heads[n + 1][0] if n + 1 < len(heads) else len(lines)
+        msgs.append({"dt": dt, "from": head.get("From", ""), "to": ", ".join(x for x in (head.get("To"), head.get("Cc"))
+                                                                              if x),
+                     "subject": head.get("Subject", ""), "body": lines[e:end]})
+    msgs.sort(key=lambda m: m["dt"])
+    return msgs
+
+
+def looks_like_eml_dump(text):
+    return bool(eml_messages(text)) if re.search(r"(?m)^Date: ", text or "") else False
+
+
+def eml_thread(text, me_name=None):
+    """Emails loaded from .eml files as one dated block each, oldest first: "[2026-11-11 3:15 PM] Sender →
+    Recipient:", the subject, then the message without quoted earlier emails, signature or notices. With two or
+    more emails, the address on every one of them is the Counselor's own. Text without such emails: unchanged."""
+    from email.utils import getaddresses
+    msgs = eml_messages(text)
+    if not msgs:
+        return text or ""
+    for m in msgs:
+        m["f"] = [(n.strip().strip('"'), a.lower()) for n, a in getaddresses([m["from"]]) if a]
+        m["t"] = [(n.strip().strip('"'), a.lower()) for n, a in getaddresses([m["to"]]) if a]
+    me = ""
+    if me_name is None:
+        try:
+            me_name = load_config().get("therapist_name", "")
+        except Exception:
+            me_name = ""
+    key = lambda s: re.sub(r"[^a-z]", "", (s or "").lower())
+    if key(me_name):                                  # your name as Settings has it (the note's therapist)
+        me = next((a for m in msgs for n, a in m["f"] + m["t"] if key(n) == key(me_name)), "")
+    if not me and len(msgs) >= 2:
+        # the address on every email; with two such (a back-and-forth), the one receiving more — files saved
+        # from your own mailbox are mostly emails to you
+        common = set.intersection(*[{a for _, a in m["f"] + m["t"]} for m in msgs])
+        if common:
+            me = max(sorted(common), key=lambda a: sum(a == x for m in msgs for _, x in m["t"]))
+
+    def name(p):
+        n, a = p
+        return "Counselor" if me and a == me else (n or a)
+    out = []
+    for m in msgs:
+        who = name(m["f"][0]) if m["f"] else (m["from"].strip() or "Unknown sender")
+        tos = [name(p) for p in m["t"]]
+        to = ", ".join(tos[:3]) + (f" +{len(tos) - 3}" if len(tos) > 3 else "")
+        tm = m["dt"].strftime("%I:%M %p").lstrip("0")
+        sig = m["f"][0][0] if m["f"] else ""         # their real name signs the email, not "Counselor"
+        body = reflow_paragraphs("\n".join(_clean_mail_body(_cut_quoted(m["body"]), sig))).strip()
+        out.append(f"[{m['dt'].date().isoformat()} {tm}] {who}" + (f" → {to}" if to else "") + ":\n" +
+                   (f"Subject: {m['subject']}\n" if m["subject"].strip() else "") + body)
+    return "\n\n".join(out)
+
+
+def looks_like_email_print(text):
+    """An email thread printed or saved from Gmail/Outlook ("Name <address>   Wed, Nov 11, 2026 at 3:15 PM")."""
+    return bool(re.search(r"(?m)^[^<\n]{1,80}<[^>\s]+@[^>\s]+>\s+(?:[A-Z][a-z]{2},\s+)?[A-Z][a-z]{2,8}\.?\s+\d{1,2},\s+"
+                          r"\d{4}", text or ""))
+
+
+def tidy_email_thread(text):
+    """An email thread as one dated block per email: "[2026-11-11 3:15 PM] Sender → Counselor:" and the message,
+    without the signature blocks, confidentiality notices, "[Quoted text hidden]" or print headers and links. The
+    mailbox the thread was printed from (its first line) is the Counselor. Text it doesn't recognize is kept."""
+    lines = _INVISIBLE_RE.sub("", text or "").replace("\r\n", "\n").split("\n")
+    me = ""
+    for l in lines:                       # the mailbox line ("Name <address>" alone) above the first email
+        if _MAIL_HEAD_RE.match(l.strip()):
+            break
+        m0 = re.match(r"^([^<\n]{1,80}?)\s*<([^>\s]+@[^>\s]+)>\s*$", l.strip())
+        if m0:
+            me = m0.group(2).lower()
+            break
+    msgs, pre, cur = [], [], None
+    for raw in lines:
+        line = raw.rstrip()
+        m = _MAIL_HEAD_RE.match(line.strip())
+        if m:
+            cur = {"who": m.group("who").strip().strip('"'), "addr": m.group("addr").lower(), "head": m,
+                   "to": "", "body": []}
+            msgs.append(cur)
+            continue
+        if cur is None:
+            pre.append(line)
+            continue
+        t_ = re.match(r"^\s*To:\s*(.*)$", line)
+        if t_ and not cur["body"]:
+            cur["to_raw"] = t_.group(1).lower()
+            cur["to"] = re.sub(r"\s*<[^>]*>", "", t_.group(1)).strip()
+            continue
+        cur["body"].append(line)
+    if not msgs:
+        return text or ""
+    subject = next((l.strip() for l in pre if l.strip() and not re.search(r"<[^>]+@", l)
+                    and not _MAIL_JUNK_RE.match(l)), "")
+    out = [f"Subject: {subject}"] if subject else []
+    for msg in msgs:
+        body = _clean_mail_body(msg["body"], msg["who"])
+        h = msg["head"]
+        mon = _MONTHS.get(h.group("mon").lower()[:3])
+        when = (f"{int(h.group('year')):04d}-{mon:02d}-{int(h.group('day')):02d} " if mon else "") + \
+            re.sub(r"\s+", " ", h.group("time")).upper().replace(".", "")
+        who = "Counselor" if me and msg["addr"] == me else msg["who"]
+        to = msg["to"]
+        if me and to and me in msg.get("to_raw", ""):
+            to = "Counselor"
+        out.append(f"\n[{when}] {who}" + (f" → {to}" if to else "") + ":\n" + reflow_paragraphs("\n".join(body)).strip())
+    return "\n".join(out).strip()
+
+
+# ---- the contact log: one entry per date (texts/emails pasted together are split by their own dates)
+_STAMP_LINE_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d)(?: (\d{1,2}:\d\d ?[AaPp][Mm]))?\]")
+
+
+def _clock(t):
+    """'8:34 AM' -> minutes after midnight (-1 when there's no time)."""
+    m = re.match(r"(\d{1,2}):(\d\d)\s*([AaPp])", t or "")
+    if not m:
+        return -1
+    h = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "p" else 0)
+    return h * 60 + int(m.group(2))
+
+
+def contact_blocks(text):
+    """(lines before the first dated message, subject, [(date, minutes, time text, block)]) — a block is a dated
+    message line ("[2026-10-19 8:34 AM] Patient: …") or a dated email with its body."""
+    pre, subject, blocks, cur = [], "", [], None
+    for l in (text or "").split("\n"):
+        if l.startswith("Subject: ") and not blocks and not subject:
+            subject = l[9:].strip()
+            continue
+        if _PHONE_RE.fullmatch(l.strip() or "x"):
+            continue                                # a lone phone number: the copy app's header, not a message
+        m = _STAMP_LINE_RE.match(l)
+        if m:
+            cur = [m.group(1), _clock(m.group(2)), (m.group(2) or "").upper().replace(" ", " "), [l]]
+            blocks.append(cur)
+        elif cur is None:
+            pre.append(l)
+        else:
+            cur[3].append(l)
+    out = []
+    for d, mins, t, ls in blocks:
+        while ls and not ls[-1].strip():
+            ls.pop()
+        out.append((d, mins, t, "\n".join(ls).strip()))
+    while pre and not pre[-1].strip():
+        pre.pop()
+    return [l for l in pre], subject, out
+
+
+def _contact_text(pre, subject, blocks):
+    blocks = sorted(blocks, key=lambda b: b[1])          # chronological (stable for equal times)
+    sep = "\n\n" if any("\n" in b[3] for b in blocks) else "\n"
+    parts = [("\n".join(pre)).strip(), f"Subject: {subject}" if subject else "", sep.join(b[3] for b in blocks)]
+    return "\n\n".join(p for p in parts if p)
+
+
+def merge_contacts(entries, new, now=None):
+    """Add a logged contact to the list, one entry per date: messages pasted together are split by their own
+    dates, and a date that already has an entry with the same person and way of contact gets them merged in,
+    in time order (repeats left out). Returns the entries it added or changed."""
+    now = now or datetime.now().isoformat(timespec="seconds")
+    if looks_like_eml_dump(new.get("text", "")):         # emails loaded from .eml files: one dated block each
+        new = dict(new, text=eml_thread(new["text"]))
+    pre, subject, blocks = contact_blocks(new.get("text", ""))
+    touched = []
+    if not blocks:                                       # a summary you typed: as it is
+        e = dict(new, id=new.get("id") or uuid.uuid4().hex[:12], added=new.get("added") or now, updated=now)
+        entries.append(e)
+        return [e]
+    by_date = {}
+    for b in blocks:
+        by_date.setdefault(b[0], []).append(b)
+    first = min(by_date)
+    # one entry per date for each way of contact: all of a day's texts together, all of its emails together
+    same = lambda e: e.get("method") == new.get("method")
+    for d in sorted(by_date):
+        bl = by_date[d]
+        tgt = next((e for e in entries if e.get("date") == d and same(e) and contact_blocks(e.get("text", ""))[2]),
+                   None)
+        if tgt is not None:
+            if (tgt.get("with", "patient"), tgt.get("who") or "") != (new.get("with", "patient"), new.get("who") or ""):
+                tgt["mixed"] = True                    # more than one person that day (each message says who)
+            p2, s2, b2 = contact_blocks(tgt.get("text", ""))
+            seen = {re.sub(r"\s+", " ", b[3]).strip().lower() for b in b2}
+            add = [b for b in bl if re.sub(r"\s+", " ", b[3]).strip().lower() not in seen]
+            merged = b2 + add
+            tgt["text"] = _contact_text(p2 or (pre if d == first else []), s2 or subject, merged)
+            tgt["time"] = sorted(merged, key=lambda b: b[1])[0][2] if merged else tgt.get("time", "")
+            tgt["updated"] = now
+            touched.append(tgt)
+        else:
+            e = dict(new, id=uuid.uuid4().hex[:12], date=d, text=_contact_text(pre if d == first else [], subject, bl),
+                     time=sorted(bl, key=lambda b: b[1])[0][2], notes=new.get("notes", "") if d == first else "",
+                     added=now, updated=now)
+            entries.append(e)
+            touched.append(e)
+    return touched
+
+
+def detect_contact_dates(text):
+    """The dates in pasted or loaded texts/emails (sorted, YYYY-MM-DD), read the same way they'll be saved; a
+    date written anywhere in the text when the messages carry none; [] when there's none at all."""
+    t = text or ""
+    if looks_like_eml_dump(t):
+        t = eml_thread(t)
+    elif looks_like_email_print(t):
+        t = tidy_email_thread(t)
+    elif looks_like_message_export(t):
+        t = tidy_message_thread(t)
+    dates = sorted({b[0] for b in contact_blocks(t)[2]})
+    if dates:
+        return dates
+    m = re.search(r"(?mi)^\s*(?:date|sent):\s*(.+)$", text or "")      # an .eml / Outlook "Date:" header
+    found = ""
+    if m:
+        try:
+            from email.utils import parsedate_to_datetime
+            found = parsedate_to_datetime(m.group(1).strip()).date().isoformat()
+        except (TypeError, ValueError, IndexError):
+            found = find_date(m.group(1))
+    return [found or find_date(text or "")] if (found or find_date(text or "")) else []
+
+
+def contacts_need_split(e):
+    """A saved contact whose messages span several dates (or another date), or with phone-number header lines."""
+    text = e.get("text") or ""
+    if looks_like_eml_dump(text):
+        return True                                      # .eml files saved as one block before they were split
+    dated = re.search(r"(?m)^\[\d{4}-\d\d-\d\d", text) is not None
+    if dated and any(_PHONE_RE.fullmatch(l.strip()) for l in text.split("\n") if l.strip()):
+        return True
+    dates = {b[0] for b in contact_blocks(text)[2]}
+    return bool(dates) and dates != {e.get("date")}
+
+
+def resplit_contacts(entries):
+    """Re-file saved contacts that need it (see contacts_need_split). Returns True if anything changed."""
+    bad = [e for e in entries if contacts_need_split(e)]
+    if not bad:
+        return False
+    keep = [e for e in entries if e not in bad]
+    for e in sorted(bad, key=lambda x: x.get("added", "")):
+        merge_contacts(keep, {k: v for k, v in e.items() if k not in ("id", "date", "time", "added", "updated")},
+                       now=e.get("added"))
+    entries[:] = keep
+    return True
+
+
+def looks_like_message_export(text):
+    return bool(re.search(r"(?m)^\W*Message from .+, (?:" + _WEEKDAYS + r"), ", _INVISIBLE_RE.sub("", text or "")))
 
 
 def read_messages_file(path):
@@ -6912,16 +8019,925 @@ def read_messages_file(path):
         with open(path, "rb") as f:
             msg = email.message_from_binary_file(f, policy=policy.default)
         body = msg.get_body(preferencelist=("plain", "html"))
-        text = body.get_content() if body else ""
+        try:
+            text = body.get_content() if body else ""
+        except (LookupError, ValueError):
+            text = (body.get_payload(decode=True) or b"").decode("utf-8", "replace") if body else ""
         if body is not None and body.get_content_type() == "text/html":
-            text = re.sub(r"<[^>]+>", " ", text)
-        head = "\n".join(f"{h}: {msg[h]}" for h in ("From", "To", "Date", "Subject") if msg[h])
+            import html as _html
+            text = re.sub(r"(?is)<(style|script|head)\b.*?</\1>", "", text)
+            text = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|li|h\d|blockquote)>", "\n", text)
+            text = _html.unescape(re.sub(r"<[^>]+>", "", text))
+            text = re.sub(r"[ \t\xa0]+", " ", text)
+            text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+        head = "\n".join(f"{h}: {' '.join(str(msg[h]).split())}" for h in ("From", "To", "Cc", "Date", "Subject")
+                         if msg[h])
         return (head + "\n\n" + text.strip()).strip()
     return extract_text(path)
 
 
 # --------------------------------------------------------------------------- #
-# Local LLM (LM Studio)
+# Registration forms: every answer read out of the form and organized by topic (no AI)
+# --------------------------------------------------------------------------- #
+def _nk(s):
+    return re.sub(r"\s+", "", s or "").lower()
+
+
+def _reg_from_pdf(data):
+    """(title, form date, [(form section, question, answer)]) from a filled-in form PDF (a Jotform-style
+    export: bold questions, answers beside or under them in a lighter type, larger bold section titles).
+    Questions and answers are paired by where they sit on the page; the instructions and policy text in
+    between are left out."""
+    import io
+    from pypdf import PdfReader
+    reader = PdfReader(io.BytesIO(data))
+    title, form_date, out = "", "", []
+    section, label, value, prev_label, beside = "", "", [], False, False
+
+    def clean(v):
+        v = re.sub(r"\b(1[89]\d|20\d) {1,3}(\d)\b", r"\1\2", v)          # a year the PDF split ("197  1")
+        return re.sub(r"[ \t\xa0]{2,}", " ", v)
+
+    def flush():
+        nonlocal label, value, beside
+        v = clean("\n".join(value)).strip()
+        if label and v:
+            out.append((section, re.sub(r"\s+", " ", label).strip(), v))
+        label, value, beside = "", [], False
+    for page in reader.pages:
+        frags = []
+
+        def vis(text, cm, tm, fd, fs):
+            t = (text or "").strip()
+            if not t:
+                return
+            try:
+                y = tm[5] * cm[3] + cm[5]
+                x = tm[4] * cm[0] + cm[4]
+            except (TypeError, IndexError):
+                return
+            font = str((fd or {}).get("/BaseFont", "")) if hasattr(fd, "get") else ""
+            size = float(fs or 0) * abs(float(tm[0] or 1)) * abs(float(cm[0] or 1))    # as printed on the page
+            frags.append((y, x, "bold" in font.lower(), size, t))
+        page.extract_text(visitor_text=vis)
+        rows_b, rows_r = {}, {}
+        for y, x, b, fs, t in frags:
+            (rows_b if b else rows_r).setdefault(round(y), []).append((x, fs, t))
+        bsizes = sorted(fs for y, x, b, fs, t in frags if b) or [0]
+        label_size = bsizes[len(bsizes) // 2]
+        bold, bold_y = {}, {}
+        for y_, parts in sorted(rows_b.items(), key=lambda kv: -kv[0]):
+            parts.sort(key=lambda p: p[0])
+            key = _nk("".join(p[2] for p in parts))
+            bold[key] = "head" if max(p[1] for p in parts) >= label_size * 1.3 else "label"
+            bold_y.setdefault(key, []).append(y_)               # top to bottom, like the lines below
+        prose = {_nk("".join(p[2] for p in sorted(parts))) for parts in rows_r.values()
+                 if label_size and max(p[1] for p in parts) >= label_size * 0.95}   # instructions, policies
+        chips = {_nk(t) for y, x, b, fs, t in frags if not b and label_size and fs >= label_size * 0.85}
+        run_in = [k for k, kind in bold.items() if kind == "label" and len(k) > 3]
+        try:
+            layout = page.extract_text(extraction_mode="layout")
+        except Exception:
+            layout = page.extract_text()
+        last_y = None
+
+        def split_after(text, n):
+            """text cut after its first n non-space characters."""
+            seen = 0
+            for i, ch in enumerate(text):
+                if not ch.isspace():
+                    seen += 1
+                    if seen == n:
+                        return text[:i + 1], text[i + 1:]
+            return text, ""
+        for raw in layout.split("\n"):
+            s = raw.strip()
+            if not s:
+                prev_label = False
+                continue
+            if re.fullmatch(r"\d{1,3}", s) or s.startswith("Document ID:"):
+                continue
+            k_all = _nk(s)
+            m = re.match(r"^\s*(\S.*?)\s{3,}(\S.*)$", raw)
+            left, right = (m.group(1), m.group(2)) if m else (s, "")
+            kind = bold.get(k_all) or (bold.get(_nk(left)) if m else None)
+            if kind is None and not m:                    # a question run straight into its answer
+                pre = max((k for k in bold if bold[k] == "label" and len(k) > 3 and k_all.startswith(k)
+                           and k != k_all), key=len, default="")
+                if pre:
+                    left, right = split_after(s, len(pre))
+                    left, right = left.strip(), right.strip()
+                    m, kind = True, "label"
+            key_now = k_all if bold.get(k_all) else _nk(left)
+            ys = bold_y.get(key_now)
+            y_now = ys.pop(0) if ys else None
+            near = last_y is not None and y_now is not None and 0 < last_y - y_now < label_size * 1.6
+            if kind:
+                last_y = y_now
+            if kind == "head":
+                flush()
+                section = s if bold.get(k_all) == "head" else left
+                title = title or section
+                prev_label = False
+                continue
+            if kind == "label":
+                text = s if bold.get(k_all) else left
+                if label and (near if y_now is not None else prev_label):
+                    label += " " + text                      # the question carries on onto this line
+                else:
+                    flush()
+                    label = text
+                if m and not bold.get(k_all):
+                    parts = re.split(r"\s{3,}", right.strip())
+                    # several ticked boxes ("Shy and inhibited   Difficulty feeding") vs one answer the PDF
+                    # spaced out ("James   Doe", "(631)   468-8347")
+                    joiner = "; " if len(parts) > 1 and all(_nk(p) in chips and re.search(r"[A-Za-z]", p)
+                                                            for p in parts) \
+                        and any(len(p.split()) > 1 for p in parts) else " "
+                    value.append(joiner.join(parts))
+                    beside = True                            # answered beside the question
+                prev_label = True
+                continue
+            prev_label = False
+            if k_all in prose or any(k_all.startswith(r) and k_all != r for r in run_in):
+                continue                                     # the form's own instructions and policy text
+            if not label:
+                if not form_date and not out and find_date(s):
+                    form_date = parse_date(s) or find_date(s)
+                continue
+            if beside and len(raw) - len(raw.lstrip()) < 20:
+                flush()                                      # full-width text after a side answer: the form's
+                continue                                     # own wording (a policy paragraph), not the answer
+            parts = re.split(r"\s{3,}", s)
+            value.append(("; " if len(parts) > 1 and all(_nk(p) in chips and re.search(r"[A-Za-z]", p)
+                                                         for p in parts)
+                          and any(len(p.split()) > 1 for p in parts) else " ").join(parts))
+    flush()
+    return title, form_date, out
+
+
+def _reg_from_text(text):
+    """The same from plain text (a .docx or .txt form): "Question: answer" lines; a short line on its own
+    ending without a colon starts a section."""
+    out, section, title = [], "", ""
+    for line in (text or "").split("\n"):
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"^([^:]{2,90}?)\s*:\s+(\S.*)$", s)
+        if m:
+            out.append((section, m.group(1).strip(), m.group(2).strip()))
+        elif len(s) < 60 and not s.endswith((".", ",", "?")) and not re.search(r"\d", s):
+            section = s
+            title = title or s
+    return title, find_date(text or ""), out
+
+
+# (pattern on the question, topic, short label) — first match wins
+_REG_RULES = [
+    (r"policy holder.*date of birth|policy holder.*dob", "Insurance & billing", "Policy holder's date of birth"),
+    (r"policy holder.*phone", "Insurance & billing", "Policy holder's phone"),
+    (r"relationship to policy holder", "Insurance & billing", "Patient's relationship to policy holder"),
+    (r"policy holder", "Insurance & billing", "Policy holder"),
+    (r"insurance company", "Insurance & billing", "Insurance company"),
+    (r"insurance id|member id", "Insurance & billing", "Insurance ID"),
+    (r"paying with insurance|private pay|out-of-pocket", "Insurance & billing", "Paying by"),
+    (r"accident or injury", "Insurance & billing", "Related to an accident or injury"),
+    (r"responsible for the bill", "Insurance & billing", "Responsible for the bill"),
+    (r"patient'?s full name|^patient'?s? name$", "Patient", "Name"),
+    (r"date of birth|\bdob\b", "Patient", "Date of birth"),
+    (r"gender|\bsex\b", "Patient", "Gender"),
+    (r"address", "Patient", "Address"),
+    (r"language", "Patient", "Language spoken at home"),
+    (r"text you", "Contact preferences", "OK to text"),
+    (r"voicemail", "Contact preferences", "OK to leave a voicemail"),
+    (r"preferred (form of|way of|method of)? ?contact", "Contact preferences", "Preferred contact"),
+    (r"therapist'?s name", "Treatment", "Therapist"),
+    (r"first appointment", "Treatment", "First appointment"),
+    (r"reason", "Treatment", "Reason for starting therapy"),
+    (r"psychological and/or psychiatric services|services your child has received in\s*past",
+     "Treatment", "Past mental health services"),
+    (r"special services", "Treatment", "Special services (school or outside agency)"),
+    (r"best hopes", "Treatment", "Hopes for the child"),
+    (r"firearm.*access|access to the firearm", "Safety", "Child has access to the firearm"),
+    (r"firearm|\bgun\b", "Safety", "Firearm in the home"),
+    (r"experienced any of the following", "Safety", "Recent experiences"),
+    (r"primary care", "Medical", "Primary care physician"),
+    (r"prescrib|psychiatrist", "Medical", "Prescriber / psychiatrist"),
+    (r"family stresses|changes in the past year", "Family & home", "Stresses or changes in the past year"),
+    (r"illnesses|allerg", "Medical", "Illnesses and allergies"),
+    (r"grades? (were )?repeated", "School", "Grades repeated"),
+    (r"school grade|^grade", "School", "Grade"),
+    (r"school name", "School", "School"),
+    (r"school phone", "School", "School phone"),
+    (r"marital status", "Family & home", "Parents' marital status"),
+    (r"details regarding this", "Family & home", "About the parents' situation"),
+    (r"family members.*(south shore|elsewhere)|close relations", "Family & home",
+     "Family members in therapy"),
+    (r"family members.*(psychotherapy|counseling|psychiatry)", "Family & home",
+     "Child or family seen for psychotherapy, counseling or psychiatry"),
+    (r"relationship problems|emotional problems", "Family & home", "Problems at home"),
+    (r"family stresses|changes in the past year", "Family & home", "Stresses or changes in the past year"),
+    (r"agree on ways", "Family & home", "Parents agree on how to help"),
+    (r"disciplined", "Family & home", "Discipline"),
+    (r"best things", "Family & home", "Strengths (from the parents)"),
+    (r"foster|adopted", "Family & home", "Foster or adopted"),
+    (r"mother'?s condition|pregnancy", "Development", "Pregnancy"),
+    (r"births before", "Development", "Births before this child"),
+    (r"age of mother", "Development", "Mother's age at the birth"),
+    (r"milestones", "Development", "Developmental milestones on target"),
+    (r"difficulties your child has had", "Development", "Early difficulties"),
+    (r"unusual", "Development", "Other early history"),
+    (r"use and disclose|authori[sz]e .*to:", "Consents", "Release of information to"),
+    (r"released/exchanged|information to be released", "Consents", "Release covers"),
+    (r"covers the period", "Consents", "Release period"),
+]
+REG_TOPICS = ["Patient", "Parents / guardians", "Emergency contact", "Contact preferences", "Treatment", "Safety",
+              "Medical", "School", "Family & home", "Development", "Insurance & billing", "Consents"]
+
+
+def _reg_short(q):
+    q = re.sub(r"\((?:type n/?a|if paying|if you)[^)]*\)", "", q, flags=re.I)
+    q = re.sub(r"\s*(please (describe|explain|elaborate|list)[^?]*|if so,[^?]*)[:.]?\s*$", "", q, flags=re.I)
+    return re.sub(r"\s+", " ", q).strip(" :")
+
+
+def organize_registration(title, form_date, fields):
+    """The form's answers by topic: {"title", "form_date", "fields": [{"topic", "label", "value", "q"}]} —
+    guardians and the emergency contact gathered into one line each, repeats and "Signature" left out."""
+    out, people, signed, seen = [], {}, [], set()
+    for section, q, a in fields:
+        ql = q.lower()
+        a = a.strip()
+        if ql in ("signature",) or not a:
+            continue
+        if ql == "date":
+            signed.append(a)
+            continue
+        g = re.search(r"(parent|guardian)\S*\s*(\d)\s*(name|cell|phone|e-?mail|relationship)", ql)
+        e = re.search(r"emergency contact\s*(name|phone|relationship)", ql)
+        if g or e:
+            key = ("Parents / guardians", f"Parent / guardian {g.group(2)}") if g else \
+                ("Emergency contact", "Emergency contact")
+            part = (g.group(3) if g else e.group(1)).replace("cell", "phone").replace("-", "")
+            people.setdefault(key, {})[part] = a
+            continue
+        rule = next(((t, l) for p, t, l in _REG_RULES if re.search(p, ql)), None)
+        if rule is None and (re.search(r"polic|rights|responsib|consent|privacy|confidential|agreement",
+                                       section, re.I) or
+                             (len(a) > 600 and not q.rstrip().endswith(("?", ":")))):
+            continue                                         # the form's policy pages: wording, not answers
+        topic, label = rule or (re.sub(r"\s+", " ", section).strip() or "Other", _reg_short(q))
+        sig = (label, _nk(a))
+        if sig in seen or (label == "Name" and any(f["label"] == "Name" for f in out)):
+            continue                                         # (the patient's name again on a later page)
+        seen.add(sig)
+        out.append({"topic": topic, "label": label, "value": a, "q": q})
+    for (topic, label), p in people.items():
+        head = p.get("name", "") + (f" — {p['relationship']}" if p.get("relationship") else "")
+        rest = " · ".join(x for x in (p.get("phone"), p.get("email")) if x)
+        out.append({"topic": topic, "label": label, "value": (head + ("\n" + rest if rest else "")).strip(),
+                    "q": label, "who": p.get("name", ""), "role": p.get("relationship", "")})
+    dates = list(dict.fromkeys(signed))
+    if dates:
+        out.append({"topic": "Consents", "label": "Signed", "value": ", ".join(dates), "q": "Date"})
+    order = {t: i for i, t in enumerate(REG_TOPICS)}
+    out.sort(key=lambda f: (order.get(f["topic"], len(order)), 0))
+    return {"title": title, "form_date": form_date, "fields": out}
+
+
+def read_registration(data, ext):
+    """A registration form (file bytes) organized by topic — see organize_registration."""
+    ext = ext.lower()
+    if ext == ".pdf":
+        title, day, fields = _reg_from_pdf(data)
+        if not fields:                                       # (not a two-column form: try "Q: A" lines)
+            title, day, fields = _reg_from_text(text_from_bytes(data, ext))
+    elif ext == ".docx":
+        title, day, fields = _reg_from_text(text_from_bytes(data, ext))
+    else:
+        title, day, fields = _reg_from_text(data.decode("utf-8", errors="replace"))
+    return organize_registration(title, day, fields)
+
+
+def registration_flags(info):
+    """Things on the form worth seeing first (a firearm in the home, recent experiences, a prescriber…)."""
+    f = {x["label"]: x["value"] for x in (info or {}).get("fields") or []}
+    out = []
+    no = lambda v: re.fullmatch(r"\s*(no|none|n/?a|none of the above)\.?\s*", v or "", re.I) is not None
+    if f.get("Firearm in the home") and not no(f["Firearm in the home"]):
+        acc = f.get("Child has access to the firearm", "")
+        out.append("Firearm in the home" + (" — the child HAS access" if acc and not no(acc) else
+                                             " (child has no access)" if acc else ""))
+    if f.get("Recent experiences") and not no(f["Recent experiences"]):
+        out.append("Recent experiences: " + f["Recent experiences"])
+    if f.get("Prescriber / psychiatrist") and not no(f["Prescriber / psychiatrist"]):
+        out.append("Prescriber: " + f["Prescriber / psychiatrist"])
+    if f.get("Illnesses and allergies") and not no(f["Illnesses and allergies"]):
+        out.append("Illnesses / allergies: " + f["Illnesses and allergies"])
+    return out
+
+
+def registration_age(info, today=None):
+    dob = next((x["value"] for x in (info or {}).get("fields") or [] if x["label"] == "Date of birth"), "")
+    d = parse_date(dob)
+    if not d:
+        return None
+    b, t = date.fromisoformat(d), today or date.today()
+    return t.year - b.year - ((t.month, t.day) < (b.month, b.day))
+
+
+def registration_text(info):
+    """The organized form as plain text (Copy)."""
+    lines, topic = [], None
+    if info.get("title"):
+        lines.append(info["title"] + (f" — {fmt_date(info['form_date'])}" if info.get("form_date") else ""))
+    for x in info.get("fields") or []:
+        if x["topic"] != topic:
+            topic = x["topic"]
+            lines.append(f"\n{topic.upper()}")
+        lines.append(f"{x['label']}: " + x["value"].replace("\n", " · "))
+    return "\n".join(lines).strip()
+
+
+# --------------------------------------------------------------------------- #
+# Built-in AI (installer builds): llama.cpp's llama-server instead of LM Studio
+# --------------------------------------------------------------------------- #
+# An installer build ships llama-server in engine\ and one or more GGUF models in models\llm\. The app
+# starts the server itself (on this computer only, 127.0.0.1) with the model chosen in Settings, sized
+# for this computer's memory and graphics, and stops it when the app closes. Without an engine folder
+# (a plain copy of the program) everything works with LM Studio, as before.
+ENGINE_DIR = os.path.join(APP_DIR, "engine")
+LLM_DIRS = (os.path.join(APP_DIR, "models", "llm"), os.path.join(LOCAL_DIR, "models"))
+HARDWARE_PATH = os.path.join(LOCAL_DIR, "hardware.json")
+GB = 1024 ** 3
+_SHARD = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$", re.I)
+
+
+def engine_exe():
+    """The bundled llama-server, or None."""
+    for name in ("llama-server.exe", "llama-server"):
+        p = os.path.join(ENGINE_DIR, name)
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def ai_engine(cfg):
+    """'builtin' (bundled llama-server) or 'lmstudio'."""
+    choice = (cfg or {}).get("ai_engine") or "auto"
+    if choice == "lmstudio":
+        return "lmstudio"
+    return "builtin" if engine_exe() else "lmstudio"
+
+
+def ai_name(cfg):
+    return "the built-in AI" if ai_engine(cfg) == "builtin" else "LM Studio"
+
+
+# ---- this computer's hardware --------------------------------------------- #
+def _ram_bytes():
+    """(total, available) memory in bytes; (0, 0) if it can't be read."""
+    try:
+        if IS_WIN:
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = MS()
+            ms.dwLength = ctypes.sizeof(MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return int(ms.ullTotalPhys), int(ms.ullAvailPhys)
+        if IS_MAC:
+            total = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                       text=True, timeout=10).stdout.strip())
+            return total, total // 2
+        info = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                info[k] = int(v.split()[0]) * 1024
+        return info.get("MemTotal", 0), info.get("MemAvailable", info.get("MemFree", 0))
+    except Exception:
+        return 0, 0
+
+
+def _cpu_info():
+    """(name, physical cores, logical cores)."""
+    logical = os.cpu_count() or 4
+    name, physical = platform.processor() or "", 0
+    try:
+        if IS_WIN:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfCores | "
+                                  "ConvertTo-Json"], capture_output=True, text=True, timeout=30).stdout
+            rows = json.loads(out or "[]")
+            rows = rows if isinstance(rows, list) else [rows]
+            physical = sum(int(r.get("NumberOfCores") or 0) for r in rows)
+            name = (rows[0].get("Name") or name).strip() if rows else name
+        elif not IS_MAC and os.path.exists("/proc/cpuinfo"):
+            cores = set()
+            phys = core = None
+            with open("/proc/cpuinfo") as f:
+                for line in f:
+                    k, _, v = line.partition(":")
+                    k, v = k.strip(), v.strip()
+                    if k == "model name" and not name.strip():
+                        name = v
+                    elif k == "physical id":
+                        phys = v
+                    elif k == "core id":
+                        core = v
+                    elif not k and phys is not None:
+                        cores.add((phys, core))
+                        phys = core = None
+            if phys is not None:
+                cores.add((phys, core))
+            physical = len(cores)
+    except Exception:
+        pass
+    return name, physical or max(1, logical // 2), logical
+
+
+_INTEGRATED = re.compile(r"\b(UHD|Iris|HD Graphics|Radeon\(TM\) Graphics|Radeon Graphics|Vega \d+ Graphics|"
+                         r"Radeon \d{3}M|Arc\(TM\) Graphics|Adreno|Mali|llvmpipe)\b", re.I)
+
+
+def _gpu_devices(exe=None):
+    """Graphics devices llama-server can use: [{'name', 'total', 'free', 'integrated'}] (bytes).
+    Asks the bundled llama-server itself (--list-devices), so it lists exactly what it will see."""
+    exe = exe or engine_exe()
+    if not exe:
+        return []
+    try:
+        out = subprocess.run([exe, "--list-devices"], capture_output=True, text=True, errors="replace",
+                             timeout=60, cwd=os.path.dirname(exe))
+        text = (out.stdout or "") + "\n" + (out.stderr or "")
+    except Exception:
+        return []
+    gpus = []
+    for m in re.finditer(r"^\s*([A-Za-z]+\d+):\s*(.+?)\s*\((\d+)\s*MiB,\s*(\d+)\s*MiB free\)", text, re.M):
+        name = m.group(2).strip()
+        gpus.append({"id": m.group(1), "name": name, "total": int(m.group(3)) * 1024 ** 2,
+                     "free": int(m.group(4)) * 1024 ** 2, "integrated": bool(_INTEGRATED.search(name))})
+    return gpus
+
+
+def _cuda_available():
+    """Whether the speech engine can use an NVIDIA card (without importing PyTorch here: slow)."""
+    if not shutil.which("nvidia-smi"):
+        return False
+    try:
+        spec = importlib.util.find_spec("torch")
+        if spec is None or not spec.origin:
+            return False
+        lib = os.path.join(os.path.dirname(spec.origin), "lib")
+        return any("cudart" in f.lower() or f.lower().startswith("cudnn") for f in os.listdir(lib))
+    except Exception:
+        return False
+
+
+def detect_hardware(refresh=False):
+    """What this computer has, for sizing the AI and the speech model. Cached in hardware.json (the
+    checks take a few seconds); refresh=True looks again. Free memory is always read fresh."""
+    total, avail = _ram_bytes()
+    hw = {} if refresh else _read_json(HARDWARE_PATH)
+    if not hw.get("cpu_logical") or hw.get("ram_total") != total or hw.get("engine") != bool(engine_exe()):
+        name, physical, logical = _cpu_info()
+        hw = {"ram_total": total, "cpu_name": name, "cpu_physical": physical, "cpu_logical": logical,
+              "gpus": _gpu_devices(), "cuda": _cuda_available(), "engine": bool(engine_exe()),
+              "checked": datetime.now().isoformat(timespec="seconds")}
+        try:
+            os.makedirs(LOCAL_DIR, exist_ok=True)
+            _atomic_json(HARDWARE_PATH, hw)
+        except OSError:
+            pass
+    hw["ram_free"] = avail
+    return hw
+
+
+def hardware_cached():
+    """The last hardware check, without running a new one (for screens that redraw often)."""
+    hw = _read_json(HARDWARE_PATH)
+    return hw if hw.get("cpu_logical") else {"ram_total": _ram_bytes()[0], "gpus": []}
+
+
+def best_gpu(hw):
+    """The graphics device to run the AI on: a dedicated card if there is one, else integrated."""
+    gpus = [g for g in hw.get("gpus") or [] if g.get("total")]
+    if not gpus:
+        return None
+    return sorted(gpus, key=lambda g: (not g.get("integrated"), g.get("free") or 0))[-1]
+
+
+def hardware_summary(hw):
+    bits = [f"{hw.get('ram_total', 0) / GB:.0f} GB memory"]
+    if hw.get("cpu_name"):
+        bits.append(f"{hw['cpu_name']} ({hw.get('cpu_physical')} cores)")
+    g = best_gpu(hw)
+    if g:
+        kind = "integrated graphics" if g.get("integrated") else f"{g['total'] / GB:.0f} GB graphics card"
+        bits.append(f"{g['name']} ({kind})")
+    else:
+        bits.append("no graphics acceleration found")
+    return ", ".join(bits)
+
+
+# ---- model files ------------------------------------------------------------ #
+def _gguf_meta(path, want):
+    """The metadata values named in `want` from a GGUF file's header (stops reading once it has them)."""
+    scalar = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+    got = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("not a GGUF file")
+        version = struct.unpack("<I", f.read(4))[0]
+        if version < 2:
+            raise ValueError("GGUF version 1 isn't supported")
+        _tensors, nkv = struct.unpack("<QQ", f.read(16))
+
+        def rstr():
+            n = struct.unpack("<Q", f.read(8))[0]
+            return f.read(n).decode("utf-8", errors="replace")
+
+        def rval(t):
+            if t in scalar:
+                fmt = scalar[t]
+                return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+            if t == 8:
+                return rstr()
+            if t == 9:
+                it, n = struct.unpack("<IQ", f.read(12))
+                if it in scalar and n > 64:                 # long numeric arrays: skip over them
+                    f.seek(n * struct.calcsize(scalar[it]), 1)
+                    return None
+                if it == 8 and n > 64:                      # e.g. the tokenizer's vocabulary
+                    for _ in range(n):
+                        f.seek(struct.unpack("<Q", f.read(8))[0], 1)
+                    return None
+                return [rval(it) for _ in range(n)]
+            raise ValueError(f"unknown GGUF value type {t}")
+        for _ in range(nkv):
+            key = rstr()
+            t = struct.unpack("<I", f.read(4))[0]
+            val = rval(t)
+            if key in want or key == "general.architecture":
+                got[key] = val
+                if key == "general.architecture":
+                    want = set(w.replace("{arch}", val) for w in want)
+                if "general.architecture" in got and all(w in got for w in want):
+                    break
+    return got
+
+
+_GGUF_CACHE = {}
+
+
+def gguf_info(path):
+    try:
+        key = (path, os.path.getmtime(path))
+    except OSError:
+        return {}
+    if key not in _GGUF_CACHE:
+        _GGUF_CACHE[key] = _gguf_info(path)
+    return dict(_GGUF_CACHE[key])
+
+
+def _gguf_info(path):
+    """{'layers', 'ctx_train', 'kv_bytes_per_token', 'arch'} for a model file ({} if unreadable).
+    The memory a context of N tokens needs is about N × kv_bytes_per_token (16-bit cache)."""
+    want = {"general.architecture", "{arch}.block_count", "{arch}.context_length", "{arch}.embedding_length",
+            "{arch}.attention.head_count", "{arch}.attention.head_count_kv", "{arch}.attention.key_length",
+            "{arch}.attention.value_length"}
+    try:
+        meta = _gguf_meta(path, want)
+    except (OSError, ValueError, struct.error):
+        return {}
+    arch = meta.get("general.architecture") or ""
+
+    def g(name, default=0):
+        v = meta.get(f"{arch}.{name}", default)
+        if isinstance(v, list):
+            v = max((x for x in v if isinstance(x, (int, float))), default=default)
+        return v or default
+    layers, heads = int(g("block_count")), int(g("attention.head_count", 1))
+    kv_heads = int(g("attention.head_count_kv", heads))
+    head_dim = int(g("embedding_length")) // max(heads, 1)
+    k_len, v_len = int(g("attention.key_length", head_dim)), int(g("attention.value_length", head_dim))
+    return {"arch": arch, "layers": layers, "ctx_train": int(g("context_length")),
+            "kv_bytes_per_token": layers * kv_heads * (k_len + v_len) * 2}
+
+
+def model_files():
+    """Every AI model (GGUF) this computer has: the installer's models\\llm and the local app folder's
+    models\\ (drop more files there). Split models count once, by their first part."""
+    seen, out = set(), []
+    for d in LLM_DIRS:
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            continue
+        for fn in names:
+            low = fn.lower()
+            if not low.endswith(".gguf") or "mmproj" in low:
+                continue
+            m = _SHARD.search(fn)
+            if m and int(m.group(1)) != 1:
+                continue
+            path = os.path.join(d, fn)
+            parts = [path]
+            if m:
+                stem = fn[:m.start()]
+                parts = [os.path.join(d, f"{stem}-{i:05d}-of-{m.group(2)}.gguf") for i in range(1, int(m.group(2)) + 1)]
+                if not all(os.path.isfile(p) for p in parts):
+                    continue                             # incomplete download: leave it out
+            name = _SHARD.sub("", fn)
+            name = name[:-5] if name.lower().endswith(".gguf") else name
+            if name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            out.append({"name": name, "path": path, "bytes": sum(os.path.getsize(p) for p in parts),
+                        "bundled": d == LLM_DIRS[0]})
+    return out
+
+
+def find_model(name):
+    name = (name or "").strip().lower()
+    return next((m for m in model_files() if m["name"].lower() == name), None)
+
+
+# ---- fitting a model to this computer -------------------------------------- #
+OVERHEAD = int(0.8 * GB)        # llama-server's own buffers, beyond the weights and the context cache
+CONTEXTS = (16384, 12288, 8192)
+
+
+def plan_model(model, hw, ctx_wanted=16384):
+    """How to run `model` here: {'fit': 'good'|'slow'|'no', 'ctx', 'gpu_layers', 'need', 'why'}.
+    Memory needed ≈ the file + the context cache + a little overhead. On a dedicated card as much as fits
+    goes on the card and the rest stays in memory; integrated graphics share the computer's memory, so
+    there it's about whether the computer has room."""
+    info = gguf_info(model["path"]) if os.path.isfile(model.get("path") or "") else {}
+    layers = info.get("layers") or 40
+    per_tok = info.get("kv_bytes_per_token") or 160 * 1024
+    ctx_cap = info.get("ctx_train") or 32768
+    ram = hw.get("ram_total") or 8 * GB
+    gpu = best_gpu(hw)
+    dedicated = gpu is not None and not gpu.get("integrated")
+    room_ram = ram - 3 * GB                       # Windows and the app itself keep a few GB
+    vram = (gpu.get("free") or gpu.get("total") or 0) if dedicated else 0
+    weights = model.get("bytes") or 0
+    for ctx in [c for c in CONTEXTS if c <= max(ctx_wanted, CONTEXTS[-1])]:
+        ctx = min(ctx, ctx_cap)
+        need = weights + per_tok * ctx + OVERHEAD
+        if need <= room_ram + vram * 0.9:
+            break
+    else:
+        return {"fit": "no", "ctx": CONTEXTS[-1], "gpu_layers": 0, "need": need,
+                "why": f"needs about {need / GB:.0f} GB of memory; this computer has {ram / GB:.0f} GB"}
+    if dedicated:
+        usable = vram * 0.9 - per_tok * ctx - OVERHEAD
+        n = layers if usable >= weights else max(0, int(layers * usable / max(weights, 1)))
+        on_card = n / max(layers, 1)
+        fit = "good" if on_card >= 0.999 else "slow"
+        why = ("runs entirely on the graphics card" if fit == "good" else
+               f"{on_card:.0%} on the graphics card, the rest on the processor")
+    else:
+        # Integrated graphics (or none): the model runs from the computer's memory either way. Offloading
+        # layers lets the integrated GPU (Vulkan) help with reading the transcript — as many as the share
+        # of memory the graphics driver offers will hold.
+        n = 0
+        if gpu is not None:
+            usable = (gpu.get("free") or gpu.get("total") or 0) * 0.9 - per_tok * ctx - OVERHEAD
+            n = layers if usable >= weights else max(0, int(layers * usable / max(weights, 1)))
+        share = need / max(ram, 1)
+        fit = "good" if share <= 0.6 and weights <= 8 * GB else "slow"
+        why = ((f"uses about {need / GB:.0f} of {ram / GB:.0f} GB memory"
+                + ("" if fit == "good" else "; large for this computer, so expect slow note writing")))
+        if gpu is not None:
+            why += f"; {gpu['name']} helps"
+    if ctx < ctx_wanted:
+        why += f"; context shortened to {ctx // 1024}K to fit"
+    return {"fit": fit, "ctx": ctx, "gpu_layers": n, "need": need, "why": why}
+
+
+FIT_LABEL = {"good": "Fits well", "slow": "Slow here", "no": "Won't fit"}
+
+
+def recommend_whisper(hw, cached):
+    """(speech model, batch size, threads) for this computer from the models it has."""
+    cuda = hw.get("cuda")
+    ram = (hw.get("ram_total") or 8 * GB) / GB
+    cores = hw.get("cpu_physical") or 4
+    order = (["large-v3-turbo", "large-v3", "medium.en", "small.en"] if cuda or (ram >= 12 and cores >= 6)
+             else ["medium.en", "small.en", "large-v3-turbo", "large-v3"] if ram >= 8 else
+             ["small.en", "medium.en", "large-v3-turbo", "large-v3"])
+    model = next((m for m in order if m in cached), None)
+    batch = 16 if cuda else (8 if ram >= 16 else 4)
+    return model, batch, max(1, min(cores, 16))
+
+
+def auto_tune(cfg, refresh=False):
+    """Fit the settings to this computer: the AI model (the installer's choice if it fits, otherwise the
+    best one that does), its context and graphics offload, and the speech model. Runs on the first start
+    of an installer build and from Settings › Check this computer again. Returns a summary line."""
+    hw = detect_hardware(refresh)
+    stamp = f"{hw.get('ram_total')}|{[g.get('name') for g in hw.get('gpus') or []]}|{len(model_files())}"
+    if not refresh and cfg.get("tuned_for") == stamp:
+        return None
+    changes = []
+    if ai_engine(cfg) == "builtin":
+        models = model_files()
+        bundle = BUNDLE.get("default_model") or ""
+        current = find_model(cfg.get("model")) or find_model(bundle)
+        plans = {m["name"]: plan_model(m, hw) for m in models}
+        rank = {"good": 0, "slow": 1, "no": 2}
+        pick = current if current and plans[current["name"]]["fit"] != "no" else None
+        if pick is None and models:                         # largest model that still runs well, else fits
+            pick = sorted(models, key=lambda m: (rank[plans[m["name"]]["fit"]], -m["bytes"]))[0]
+        if pick:
+            p = plans[pick["name"]]
+            cfg.update(model=pick["name"], lm_context=p["ctx"], gpu_layers=p["gpu_layers"])
+            changes.append(f"AI: {pick['name']} ({FIT_LABEL[p['fit']].lower()}: {p['why']})")
+    wm, batch, threads = recommend_whisper(hw, cached_whisper_models())
+    if wm:
+        cfg.update(whisper_model=wm, batch_size=batch, whisper_threads=threads)
+        changes.append(f"speech: {wm}")
+    cfg["tuned_for"] = stamp
+    save_config(cfg)
+    return f"This computer: {hardware_summary(hw)}. " + ("Using " + "; ".join(changes) + "." if changes else "")
+
+
+# ---- running llama-server ------------------------------------------------- #
+class LocalEngine:
+    """Starts, watches and stops the bundled llama-server. One model at a time; asking for another
+    model (or other settings) restarts it. The server listens on 127.0.0.1 only."""
+
+    def __init__(self):
+        self.proc = None
+        self.key = None
+        self.port = None
+        self.alias = None
+        self.lock = threading.RLock()
+        self.log_path = os.path.join(LOCAL_DIR, "logs", "ai-engine.log")
+        self._job = None
+
+    @property
+    def base_url(self):
+        return f"http://127.0.0.1:{self.port}/v1"
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _free_port(self):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _tie_to_app(self, p):
+        """Windows: put the server in a job that closes with the app, so a crash never leaves it holding
+        memory. (Elsewhere, stop() runs when the app exits.)"""
+        if not IS_WIN:
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            if self._job is None:
+                job = k32.CreateJobObjectW(None, None)
+
+                class BASIC(ctypes.Structure):
+                    _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                                ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                                ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                                ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                                ("SchedulingClass", wintypes.DWORD)]
+
+                class IOC(ctypes.Structure):
+                    _fields_ = [(n, ctypes.c_uint64) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+                class EXT(ctypes.Structure):
+                    _fields_ = [("BasicLimitInformation", BASIC), ("IoInfo", IOC),
+                                ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                                ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+                info = EXT()
+                info.BasicLimitInformation.LimitFlags = 0x2000          # KILL_ON_JOB_CLOSE
+                k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))
+                self._job = job
+            handle = k32.OpenProcess(0x0001 | 0x0100, False, p.pid)      # TERMINATE | SET_QUOTA
+            k32.AssignProcessToJobObject(self._job, handle)
+            k32.CloseHandle(handle)
+        except Exception:
+            pass
+
+    def log_tail(self, n=4000):
+        try:
+            with open(self.log_path, encoding="utf-8", errors="replace") as f:
+                return f.read()[-n:]
+        except OSError:
+            return ""
+
+    def ensure(self, cfg, model_name=None):
+        try:
+            return self._ensure(cfg, model_name)
+        except RuntimeError as e:
+            ngl = cfg.get("gpu_layers")
+            if not ngl or "stopped while loading" not in str(e):
+                raise
+            # Some graphics drivers can't run it: carry on with the processor only, and remember that.
+            cfg["gpu_layers"] = 0
+            _quiet(save_config, cfg)
+            return self._ensure(cfg, model_name)
+
+    def _ensure(self, cfg, model_name=None):
+        """Make sure the server runs the chosen model with this computer's settings; returns the model's
+        name (what the server answers to). Waits while the model loads (a minute or more for a big one)."""
+        exe = engine_exe()
+        if not exe:
+            raise RuntimeError("The built-in AI isn't installed in this copy of Session Scribe.")
+        model = find_model(model_name or cfg.get("model")) or (model_files() or [None])[0]
+        if model is None:
+            raise RuntimeError("No AI model found. Put a .gguf model file in " + LLM_DIRS[1] + " or reinstall.")
+        ctx = int(cfg.get("lm_context") or 16384)
+        ngl = cfg.get("gpu_layers")
+        ngl = 0 if ngl in (None, "") else int(ngl)
+        key = (model["path"], ctx, ngl)
+        with self.lock:
+            if self.running() and self.key == key:
+                return self.alias
+            self.stop()
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            self.port = self._free_port()
+            self.alias = model["name"]
+            cmd = [exe, "-m", model["path"], "--host", "127.0.0.1", "--port", str(self.port),
+                   "-c", str(ctx), "-ngl", str(ngl), "--parallel", "1", "--alias", self.alias, "--jinja"]
+            log = open(self.log_path, "w", encoding="utf-8", errors="replace")
+            log.write(" ".join(cmd) + "\n")
+            log.flush()
+            kw = {"start_new_session": True} if not IS_WIN else {}
+            self.proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                         cwd=os.path.dirname(exe), **kw)
+            log.close()
+            self._tie_to_app(self.proc)
+            self.key = key
+            deadline = time.time() + 1800
+            while True:
+                if self.proc.poll() is not None:
+                    tail = self.log_tail(1500)
+                    self.proc, self.key = None, None
+                    hint = (" It may not have enough memory for this model — pick a smaller one in Settings."
+                            if re.search(r"alloc|memory|out of", tail, re.I) else "")
+                    raise RuntimeError(f"The built-in AI stopped while loading {model['name']}.{hint}\n\n"
+                                       + tail.strip()[-600:])
+                try:
+                    with _NO_PROXY.open(f"http://127.0.0.1:{self.port}/health", timeout=2) as r:
+                        if r.status == 200:
+                            break
+                except Exception:
+                    pass
+                if time.time() > deadline:
+                    self.stop()
+                    raise RuntimeError(f"The built-in AI took too long to load {model['name']}.")
+                try:
+                    check_cancelled()
+                except Cancelled:
+                    self.stop()
+                    raise
+                time.sleep(0.5)
+            return self.alias
+
+    def stop(self):
+        with self.lock:
+            p, self.proc, self.key = self.proc, None, None
+            if p is None or p.poll() is not None:
+                return
+            try:
+                p.terminate()
+                p.wait(timeout=10)
+            except Exception:
+                _quiet(p.kill)
+
+    def make_room(self, cfg):
+        """Before transcribing: if this computer can't hold the AI model and the speech models at once,
+        unload the AI (it starts again by itself for the notes)."""
+        if not self.running():
+            return
+        hw = detect_hardware()
+        if (hw.get("ram_free") or 0) < 6 * GB:
+            self.stop()
+
+
+ENGINE = LocalEngine()
+
+
+# --------------------------------------------------------------------------- #
+# Local LLM (LM Studio or the built-in AI)
 # --------------------------------------------------------------------------- #
 def assert_local_url(url):
     if not _is_local_host(urllib.parse.urlparse(url).hostname):
@@ -6952,6 +8968,8 @@ def _http_json(url, body=None, timeout=30):
 
 
 def list_models(cfg, timeout=30):
+    if ai_engine(cfg) == "builtin":
+        return [m["name"] for m in model_files()]
     data = _http_json(cfg["lmstudio_url"].rstrip("/") + "/models", timeout=timeout)
     return [m.get("id") for m in data.get("data", []) if m.get("id")]
 
@@ -6964,6 +8982,8 @@ def ensure_model_loaded(cfg, model):
     one request slot, flash attention) instead of letting LM Studio load it on demand with its defaults —
     those (several request slots) made reading long transcripts about 3× slower on a laptop GPU.
     Quietly does nothing on LM Studio versions without the /api/v1 endpoints."""
+    if ai_engine(cfg) == "builtin":
+        return ENGINE.ensure(cfg, model)
     if not model:
         return
     base = cfg["lmstudio_url"].rstrip("/")
@@ -7007,7 +9027,7 @@ def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=
             try:
                 return _llm_chat_once(cfg, prompt, on_progress, expected, system, on_text, temperature, on_eta)
             except RuntimeError as e:
-                if wait is None or not str(e).startswith("Couldn't reach LM Studio"):
+                if wait is None or not str(e).startswith("Couldn't reach"):
                     raise
                 if getattr(e, "refused", False) and not _SleepWatch.slept_since(started - 120):
                     raise                 # LM Studio simply isn't running: say so now, don't make you wait
@@ -7027,12 +9047,19 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     If the task is cancelled, the connection is cut at once and LM Studio stops writing."""
     import http.client
     check_cancelled()
-    model = cfg.get("model") or (list_models(cfg) or [None])[0]
-    if not model:
-        raise RuntimeError("LM Studio is running but no model is loaded.")
-    if cfg.get("model"):
-        ensure_model_loaded(cfg, model)
-    url = cfg["lmstudio_url"].rstrip("/") + "/chat/completions"
+    builtin = ai_engine(cfg) == "builtin"
+    who = "The built-in AI" if builtin else "LM Studio"
+    if builtin:
+        model = ENGINE.ensure(cfg)                       # starts it (or switches model) when needed
+        base = ENGINE.base_url
+    else:
+        model = cfg.get("model") or (list_models(cfg) or [None])[0]
+        if not model:
+            raise RuntimeError("LM Studio is running but no model is loaded.")
+        if cfg.get("model"):
+            ensure_model_loaded(cfg, model)
+        base = cfg["lmstudio_url"]
+    url = base.rstrip("/") + "/chat/completions"
     assert_local_url(url)
     body = {"model": model, "temperature": temperature, "stream": True,
             "messages": [{"role": "system", "content": system or SYSTEM_PROMPT},
@@ -7083,7 +9110,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
         r = conn.getresponse()
         if r.status >= 400:
             detail = r.read().decode("utf-8", errors="replace")[:300]
-            raise RuntimeError(f"LM Studio returned an error ({r.status}): {detail}")
+            raise RuntimeError(f"{who} returned an error ({r.status}): {detail}")
         if "event-stream" not in (r.getheader("Content-Type") or ""):
             data = json.loads(r.read().decode("utf-8"))      # server ignored streaming
             choice = data["choices"][0]
@@ -7129,7 +9156,11 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     except Exception as e:
         check_cancelled()                  # a read cut short by cancelling is a cancel, not an error
         if isinstance(e, (KeyError, IndexError, ValueError)):
-            raise RuntimeError("LM Studio sent back an unexpected response.") from None
+            raise RuntimeError(f"{who} sent back an unexpected response.") from None
+        if builtin:                        # it stopped part-way: the next try starts it again
+            err = RuntimeError(f"Couldn't reach the built-in AI. Details: {e}\n\n{ENGINE.log_tail(600)}")
+            err.refused = False
+            raise err from None
         err = RuntimeError("Couldn't reach LM Studio. Open LM Studio, load a model, and start the "
                            f"local server (Developer tab). Details: {e}")
         # not running at all (vs. a connection dropped part-way, e.g. by the computer sleeping)
@@ -7147,8 +9178,9 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     text = re.sub(r"^\s*```[a-z]*\n|\n```\s*$", "", text.strip())
     if finish == "length":
-        text += ("\n\n[VERIFY: the AI stopped early — output may be cut off. Increase the context "
-                 "length in LM Studio.]")
+        text += ("\n\n[VERIFY: the AI stopped early — output may be cut off. "
+                 + ("Choose a model with more room in Settings, or lower “Condense transcripts over”.]" if builtin
+                    else "Increase the context length in LM Studio.]"))
     return text.strip()
 
 
@@ -7379,6 +9411,7 @@ def plan_material(client, sessions, hide):
     case = (client.get("case_overview") or {}).get("text", "")
     if case:
         blocks.append(f"=== CASE OVERVIEW ===\n{hide(case)}")
+    blocks += documents_blocks(client, hide)
     for day, records in group_by_date([(None, d) for d in sessions]):
         parts = []
         for label, key, _, d in day_docs(records):
@@ -7529,6 +9562,120 @@ def generate_documents(cfg, values, transcript, context, progress, kind="progres
     return first, second
 
 
+# ---- contact log: one detailed summary note of every contact over a period ---------------------
+CONTACT_PERIOD_PROMPT = """Write a CONTACT SUMMARY NOTE for the clinical record covering every contact outside of \
+therapy sessions about this patient from {start} to {end}: the texts, emails, phone calls, visits and other \
+contacts listed below, oldest first. Be detailed, factual and organized. Past tense, third person, using \
+"patient" and "Counselor". Never write a name the source doesn't give, and keep any placeholder exactly as \
+written (for example [PERSON_1], [EMAIL], [PHONE]). Never invent anything; if something is unclear, write \
+[VERIFY: ...].
+
+Use these plain-text headings, in this order (no other formatting):
+
+OVERVIEW
+2-4 sentences: the period, how many contacts and of what kinds, with whom, and the main reasons for contact.
+
+CONTACTS BY DATE
+One line per date, oldest first, each starting with "- " and the date, then the way of contact and who it was \
+with, then 1-3 sentences on what was communicated, asked or decided.
+
+KEY CONCERNS AND THEMES
+The concerns, reports, requests and questions raised over the period, and how they developed (one line each, \
+starting with "- ").
+
+WHAT THE COUNSELOR SHARED OR RECOMMENDED
+What the Counselor explained, advised, scheduled or recommended (one line each, starting with "- ").
+
+AGREEMENTS AND FOLLOW-UP
+Who agreed to do what, and by when if stated; whether earlier agreements were followed through; what is still \
+open (one line each, starting with "- "). If nothing was agreed, write "- None discussed".
+
+SAFETY, CONSENT AND CONFIDENTIALITY
+Any safety concern (suicidal ideation, self-harm, abuse, neglect, threats) and how it was addressed; consent, \
+release of information or limits of confidentiality. If none came up, say so in one sentence.
+
+RELEVANCE TO TREATMENT
+How these contacts relate to the treatment goals, and what may be worth exploring with the patient next \
+session. Label interpretations as hypotheses.
+
+Patient code: {client_code}
+Period: {start} to {end}
+Treatment goals: {goals}
+Clinician's notes or focus for this summary: {observations}
+
+Below are {source_kind}.
+
+{material}"""
+
+CONTACT_DIGEST_PROMPT = """These are part {part} of {total} of a patient's contacts outside therapy sessions \
+(texts, emails, calls, visits), oldest first. Condense them for a later summary: for each date, the way of \
+contact, who it was with, and every concern, request, piece of information, recommendation, agreement, and \
+anything about safety, consent or confidentiality. Keep dates, times and placeholders exactly as written. \
+Plain text, one date per paragraph, nothing invented.
+
+{chunk}"""
+
+
+def contact_period_blocks(client, sessions, start, end, hide=None):
+    """Every contact in the period (logged texts/emails/calls and contact notes), oldest first, as
+    "=== date time — how, with whom ===" blocks for the AI (names hidden, addresses/numbers/links removed).
+    Returns (blocks, counts by kind)."""
+    hide = hide or (lambda s: s or "")
+    inr = lambda d_: bool(d_) and start <= d_ <= end
+    rows, counts = [], {}
+    for x in client.get("communications") or []:
+        if not inr(x.get("date", "")):
+            continue
+        how = x.get("method", "Contact")
+        counts[how] = counts.get(how, 0) + 1
+        head = f"{fmt_date(x['date'])}" + (f" {x['time']}" if x.get("time") else "") + \
+            f" — {how} with {_export_party(x)}"
+        body = x.get("text", "") + (f"\n(Clinician's note: {x['notes']})" if x.get("notes") else "")
+        rows.append((x["date"], _clock(x.get("time", "")), f"=== {head} ===\n{hide(scrub_contact_details(body)).strip()}"))
+    for day, records in group_by_date(sessions):
+        if not (inr(day) and is_contact_day(records)):
+            continue
+        for _label, key, _sid, d in day_docs(records):
+            if key != "note" or not (d.get("note") or "").strip():
+                continue
+            m = d.get("meta", {})
+            how = m.get("contact_method") or "Contact"
+            counts["Contact note"] = counts.get("Contact note", 0) + 1
+            rows.append((day, -1, f"=== {fmt_date(day)} — {CONTACT_NAMES[contact_with(m)][0]}"
+                                  f"{' (' + how + ')' if how else ''} ===\n{hide(scrub_contact_details(d['note'])).strip()}"))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return [r[2] for r in rows], counts
+
+
+def contact_counts_text(counts):
+    if not counts:
+        return "No contacts in this period."
+    n = sum(counts.values())
+    return f"{n} contact{'s' if n != 1 else ''}: " + ", ".join(f"{v} × {k.lower()}" for k, v in
+                                                            sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def generate_contact_summary(cfg, values, blocks, start, end, progress):
+    """One detailed summary note of every contact in the period (long periods are condensed first)."""
+    groups = group_blocks(blocks, int(cfg.get("max_chars", 24000)))
+    long_ = len(groups) > 1
+    steps = _Steps(progress, ([(f"Condensing the contacts, part {i} of {len(groups)}", 3000)
+                               for i in range(1, len(groups) + 1)] if long_ else []) +
+                   [("Writing the contact summary", 4500)])
+    if long_:
+        material = "\n\n".join(steps.run(i, cfg, fill(CONTACT_DIGEST_PROMPT, {"part": i + 1, "total": len(groups),
+                                                                             "chunk": g}))
+                               for i, g in enumerate(groups))
+        kind = f"condensed digests of the {len(blocks)} contacts in this period"
+    else:
+        material = "\n\n".join(blocks)
+        kind = f"the {len(blocks)} contacts in this period"
+    out = steps.run(len(groups) if long_ else 0, cfg, fill(CONTACT_PERIOD_PROMPT, dict(
+        values, start=fmt_date(start), end=fmt_date(end), source_kind=kind, material=material)))
+    progress("Done.", 100)
+    return out
+
+
 
 # --------------------------------------------------------------------------- #
 # Session review: the session map (computed here), skills feedback and techniques used (local AI)
@@ -7611,6 +9758,63 @@ def map_patient(speakers, counselor_label, patient_label=None):
     return None
 
 
+_TS = r"((?:\d{1,2}:)?\d{1,2}:\d{2})(?:[.,]\d+)?"
+_TS_FIRST = re.compile(r"^\s*[\[(]?" + _TS + r"[\])]?\s*[-–—]?\s*([^:\[\]()]{1,40}?)\s*:\s*(.*)$")   # [00:01:23] Patient: …
+_TS_AFTER = re.compile(r"^\s*([^:\[\]()\d][^:\[\]()]{0,39}?)\s*[\[(]" + _TS + r"[\])]\s*:?\s*(.*)$")  # Patient (00:01:23): …
+
+
+def _ts_secs(ts):
+    secs = 0
+    for part in ts.split(":"):
+        secs = secs * 60 + int(part)
+    return float(secs)
+
+
+def lines_from_transcript(text):
+    """Timed lines read back from a transcript's own timestamps — for sessions saved without the
+    transcription's timings (pasted or imported transcripts, older sessions). Each line lasts until the next
+    one starts, so pauses count as talk; [] when the text has fewer than two timestamped lines or the times
+    run backwards."""
+    out = []
+    for raw in (text or "").splitlines():
+        m = _TS_FIRST.match(raw)
+        if m:
+            ts, who, said = m.groups()
+        else:
+            m = _TS_AFTER.match(raw)
+            if m:
+                who, ts, said = m.groups()
+        if m:
+            out.append({"start": _ts_secs(ts), "speaker": who.strip(), "text": said.strip()})
+        elif out and raw.strip():
+            out[-1]["text"] = (out[-1]["text"] + " " + raw.strip()).strip()   # a line that wrapped
+    if len(out) < 2:
+        return []
+    for a, b in zip(out, out[1:]):
+        if b["start"] < a["start"]:
+            return []
+        a["end"] = b["start"]
+    out[-1]["end"] = out[-1]["start"] + max(2.0, len(out[-1]["text"].split()) / 2.5)
+    return [dict(l, approx=True) for l in out if l["text"]]
+
+
+def timed_lines(d):
+    """A session's transcript lines with start and end times: the transcription's own when it has them,
+    else read from the timestamps in the transcript text."""
+    lines = [l for l in d.get("lines") or [] if l.get("start") is not None]
+    if lines and all(l.get("end") is not None for l in lines):
+        return d["lines"]
+    if lines:                                       # starts only: each line ends where the next begins
+        lines = sorted((dict(l) for l in lines), key=lambda l: float(l["start"]))
+        for a, b in zip(lines, lines[1:]):
+            if a.get("end") is None:
+                a["end"] = b["start"]
+        if lines[-1].get("end") is None:
+            lines[-1]["end"] = float(lines[-1]["start"]) + max(2.0, len((lines[-1].get("text") or "").split()) / 2.5)
+        return lines
+    return lines_from_transcript(d.get("transcript") or "")
+
+
 def session_map(lines, roles, counselor_label, window=120.0, patient_label=None):
     """Who talked when, how much, and how the patient's words felt over the session — computed on this
     computer from the transcript (no AI). Tone and the heaviest moments follow the patient's speech only (never
@@ -7655,7 +9859,8 @@ def session_map(lines, roles, counselor_label, window=120.0, patient_label=None)
             for sent in re.findall(r"[^.?!]*\?", l["text"]):
                 q[question_kind(sent)] += 1
     gaps = sum(max(0.0, float(b["start"]) - float(a["end"])) for a, b in zip(lines, lines[1:]))
-    return {"duration": dur, "speakers": speakers, "counselor": counselor_label, "patient": patient,
+    approx = any(l.get("approx") for l in lines)      # timings read from the transcript's timestamps
+    return {"duration": dur, "approx": approx, "speakers": speakers, "counselor": counselor_label, "patient": patient,
             "timeline": [(float(l["start"]), float(l["end"]), label(l)) for l in lines],
             "tone": tone, "heavy": heavy, "questions": dict(q, total=sum(q.values())),
             "silence_pct": round(100 * gaps / dur) if dur else 0}
@@ -7667,7 +9872,7 @@ def session_map_text(m):
         return ""
     out = [f"Length {fmt_ts(m['duration'])}. Talk time: " + ", ".join(
         f"{s['label']} {s['pct']}% ({s['turns']} turns, longest {round(s['longest'])} s)" for s in m["speakers"])
-        + f". Pauses between turns: {m['silence_pct']}% of the session."]
+        + ("" if m.get("approx") else f". Pauses between turns: {m['silence_pct']}% of the session.")]
     q = m["questions"]
     if q["total"]:
         out.append(f"{m['counselor']}'s questions: {q['total']} — {q['open']} open, {q['closed']} closed"
@@ -7744,7 +9949,7 @@ def generate_session_review(cfg, client, d, counselor, patient, orientation, ref
     session is read in parts (each part's feedback is kept, labelled)."""
     hide = client_hider(client)
     transcript = hide(review_transcript(d))
-    smap = session_map(d.get("lines"), d.get("roles") or {}, counselor, patient_label=patient)
+    smap = session_map(timed_lines(d), d.get("roles") or {}, counselor, patient_label=patient)
     max_chars = int(cfg.get("max_chars", 24000))
     parts = split_chunks(transcript, max_chars) if len(transcript) > max_chars else [transcript]
     vocab = (reference or {}).get("vocabulary") or BUILTIN_REFERENCE.get("vocabulary", "")
@@ -7803,8 +10008,8 @@ Documentation for this period (oldest first):
 
 
 def supervision_inputs(client, sessions, start, end):
-    """The documentation one patient contributes to a supervision packet (names hidden)."""
-    hide = client_hider(client)
+    """The documentation one patient contributes to a supervision packet (names always hidden: it's shared)."""
+    hide = client_hider(client, always=True)
     docs = []
     for sid, d in sessions:
         day = d.get("meta", {}).get("session_date") or ""
@@ -7842,7 +10047,7 @@ def generate_supervision_packet(cfg, patients, start, end, questions, orientatio
                               for c, _, docs in work])
     sections, practice = [], []
     for i, (client, sessions, docs) in enumerate(work):
-        hide = client_hider(client)
+        hide = client_hider(client, always=True)
         text = steps.run(i, cfg, fill(SUPERVISION_PATIENT_PROMPT, {
             "code": client.get("code", ""), "start": fmt_date(start), "end": fmt_date(end),
             "orientation": orientation or "not specified", "goals": hide(client.get("goals", "")) or "(none listed)",
@@ -7855,7 +10060,7 @@ def generate_supervision_packet(cfg, patients, start, end, questions, orientatio
             f"{fmt_date(date.today().isoformat())} · {len(work)} patient{'s' if len(work) != 1 else ''}")
     out = [head]
     if (questions or "").strip():
-        out.append("MY QUESTIONS\n" + "\n".join(("- " + q.strip().lstrip("-• ").strip())
+        out.append("WHAT I'D LIKE TO FOCUS ON\n" + "\n".join(("- " + q.strip().lstrip("-• ").strip())
                                                   for q in questions.splitlines() if q.strip()))
     if practice:
         out.append("SKILLS I'M WORKING ON (from my session reviews)\n" + "\n".join(
@@ -7863,6 +10068,11 @@ def generate_supervision_packet(cfg, patients, start, end, questions, orientatio
     out.append("PATIENTS\n\n" + ("\n\n".join(sections) if sections else "No sessions or contacts in this period."))
     progress("Done.", 100)
     return "\n\n".join(out)
+
+
+def _capwords(s):
+    import string
+    return string.capwords(s)
 
 
 def text_to_blocks(title, text):
@@ -7878,7 +10088,7 @@ def text_to_blocks(title, text):
         s_ = line.strip()
         if s_ and len(s_) <= 90 and s_.upper() == s_ and re.search(r"[A-Z]", s_) and not s_.startswith("-"):
             flush()
-            blocks.append(("h1", s_.title() if len(s_) > 3 else s_))
+            blocks.append(("h1", _capwords(s_.lower()) if len(s_) > 3 else s_))   # "I'd", not "I'D"
         elif not s_:
             flush()
         else:
@@ -8195,9 +10405,1027 @@ def measures_text(client):
         if t["item9"]:
             line += f"; item 9 (thoughts of being better off dead or self-harm) answered {l_['items'][8]}"
         out.append(line + ".")
+    more = assessments_text(client)                   # the other questionnaires taken here (latest of each)
+    if more:
+        out.append(more)
     return "\n".join(out)
 
 
+
+
+# --------------------------------------------------------------------------- #
+# Assessment library: questionnaires the patient takes on this computer (full screen), scored here.
+# Only free / public-domain instruments, worded as on their official forms (sources in each "credit").
+# Proprietary tests (BDI-II, CDI-2, MMPI, WAIS…) can't be reproduced; their scores go in with
+# "Add assessment…" instead.
+# --------------------------------------------------------------------------- #
+DEFAULT_DOC_TYPES = ["Psychological assessment", "Psychiatric evaluation", "Discharge summary",
+                     "School / IEP records", "Medical records", "Letter or correspondence", "Other document"]
+
+
+_DOC_GUESS = [(r"\bneuro\s*psych|psycho\s*-?\s*educational|psycholog\w*\s+(assessment|evaluation|testing|report)|"
+               r"\b(WAIS|WISC|WIAT|WPPSI|MMPI|PAI|RBANS|WJ-?IV)\b|cognitive\s+(testing|assessment)",
+               "Psychological assessment"),
+              (r"psychiatric\s+(evaluation|assessment|consultation)", "Psychiatric evaluation"),
+              (r"discharge\s+summary", "Discharge summary"),
+              (r"\bIEP\b|individuali[sz]ed\s+education|504\s+plan", "School / IEP records")]
+
+
+def guess_doc_type(text, types):
+    """A likely document type from the top of an imported document (its title area), or "" — only types the
+    counselor has (Settings ▸ Document types)."""
+    lines = [l.strip() for l in (text or "")[:1500].splitlines() if l.strip()][:12]
+    head = "\n".join(l for l in lines if len(l.split()) <= 10)        # headings and short lines, not sentences
+    for pat, name in _DOC_GUESS:
+        if name in types and re.search(pat, head, re.I):
+            return name
+    return ""
+
+
+def documents_blocks(client, hide):
+    """Imported documents (psychological assessments, records…) as material for the AI, oldest first."""
+    out = []
+    for d in sorted(client.get("documents") or [], key=lambda x: x.get("date", "")):
+        if (d.get("text") or "").strip():
+            out.append(f"=== {d.get('type', 'Document').upper()} — {fmt_date(d.get('date', ''))} (imported document"
+                       + (f": {d['title']}" if d.get("title") else "") + f") ===\n"
+                       + hide(strip_word_xml(d["text"])).strip())
+    return out
+
+
+ASSESS_GROUPS = [("child", "Children", "about 7–12"), ("adolescent", "Adolescents", "about 12–17"),
+                 ("adult", "Adults", "18 and over")]
+ASSESS_CATEGORIES = ["Depression", "Anxiety, stress & distress", "Trauma & PTSD", "Substance use", "ADHD",
+                     "Behavior & functioning", "Suicide risk & safety"]
+
+_FREQ4 = [(0, "Not at all"), (1, "Several days"), (2, "More than half the days"), (3, "Nearly every day")]
+_DIFFICULT = [(0, "Not difficult at all"), (1, "Somewhat difficult"), (2, "Very difficult"), (3, "Extremely difficult")]
+_YN = [(1, "Yes"), (0, "No")]
+_BOTHER5 = [(0, "Not at all"), (1, "A little bit"), (2, "Moderately"), (3, "Quite a bit"), (4, "Extremely")]
+_OFTEN5 = [(0, "Never"), (1, "Rarely"), (2, "Sometimes"), (3, "Often"), (4, "Very often")]
+_NSO3 = [(0, "Never"), (1, "Sometimes"), (2, "Often")]
+
+
+def _q(qid, text, opts=None, **kw):
+    """One question: kind 'choice' (opts = [(score, label)]), 'number' (lo/hi) or 'text' (optional, unscored)."""
+    d = {"id": str(qid), "text": text, "kind": kw.pop("kind", "choice" if opts is not None else "number")}
+    if opts is not None:
+        d["opts"] = opts
+    d.update(kw)
+    return d
+
+
+def _band(v, bands):
+    """bands = [(lowest score, label)] ascending; the label for v."""
+    out = bands[0][1]
+    for lo, name in bands:
+        if v >= lo:
+            out = name
+    return out
+
+
+def _val(a, qid, default=0):
+    v = (a or {}).get(str(qid))
+    return default if v is None or v == "" else v
+
+
+def _label_of(inst, qid, value):
+    q = next((x for x in inst["items"] if x["id"] == str(qid)), None)
+    if not q or q["kind"] != "choice":
+        return "" if value is None else str(value)
+    return next((lbl for sc, lbl in q["opts"] if sc == value), str(value))
+
+
+def assessment_visible(inst, answers):
+    """The questions this patient is asked, in order (follows the instrument's skip rules)."""
+    return [q for q in inst["items"] if not q.get("show") or q["show"](answers or {})]
+
+
+# ---- scoring -----------------------------------------------------------------------------------------------
+_PHQ_BANDS = [(0, "minimal"), (5, "mild"), (10, "moderate"), (15, "moderately severe"), (20, "severe")]
+
+
+def _score_phq(a, adolescent=False):
+    total = sum(int(_val(a, i)) for i in range(1, 10))
+    band = _band(total, _PHQ_BANDS)
+    flags, lines = [], [f"{total} of 27: {band} depressive symptoms."]
+    if total >= 10:
+        lines.append("10 or more: possible major depression — confirm with a clinical interview.")
+    if int(_val(a, 9)) > 0:
+        flags.append(f"Item 9 (thoughts of being better off dead or of hurting yourself) answered "
+                     f"“{_FREQ4[int(_val(a, 9))][1]}”. Assess suicide risk today (ASQ or C-SSRS, then a brief "
+                     "suicide safety assessment).")
+    if adolescent:
+        if int(_val(a, "month", 0)) == 1:
+            flags.append("Answered YES: serious thoughts about ending their life in the past month.")
+        if int(_val(a, "ever", 0)) == 1:
+            flags.append("Answered YES: has tried to kill themselves or made a suicide attempt at some point.")
+        if int(_val(a, "year", 0)) == 1:
+            lines.append("Felt depressed or sad most days in the past year (possible persistent depressive symptoms).")
+    if (a or {}).get("diff") not in (None, ""):
+        lines.append(f"Effect on daily life: {_DIFFICULT[int(a['diff'])][1].lower()}.")
+    return {"total": total, "max": 27, "band": band, "summary": f"{total}/27 ({band})", "lines": lines,
+            "flags": flags, "risk": bool(flags), "values": {"Total": total}}
+
+
+def _score_gad7(a):
+    total = sum(int(_val(a, i)) for i in range(1, 8))
+    band = _band(total, [(0, "minimal"), (5, "mild"), (10, "moderate"), (15, "severe")])
+    lines = [f"{total} of 21: {band} anxiety symptoms."]
+    if total >= 10:
+        lines.append("10 or more: possible generalized anxiety disorder — confirm with a clinical interview.")
+    if (a or {}).get("diff") not in (None, ""):
+        lines.append(f"Effect on daily life: {_DIFFICULT[int(a['diff'])][1].lower()}.")
+    return {"total": total, "max": 21, "band": band, "summary": f"{total}/21 ({band})", "lines": lines, "flags": [],
+            "values": {"Total": total}}
+
+
+_DASS_SCALES = {"Depression": ([3, 5, 10, 13, 16, 17, 21], [(0, "normal"), (10, "mild"), (14, "moderate"),
+                                                              (21, "severe"), (28, "extremely severe")]),
+                "Anxiety": ([2, 4, 7, 9, 15, 19, 20], [(0, "normal"), (8, "mild"), (10, "moderate"), (15, "severe"),
+                                                       (20, "extremely severe")]),
+                "Stress": ([1, 6, 8, 11, 12, 14, 18], [(0, "normal"), (15, "mild"), (19, "moderate"), (26, "severe"),
+                                                       (34, "extremely severe")])}
+
+
+def _score_dass(a):
+    vals, parts, lines = {}, [], []
+    for name, (items, bands) in _DASS_SCALES.items():
+        v = 2 * sum(int(_val(a, i)) for i in items)               # ×2: DASS-21 on the DASS-42 scale
+        vals[name] = v
+        parts.append(f"{name[0]} {v} ({_band(v, bands)})")
+        lines.append(f"{name}: {v} of 42 — {_band(v, bands)}.")
+    lines.append("Scores are doubled to the full DASS scale. The DASS measures severity along each dimension; it "
+                 "isn't a diagnosis.")
+    worst = max(_band(vals[n], b).count("severe") for n, (_, b) in _DASS_SCALES.items())
+    return {"total": None, "max": 42, "band": "", "summary": ", ".join(parts), "lines": lines, "flags": [],
+            "values": vals, "worse_up": True, "_sev": worst}
+
+
+def _score_k10(a):
+    item = {i: (int(_val(a, i, 1)) if str(i) in (a or {}) else 1) for i in range(1, 11)}
+    total = sum(item.values())
+    band = _band(total, [(10, "likely to be well"), (20, "mild"), (25, "moderate"), (30, "severe")])
+    k6 = sum(item[i] - 1 for i in (2, 4, 5, 8, 9, 10))
+    lines = [f"{total} (10–50): " + ("likely to be well." if total < 20 else
+                                    f"likely to have a {band} mental health disorder (primary care guide)."),
+             f"K6 from the same answers: {k6} of 24" + (" — 13 or more suggests serious psychological distress."
+                                                         if k6 >= 13 else ".")]
+    return {"total": total, "max": 50, "band": band, "summary": f"{total}/50 ({band}); K6 {k6}", "lines": lines,
+            "flags": [], "values": {"K10": total, "K6": k6}}
+
+
+def _score_who5(a):
+    raw = sum(int(_val(a, i)) for i in range(1, 6))
+    pct = raw * 4
+    low = [i for i in range(1, 6) if int(_val(a, i)) <= 1]
+    poor = raw < 13 or low
+    lines = [f"Raw score {raw} of 25 = {pct}% (higher is better well-being)."]
+    if poor:
+        lines.append("Below 13, or 0–1 on any item: poor well-being — screen for depression (e.g. PHQ-9).")
+    lines.append("A 10-point change in the percentage score is a meaningful change.")
+    return {"total": pct, "max": 100, "band": "poor well-being" if poor else "", "higher_better": True,
+            "summary": f"{pct}% (raw {raw}/25)" + (" — poor well-being" if poor else ""), "lines": lines, "flags": [],
+            "values": {"Well-being %": pct}}
+
+
+def _score_pcl5(a):
+    v = {i: int(_val(a, i)) for i in range(1, 21)}
+    total = sum(v.values())
+    clusters = {"Intrusion (B)": range(1, 6), "Avoidance (C)": range(6, 8), "Mood & cognition (D)": range(8, 15),
+                "Arousal (E)": range(15, 21)}
+    vals = {"Total": total}
+    vals.update({k: sum(v[i] for i in r) for k, r in clusters.items()})
+    n = {k: sum(1 for i in r if v[i] >= 2) for k, r in clusters.items()}       # 2 = "Moderately" or more
+    dsm = n["Intrusion (B)"] >= 1 and n["Avoidance (C)"] >= 1 and n["Mood & cognition (D)"] >= 2 \
+        and n["Arousal (E)"] >= 2
+    probable = total >= 31
+    lines = [f"Total {total} of 80. " + ("31–33 or more suggests probable PTSD (National Center for PTSD) — confirm "
+                                          "with a clinical interview." if probable else "Below the usual cut-point "
+                                                                                         "(31–33).")]
+    lines.append("DSM-5 symptom pattern (items rated 2+: 1 B, 1 C, 2 D, 2 E): " + ("met" if dsm else "not met") + ".")
+    lines += [f"{k}: {vals[k]}" for k in clusters]
+    return {"total": total, "max": 80, "band": "probable PTSD" if probable else "below cut-point",
+            "summary": f"{total}/80" + (" (probable PTSD)" if probable else ""), "lines": lines, "flags": [],
+            "values": vals}
+
+
+def _score_pcptsd5(a):
+    if int(_val(a, "exp")) != 1:
+        return {"total": 0, "max": 5, "band": "no trauma exposure reported", "summary": "0/5 (no exposure reported)",
+                "lines": ["No traumatic event reported: screen total 0."], "flags": [], "values": {"Total": 0}}
+    total = sum(int(_val(a, i)) for i in range(1, 6))
+    pos = total >= 4
+    lines = [f"{total} of 5 “yes”. " + ("Positive screen (cut-point 4): probable PTSD — further assessment, ideally "
+                                       "a structured interview." if pos else "Below the cut-point of 4."),
+             "VA guidance: for women a cut-point of 3 may be considered to avoid missed cases."]
+    return {"total": total, "max": 5, "band": "positive" if pos else "negative",
+            "summary": f"{total}/5 ({'positive' if pos else 'negative'})", "lines": lines, "flags": [],
+            "values": {"Total": total}}
+
+
+def _score_iesr(a):
+    sub = {"Intrusion": [1, 2, 3, 6, 9, 14, 16, 20], "Avoidance": [5, 7, 8, 11, 12, 13, 17, 22],
+           "Hyperarousal": [4, 10, 15, 18, 19, 21]}
+    total = sum(int(_val(a, i)) for i in range(1, 23))
+    vals = {"Total": total}
+    lines = [f"Total {total} of 88. " + ("33 or more: best cut-point for probable PTSD." if total >= 33 else
+                                         "24 or more: PTSD is a clinical concern." if total >= 24 else
+                                         "Below 24.")]
+    for k, items in sub.items():
+        m = round(sum(int(_val(a, i)) for i in items) / len(items), 2)
+        vals[k] = m
+        lines.append(f"{k}: mean {m} (0–4)")
+    lines.append("A screening measure, not a diagnosis.")
+    band = "probable PTSD" if total >= 33 else "clinical concern" if total >= 24 else "below 24"
+    return {"total": total, "max": 88, "band": band, "summary": f"{total}/88 ({band})", "lines": lines,
+            "flags": [], "values": vals}
+
+
+def _score_audit(a):
+    v = {i: int(_val(a, i)) for i in range(1, 11)}
+    total = sum(v.values())
+    zone = _band(total, [(0, "Zone I: low risk"), (8, "Zone II: hazardous use"), (16, "Zone III: harmful use"),
+                         (20, "Zone IV: possible dependence")])
+    ac = v[1] + v[2] + v[3]
+    lines = [f"Total {total} of 40 — {zone}.",
+             {"Zone I: low risk": "Alcohol education.", "Zone II: hazardous use": "Simple advice.",
+              "Zone III: harmful use": "Simple advice plus brief counseling and continued monitoring.",
+              "Zone IV: possible dependence": "Referral to a specialist for diagnostic evaluation and treatment."}[zone]
+             + " (WHO guidance)",
+             f"AUDIT-C (questions 1–3): {ac} of 12 — positive at 4+ for men, 3+ for women."]
+    flags = []
+    if v[4] + v[5] + v[6] > 0:
+        lines.append("Points on questions 4–6 suggest possible alcohol dependence.")
+    return {"total": total, "max": 40, "band": zone.split(":")[0], "summary": f"{total}/40 ({zone})",
+            "lines": lines, "flags": flags, "values": {"AUDIT": total, "AUDIT-C": ac}}
+
+
+_ASRS_SOMETIMES = {1, 2, 3, 9, 12, 16, 18}            # shaded from "Sometimes"; the others from "Often"
+
+
+def _score_asrs(a):
+    v = {i: int(_val(a, i)) for i in range(1, 19)}
+    hit = {i: v[i] >= (2 if i in _ASRS_SOMETIMES else 3) for i in v}
+    part_a = sum(hit[i] for i in range(1, 7))
+    part_b = sum(hit[i] for i in range(7, 19))
+    inatt = sum(hit[i] for i in (1, 2, 3, 4, 7, 8, 9, 10, 11))
+    hyper = sum(hit[i] for i in (5, 6, 12, 13, 14, 15, 16, 17, 18))
+    pos = part_a >= 4
+    lines = [f"Part A (screener): {part_a} of 6 in the shaded range — " +
+             ("4 or more: symptoms highly consistent with ADHD in adults; further investigation warranted."
+              if pos else "below the screener threshold of 4."),
+             f"Part B: {part_b} of 12 in the shaded range (more detail for the clinical interview).",
+             f"All 18: {inatt} of 9 inattentive and {hyper} of 9 hyperactive/impulsive symptoms in the shaded range."]
+    return {"total": part_a, "max": 6, "band": "positive screen" if pos else "negative screen",
+            "summary": f"Part A {part_a}/6 ({'positive' if pos else 'negative'}); Part B {part_b}/12", "lines": lines,
+            "flags": [], "values": {"Part A": part_a, "Part B": part_b}}
+
+
+_GDS_KEY = {1: 0, 2: 1, 3: 1, 4: 1, 5: 0, 6: 1, 7: 0, 8: 1, 9: 1, 10: 1, 11: 0, 12: 1, 13: 0, 14: 1, 15: 1}
+
+
+def _score_gds(a):
+    total = sum(1 for i, key in _GDS_KEY.items() if str(i) in (a or {}) and int(a[str(i)]) == key)
+    band = "normal" if total <= 5 else "suggests depression" if total < 10 else "almost always depression"
+    lines = [f"{total} of 15. " + ("Above 5 suggests depression; follow up with a clinical interview."
+                                   if total > 5 else "5 or less: not suggestive of depression.")]
+    if total >= 10:
+        lines.append("10 or more almost always indicates depression.")
+    return {"total": total, "max": 15, "band": band, "summary": f"{total}/15 ({band})", "lines": lines, "flags": [],
+            "values": {"Total": total}}
+
+
+def _score_bam(a):
+    g = lambda i: int(_val(a, i))
+    use = g(4) + g(5) + g(6)
+    risk = g(1) + g(2) + g(3) + g(8) + g(11) + g(15)
+    prot = g(9) + g(10) + g(12) + g(13) + g(14) + g(16)
+    drugs = [lbl for qid, lbl in (("7a", "marijuana"), ("7b", "sedatives/tranquilizers"), ("7c", "cocaine/crack"),
+                                  ("7d", "other stimulants"), ("7e", "opiates"), ("7f", "inhalants"),
+                                  ("7g", "other drugs")) if g(qid) > 0]
+    lines = [f"Use {use} (0–90), Risk {risk} (0–180), Protective {prot} (0–180).",
+             "Lower Use and Risk and higher Protective are better; there are no cut-offs — compare with this "
+             "patient's earlier BAMs and look at the items behind each score.",
+             f"Days drinking: {g(4)}; heavy drinking: {g(5)}; drug use: {g(6)}" +
+             (f" ({', '.join(drugs)})" if drugs else "") + "."]
+    return {"total": use, "max": 90, "band": "", "summary": f"Use {use}, Risk {risk}, Protective {prot}",
+            "lines": lines, "flags": [], "values": {"Use": use, "Risk": risk, "Protective": prot}}
+
+
+def _score_asq(a):
+    yes = [i for i in range(1, 5) if int(_val(a, i)) == 1]
+    if not yes:
+        return {"total": 0, "max": 1, "band": "negative", "summary": "Negative screen",
+                "lines": ["No to questions 1–4: negative screen. Clinical judgment can always override a negative "
+                          "screen."], "flags": [], "values": {}, "risk": False}
+    acute = int(_val(a, 5)) == 1
+    only_past = yes == [4]
+    flags = [("ACUTE POSITIVE SCREEN — imminent risk: thoughts of killing themselves right now. Needs a STAT/urgent "
+              "safety and full mental health evaluation; the patient can't leave until evaluated. Keep them in "
+              "sight, remove dangerous objects, alert the clinician responsible.") if acute else
+             ("Non-acute positive screen — potential risk. Needs a brief suicide safety assessment to decide whether "
+              "(and when) a full mental health evaluation is needed.")]
+    lines = [f"Yes to question{'s' if len(yes) > 1 else ''} {', '.join(map(str, yes))}."]
+    if 4 in yes and (a or {}).get("4a") not in (None, ""):
+        lines.append("Most recent attempt: " + ("within the last 12 months." if int(a["4a"]) == 1 else
+                                                "over 1 year ago."))
+    if only_past and not acute and int(_val(a, "4a", 1)) == 0:
+        lines.append("Positive only because of a past attempt more than a year ago: for adults a brief suicide "
+                     "safety assessment may not be necessary; for youth, only if one has been documented since "
+                     "that attempt (NIMH).")
+    lines.append("Give every patient: 988 Suicide & Crisis Lifeline (call or text 988) and Crisis Text Line "
+                 "(text HOME to 741741).")
+    return {"total": 2 if acute else 1, "max": 2, "band": "acute positive" if acute else "non-acute positive",
+            "summary": "ACUTE positive screen" if acute else "Non-acute positive screen", "lines": lines,
+            "flags": flags, "values": {}, "risk": True}
+
+
+def _score_cssrs(a):
+    y = lambda q: int(_val(a, q)) == 1
+    recent6 = y(6) and int(_val(a, "6a")) == 1
+    if y(4) or y(5) or recent6:
+        level = "high"
+    elif y(3) or y(6):
+        level = "moderate"
+    elif y(1) or y(2):
+        level = "low"
+    else:
+        level = "none"
+    said = [n for n, q in (("wish to be dead", 1), ("thoughts of killing themselves", 2), ("thinking about how", 3),
+                           ("some intention of acting", 4), ("worked out details / intends to carry out a plan", 5),
+                           ("suicidal behavior or preparation (lifetime)", 6)) if y(q)]
+    flags = []
+    if level == "high":
+        flags.append("HIGH RISK on the C-SSRS screener (intent, a plan, or suicidal behavior in the past 3 months): "
+                     "immediate safety evaluation and safety planning; don't leave the patient alone.")
+    elif level == "moderate":
+        flags.append("MODERATE RISK on the C-SSRS screener: complete a suicide safety assessment and safety plan; "
+                     "consult your supervisor.")
+    elif level == "low":
+        flags.append("LOW RISK on the C-SSRS screener (passive or active ideation without method, intent or "
+                     "plan): assess further and consider a safety plan and follow-up.")
+    lines = [("Yes to: " + "; ".join(said) + ".") if said else "No to every question."]
+    if y(6):
+        lines.append("Behavior was " + ("within the past three months." if recent6 else "more than three months ago."))
+    return {"total": {"none": 0, "low": 1, "moderate": 2, "high": 3}[level], "max": 3,
+            "band": f"{level} risk" if level != "none" else "no ideation reported",
+            "summary": f"{level.capitalize()} risk" if level != "none" else "No ideation or behavior reported",
+            "lines": lines, "flags": flags, "values": {}, "risk": level != "none"}
+
+
+_CRAFFT_SUD = {1: 32, 2: 64, 3: 79, 4: 92, 5: 100, 6: 100}
+
+
+def _score_crafft(a):
+    days = [int(_val(a, i)) for i in (1, 2, 3)]
+    score = sum(1 for i in range(4, 10) if int(_val(a, i)) == 1)
+    car = int(_val(a, 4)) == 1
+    lines = [f"Past-year days: alcohol {days[0]}, marijuana {days[1]}, other drugs {days[2]}.",
+             f"CRAFFT score {score} of 6" + (" — 2 or more suggests a serious problem and need for further "
+                                              "assessment." if score >= 2 else ".")]
+    if score:
+        lines.append(f"About {_CRAFFT_SUD[score]}% of adolescents with this score have a DSM-5 substance use "
+                     "disorder (Mitchell et al., 2014).")
+    flags = ["CAR question answered YES: riding/driving risk counseling (Contract for Life, crafft.org/contract)."] \
+        if car else []
+    return {"total": score, "max": 6, "band": "positive" if score >= 2 else "negative",
+            "summary": f"CRAFFT {score}/6" + (" (positive)" if score >= 2 else "") +
+                       ("; no use reported" if not any(days) else ""),
+            "lines": lines, "flags": flags, "values": {"CRAFFT score": score}}
+
+
+_S2BI_SUBST = [("1", "nicotine/tobacco"), ("2", "alcohol"), ("3", "marijuana"), ("4", "prescription drugs not "
+               "prescribed"), ("5", "illegal drugs"), ("6", "inhalants"), ("7", "herbs or synthetic drugs")]
+
+
+def _score_s2bi(a):
+    used = [(lbl, int(_val(a, q))) for q, lbl in _S2BI_SUBST if int(_val(a, q)) > 0]
+    top = max([v for _, v in used], default=0)
+    level = ["No reported use", "Lower risk (once or twice)", "Higher risk (monthly use)",
+             "Highest risk (weekly or more)"][top]
+    advice = ["Positive reinforcement; discourage all substance use.",
+              "Brief advice: recommend not using at all.",
+              "Monthly use: a substance use disorder is likely. Brief intervention, recommend cessation, and consider "
+              "a referral.",
+              "Weekly or more: a severe substance use disorder is likely. Brief intervention and referral to "
+              "treatment."][top]
+    freq = {1: "once or twice", 2: "monthly", 3: "weekly or more"}
+    lines = [level + ".", advice]
+    if used:
+        lines.append("Past year: " + "; ".join(f"{lbl} {freq[v]}" for lbl, v in used) + ".")
+    return {"total": top, "max": 3, "band": level, "summary": level, "lines": lines, "flags": [], "values": {}}
+
+
+_SCARED_SUB = {"Panic/somatic": ([1, 6, 9, 12, 15, 18, 19, 22, 24, 27, 30, 34, 38], 7,
+                                 "panic disorder or significant somatic symptoms"),
+               "Generalized anxiety": ([5, 7, 14, 21, 23, 28, 33, 35, 37], 9, "generalized anxiety disorder"),
+               "Separation anxiety": ([4, 8, 13, 16, 20, 25, 29, 31], 5, "separation anxiety disorder"),
+               "Social anxiety": ([3, 10, 26, 32, 39, 40, 41], 8, "social anxiety disorder"),
+               "School avoidance": ([2, 11, 17, 36], 3, "significant school avoidance")}
+
+
+def _score_scared(a):
+    total = sum(int(_val(a, i)) for i in range(1, 42))
+    vals, lines = {"Total": total}, [f"Total {total} of 82. " + (
+        "Above 30 is more specific for an anxiety disorder." if total > 30 else
+        "25 or more may indicate an anxiety disorder." if total >= 25 else "Below 25.")]
+    for name, (items, cut, what) in _SCARED_SUB.items():
+        v = sum(int(_val(a, i)) for i in items)
+        vals[name] = v
+        lines.append(f"{name}: {v}" + (f" — {cut}+ may indicate {what}." if v >= cut else f" (cut-point {cut})."))
+    band = "likely anxiety disorder" if total > 30 else "possible anxiety disorder" if total >= 25 else "below 25"
+    return {"total": total, "max": 82, "band": band, "summary": f"{total}/82 ({band})", "lines": lines, "flags": [],
+            "values": vals}
+
+
+def _score_smfq(a):
+    total = sum(int(_val(a, i)) for i in range(1, 14))
+    pos = total >= 8
+    lines = [f"{total} of 26. " + ("8 or more suggests possible depression — follow up with a clinical interview "
+                                   "(some studies use a higher cut-point for teens)." if pos else "Below 8.")]
+    if int(_val(a, 8)) == 2 or int(_val(a, 5)) == 2:
+        lines.append("Strong self-criticism endorsed (“I hated myself” / “I felt I was no good anymore”).")
+    return {"total": total, "max": 26, "band": "possible depression" if pos else "below cut-point",
+            "summary": f"{total}/26" + (" (possible depression)" if pos else ""), "lines": lines, "flags": [],
+            "values": {"Total": total}}
+
+
+def _score_psc(a, youth=False):
+    if youth:                     # Y-PSC-17 item order
+        sub = {"Internalizing": [2, 6, 9, 11, 15], "Attention": [1, 3, 7, 13, 17],
+               "Externalizing": [4, 5, 8, 10, 12, 14, 16]}
+    else:
+        sub = {"Internalizing": [1, 2, 3, 4, 5], "Attention": [6, 7, 8, 9, 10],
+               "Externalizing": [11, 12, 13, 14, 15, 16, 17]}
+    cuts = {"Internalizing": 5, "Attention": 7, "Externalizing": 7}
+    total = sum(int(_val(a, i)) for i in range(1, 18))
+    vals, lines = {"Total": total}, [f"Total {total} of 34" + (" — 15 or more: positive screen; further evaluation."
+                                                                  if total >= 15 else " (cut-point 15).")]
+    for k, items in sub.items():
+        v = sum(int(_val(a, i)) for i in items)
+        vals[k] = v
+        lines.append(f"{k}: {v}" + (f" — positive ({cuts[k]}+)." if v >= cuts[k] else f" (cut-point {cuts[k]})."))
+    if (a or {}).get("help") not in (None, "") and int(a["help"]) == 1:
+        lines.append("The parent says the child has emotional or behavioral problems they need help with.")
+    pos = total >= 15 or any(vals[k] >= cuts[k] for k in cuts)
+    return {"total": total, "max": 34, "band": "positive" if pos else "negative",
+            "summary": f"{total}/34 ({'positive' if pos else 'negative'})", "lines": lines, "flags": [],
+            "values": vals}
+
+
+# ---- the instruments -----------------------------------------------------------------------------------------
+_PHQ_STEM = "Over the last 2 weeks, how often have you been bothered by any of the following problems?"
+_PHQ9_ITEMS = ["Little interest or pleasure in doing things", "Feeling down, depressed, or hopeless",
+               "Trouble falling or staying asleep, or sleeping too much", "Feeling tired or having little energy",
+               "Poor appetite or overeating",
+               "Feeling bad about yourself — or that you are a failure or have let yourself or your family down",
+               "Trouble concentrating on things, such as reading the newspaper or watching television",
+               "Moving or speaking so slowly that other people could have noticed? Or the opposite — being so "
+               "fidgety or restless that you have been moving around a lot more than usual",
+               "Thoughts that you would be better off dead or of hurting yourself in some way"]
+_GAD7_ITEMS = ["Feeling nervous, anxious, or on edge", "Not being able to stop or control worrying",
+               "Worrying too much about different things", "Trouble relaxing",
+               "Being so restless that it is hard to sit still", "Becoming easily annoyed or irritable",
+               "Feeling afraid as if something awful might happen"]
+_ANY = lambda ids: (lambda a: any(int(_val(a, i)) > 0 for i in ids))
+_PHQ_PFIZER = ("PHQ-9 and GAD-7: developed by Drs. Robert L. Spitzer, Janet B.W. Williams, Kurt Kroenke and colleagues, "
+               "with an educational grant from Pfizer Inc. No permission required to reproduce, translate, display "
+               "or distribute.")
+
+ASSESS_INSTRUMENTS = {}
+
+
+def _inst(**d):
+    d.setdefault("respondent", "patient")
+    d.setdefault("stem", "")
+    ASSESS_INSTRUMENTS[d["id"]] = d
+    return d
+
+
+_inst(id="phq9", name="PHQ-9", title="Patient Health Questionnaire-9", groups=("adult",), cat="Depression",
+      measures="Depression severity", ages="18+", minutes=3, measure_kind="PHQ-9",
+      intro="This questionnaire asks how you have been feeling over the last 2 weeks.", stem=_PHQ_STEM,
+      items=[_q(i, t, _FREQ4) for i, t in enumerate(_PHQ9_ITEMS, 1)] + [
+          _q("diff", "If you checked off any problems, how difficult have these problems made it for you to do your "
+                     "work, take care of things at home, or get along with other people?", _DIFFICULT,
+             stem="", show=_ANY(range(1, 10)), scored=False)],
+      score=_score_phq, credit=_PHQ_PFIZER)
+
+_inst(id="phqa", name="PHQ-A", title="PHQ-9 modified for Adolescents", groups=("adolescent",), cat="Depression",
+      measures="Depression symptoms", ages="11–17", minutes=4,
+      intro="How often have you been bothered by each of the following symptoms during the past two weeks? Choose the "
+            "answer that best describes how you have been feeling.",
+      stem="During the past two weeks, how often have you been bothered by:",
+      items=[_q(i, t, _FREQ4) for i, t in enumerate([
+          "Feeling down, depressed, irritable, or hopeless?", "Little interest or pleasure in doing things?",
+          "Trouble falling asleep, staying asleep, or sleeping too much?", "Poor appetite, weight loss, or overeating?",
+          "Feeling tired, or having little energy?",
+          "Feeling bad about yourself – or feeling that you are a failure, or that you have let yourself or your "
+          "family down?", "Trouble concentrating on things like school work, reading, or watching TV?",
+          "Moving or speaking so slowly that other people could have noticed? Or the opposite – being so fidgety or "
+          "restless that you were moving around a lot more than usual?",
+          "Thoughts that you would be better off dead, or of hurting yourself in some way?"], 1)] + [
+          _q("year", "In the past year have you felt depressed or sad most days, even if you felt okay sometimes?",
+             _YN, stem=""),
+          _q("diff", "If you are experiencing any of the problems on this form, how difficult have these problems made "
+                     "it for you to do your work, take care of things at home or get along with other people?",
+             _DIFFICULT, stem="", show=_ANY(range(1, 10))),
+          _q("month", "Has there been a time in the past month when you have had serious thoughts about ending your "
+                      "life?", _YN, stem=""),
+          _q("ever", "Have you EVER, in your WHOLE LIFE, tried to kill yourself or made a suicide attempt?", _YN,
+             stem="")],
+      score=lambda a: _score_phq(a, adolescent=True),
+      credit="Modified with permission from the PHQ (Spitzer, Williams & Kroenke, 1999) by J. Johnson (Johnson, 2002).")
+
+_inst(id="gad7", name="GAD-7", title="Generalized Anxiety Disorder-7", groups=("adolescent", "adult"),
+      cat="Anxiety, stress & distress", measures="Generalized anxiety symptoms", ages="12+", minutes=2,
+      measure_kind="GAD-7", intro="This questionnaire asks how you have been feeling over the last 2 weeks.",
+      stem=_PHQ_STEM,
+      items=[_q(i, t, _FREQ4) for i, t in enumerate(_GAD7_ITEMS, 1)] + [
+          _q("diff", "If you checked off any problems, how difficult have these problems made it for you to do your "
+                     "work, take care of things at home, or get along with other people?", _DIFFICULT,
+             stem="", show=_ANY(range(1, 8)), scored=False)],
+      score=_score_gad7, credit=_PHQ_PFIZER)
+
+_inst(id="dass21", name="DASS-21", title="Depression Anxiety Stress Scales (21 items)", groups=("adolescent", "adult"),
+      cat="Anxiety, stress & distress", measures="Depression, anxiety and stress", ages="14+", minutes=5,
+      intro="Please read each statement and choose the answer which indicates how much the statement applied to you "
+            "over the past week. There are no right or wrong answers. Do not spend too much time on any statement.",
+      stem="Over the past week:",
+      items=[_q(i, t, [(0, "Did not apply to me at all"), (1, "Applied to me to some degree, or some of the time"),
+                       (2, "Applied to me to a considerable degree, or a good part of time"),
+                       (3, "Applied to me very much, or most of the time")]) for i, t in enumerate([
+          "I found it hard to wind down", "I was aware of dryness of my mouth",
+          "I couldn't seem to experience any positive feeling at all",
+          "I experienced breathing difficulty (eg, excessively rapid breathing, breathlessness in the absence of "
+          "physical exertion)", "I found it difficult to work up the initiative to do things",
+          "I tended to over-react to situations", "I experienced trembling (eg, in the hands)",
+          "I felt that I was using a lot of nervous energy",
+          "I was worried about situations in which I might panic and make a fool of myself",
+          "I felt that I had nothing to look forward to", "I found myself getting agitated",
+          "I found it difficult to relax", "I felt down-hearted and blue",
+          "I was intolerant of anything that kept me from getting on with what I was doing",
+          "I felt I was close to panic", "I was unable to become enthusiastic about anything",
+          "I felt I wasn't worth much as a person", "I felt that I was rather touchy",
+          "I was aware of the action of my heart in the absence of physical exertion (eg, sense of heart rate "
+          "increase, heart missing a beat)", "I felt scared without any good reason",
+          "I felt that life was meaningless"], 1)],
+      score=_score_dass, series=[("Depression", 42), ("Anxiety", 42), ("Stress", 42)],
+      credit="Lovibond, S.H. & Lovibond, P.F. (1995). Manual for the Depression Anxiety Stress Scales. Psychology "
+             "Foundation, Sydney. www.psy.unsw.edu.au/dass")
+
+_K10_OPTS = [(1, "None of the time"), (2, "A little of the time"), (3, "Some of the time"), (4, "Most of the time"),
+             (5, "All of the time")]
+_inst(id="k10", name="K10", title="Kessler Psychological Distress Scale (with K6)", groups=("adolescent", "adult"),
+      cat="Anxiety, stress & distress", measures="Psychological distress (K6 scored too)", ages="12+", minutes=3,
+      intro="These questions are about how you have been feeling in the past 4 weeks.",
+      stem="In the past 4 weeks:",
+      items=[_q(i, t, _K10_OPTS, show=s) for i, (t, s) in enumerate([
+          ("About how often did you feel tired out for no good reason?", None),
+          ("About how often did you feel nervous?", None),
+          ("About how often did you feel so nervous that nothing could calm you down?",
+           lambda a: int(_val(a, 2, 1)) > 1),
+          ("About how often did you feel hopeless?", None),
+          ("About how often did you feel restless or fidgety?", None),
+          ("About how often did you feel so restless you could not sit still?", lambda a: int(_val(a, 5, 1)) > 1),
+          ("About how often did you feel depressed?", None),
+          ("About how often did you feel that everything is an effort?", None),
+          ("About how often did you feel so sad that nothing could cheer you up?", None),
+          ("About how often did you feel worthless?", None)], 1)],
+      score=_score_k10, series=[("K10", 50)],
+      credit="Kessler RC et al. (2002). Short screening scales to monitor population prevalences and trends in "
+             "non-specific psychological distress. Psychol Med 32:959–76. © World Health Organization.")
+
+_inst(id="who5", name="WHO-5", title="WHO-Five Well-Being Index", groups=("adolescent", "adult"),
+      cat="Anxiety, stress & distress", measures="Psychological well-being", ages="9+", minutes=1,
+      intro="Please indicate for each of the five statements which is closest to how you have been feeling over the "
+            "last two weeks.", stem="Over the last two weeks:",
+      items=[_q(i, t, [(5, "All of the time"), (4, "Most of the time"), (3, "More than half of the time"),
+                       (2, "Less than half of the time"), (1, "Some of the time"), (0, "At no time")])
+             for i, t in enumerate(["I have felt cheerful and in good spirits", "I have felt calm and relaxed",
+                                    "I have felt active and vigorous", "I woke up feeling fresh and rested",
+                                    "My daily life has been filled with things that interest me"], 1)],
+      score=_score_who5, higher_better=True,
+      credit="WHO (Five) Well-Being Index (1998 version). Psychiatric Research Unit, WHO Collaborating Centre in "
+             "Mental Health, Frederiksborg General Hospital.")
+
+_inst(id="pcl5", name="PCL-5", title="PTSD Checklist for DSM-5", groups=("adult",), cat="Trauma & PTSD",
+      measures="PTSD symptoms", ages="18+", minutes=6,
+      intro="Below is a list of problems that people sometimes have in response to a very stressful experience. "
+            "Keeping your worst event in mind, please read each problem carefully and then select how much you have "
+            "been bothered by that problem in the past month.",
+      stem="In the past month, how much were you bothered by:",
+      items=[_q("event", "Your worst event (optional — you can skip this):", kind="text", stem="", scored=False)] +
+            [_q(i, t, _BOTHER5) for i, t in enumerate([
+                "Repeated, disturbing, and unwanted memories of the stressful experience?",
+                "Repeated, disturbing dreams of the stressful experience?",
+                "Suddenly feeling or acting as if the stressful experience were actually happening again (as if you "
+                "were actually back there reliving it)?",
+                "Feeling very upset when something reminded you of the stressful experience?",
+                "Having strong physical reactions when something reminded you of the stressful experience (for "
+                "example, heart pounding, trouble breathing, sweating)?",
+                "Avoiding memories, thoughts, or feelings related to the stressful experience?",
+                "Avoiding external reminders of the stressful experience (for example, people, places, conversations, "
+                "activities, objects, or situations)?", "Trouble remembering important parts of the stressful experience?",
+                "Having strong negative beliefs about yourself, other people, or the world (for example, having "
+                "thoughts such as: I am bad, there is something seriously wrong with me, no one can be trusted, the "
+                "world is completely dangerous)?",
+                "Blaming yourself or someone else for the stressful experience or what happened after it?",
+                "Having strong negative feelings such as fear, horror, anger, guilt, or shame?",
+                "Loss of interest in activities that you used to enjoy?", "Feeling distant or cut off from other people?",
+                "Trouble experiencing positive feelings (for example, being unable to feel happiness or have loving "
+                "feelings for people close to you)?", "Irritable behavior, angry outbursts, or acting aggressively?",
+                "Taking too many risks or doing things that could cause you harm?",
+                "Being “superalert” or watchful or on guard?", "Feeling jumpy or easily startled?",
+                "Having difficulty concentrating?", "Trouble falling or staying asleep?"], 1)],
+      score=_score_pcl5, series=[("Total", 80)],
+      credit="Weathers, F.W., Litz, B.T., Keane, T.M., Palmieri, P.A., Marx, B.P., & Schnurr, P.P. (2013). The PTSD "
+             "Checklist for DSM-5 (PCL-5). National Center for PTSD, www.ptsd.va.gov")
+
+_inst(id="pcptsd5", name="PC-PTSD-5", title="Primary Care PTSD Screen for DSM-5", groups=("adult",),
+      cat="Trauma & PTSD", measures="Brief PTSD screen", ages="18+", minutes=2,
+      intro="Sometimes things happen to people that are unusually or especially frightening, horrible, or traumatic. "
+            "For example: a serious accident or fire; a physical or sexual assault or abuse; an earthquake or flood; "
+            "a war; seeing someone be killed or seriously injured; having a loved one die through homicide or "
+            "suicide.",
+      items=[_q("exp", "Have you ever experienced this kind of event?", _YN)] +
+            [_q(i, t, _YN, stem="In the past month, have you…", show=lambda a: int(_val(a, "exp")) == 1)
+             for i, t in enumerate([
+                 "had nightmares about the event(s) or thought about the event(s) when you did not want to?",
+                 "tried hard not to think about the event(s) or went out of your way to avoid situations that "
+                 "reminded you of the event(s)?", "been constantly on guard, watchful, or easily startled?",
+                 "felt numb or detached from people, activities, or your surroundings?",
+                 "felt guilty or unable to stop blaming yourself or others for the event(s) or any problems the "
+                 "event(s) may have caused?"], 1)],
+      score=_score_pcptsd5,
+      credit="Prins, A., Bovin, M.J., Kimerling, R., et al. (2015). Primary Care PTSD Screen for DSM-5 (PC-PTSD-5). "
+             "National Center for PTSD, www.ptsd.va.gov")
+
+_inst(id="iesr", name="IES-R", title="Impact of Event Scale – Revised", groups=("adult",), cat="Trauma & PTSD",
+      measures="Distress after a traumatic event", ages="18+", minutes=5,
+      intro="Below is a list of difficulties people sometimes have after stressful life events. Please read each "
+            "item, and then indicate how distressing each difficulty has been for you DURING THE PAST SEVEN DAYS with "
+            "respect to the event. How much were you distressed or bothered by these difficulties?",
+      stem="During the past seven days, with respect to the event:",
+      items=[_q("event", "The event (optional — you can skip this):", kind="text", stem="", scored=False)] +
+            [_q(i, t, _BOTHER5) for i, t in enumerate([
+                "Any reminder brought back feelings about it", "I had trouble staying asleep",
+                "Other things kept making me think about it", "I felt irritable and angry",
+                "I avoided letting myself get upset when I thought about it or was reminded of it",
+                "I thought about it when I didn't mean to", "I felt as if it hadn't happened or wasn't real",
+                "I stayed away from reminders about it", "Pictures about it popped into my mind",
+                "I was jumpy and easily startled", "I tried not to think about it",
+                "I was aware that I still had a lot of feelings about it, but I didn't deal with them",
+                "My feelings about it were kind of numb",
+                "I found myself acting or feeling as though I was back at that time", "I had trouble falling asleep",
+                "I had waves of strong feelings about it", "I tried to remove it from my memory",
+                "I had trouble concentrating",
+                "Reminders of it caused me to have physical reactions, such as sweating, trouble breathing, nausea, "
+                "or a pounding heart", "I had dreams about it", "I felt watchful or on-guard",
+                "I tried not to talk about it"], 1)],
+      score=_score_iesr, series=[("Total", 88)],
+      credit="Weiss, D.S., & Marmar, C.R. (1997). The Impact of Event Scale-Revised. In J.P. Wilson & T.M. Keane "
+             "(Eds.), Assessing Psychological Trauma and PTSD (pp. 399–411). Guilford Press.")
+
+_FREQ_AUDIT = [(0, "Never"), (1, "Less than monthly"), (2, "Monthly"), (3, "Weekly"), (4, "Daily or almost daily")]
+_INJ = [(0, "No"), (2, "Yes, but not in the last year"), (4, "Yes, during the last year")]
+_drinker = lambda a: int(_val(a, 1)) > 0
+_beyond = lambda a: _drinker(a) and int(_val(a, 2)) + int(_val(a, 3)) > 0
+_inst(id="audit", name="AUDIT", title="Alcohol Use Disorders Identification Test (AUDIT-C scored too)",
+      groups=("adult",), cat="Substance use", measures="Alcohol use (hazardous, harmful, dependence)", ages="18+",
+      minutes=3,
+      intro="These questions are about your use of alcoholic beverages during the past year. One drink means one "
+            "can or bottle of beer, one glass of wine, or one shot of liquor or one mixed drink. Please answer "
+            "honestly.",
+      items=[_q(1, "How often do you have a drink containing alcohol?",
+                [(0, "Never"), (1, "Monthly or less"), (2, "2 to 4 times a month"), (3, "2 to 3 times a week"),
+                 (4, "4 or more times a week")]),
+             _q(2, "How many drinks containing alcohol do you have on a typical day when you are drinking?",
+                [(0, "1 or 2"), (1, "3 or 4"), (2, "5 or 6"), (3, "7, 8, or 9"), (4, "10 or more")], show=_drinker),
+             _q(3, "How often do you have six or more drinks on one occasion?", _FREQ_AUDIT, show=_drinker),
+             _q(4, "How often during the last year have you found that you were not able to stop drinking once you "
+                   "had started?", _FREQ_AUDIT, show=_beyond),
+             _q(5, "How often during the last year have you failed to do what was normally expected from you because "
+                   "of drinking?", _FREQ_AUDIT, show=_beyond),
+             _q(6, "How often during the last year have you needed a first drink in the morning to get yourself going "
+                   "after a heavy drinking session?", _FREQ_AUDIT, show=_beyond),
+             _q(7, "How often during the last year have you had a feeling of guilt or remorse after drinking?",
+                _FREQ_AUDIT, show=_beyond),
+             _q(8, "How often during the last year have you been unable to remember what happened the night before "
+                   "because you had been drinking?", _FREQ_AUDIT, show=_beyond),
+             _q(9, "Have you or someone else been injured as a result of your drinking?", _INJ),
+             _q(10, "Has a relative or friend or a doctor or another health worker been concerned about your drinking "
+                    "or suggested you cut down?", _INJ)],
+      score=_score_audit, series=[("AUDIT", 40)],
+      credit="Babor, T.F., Higgins-Biddle, J.C., Saunders, J.B., & Monteiro, M.G. (2001). AUDIT: The Alcohol Use "
+             "Disorders Identification Test (2nd ed.). World Health Organization.")
+
+_inst(id="asrs", name="ASRS v1.1", title="Adult ADHD Self-Report Scale v1.1 Symptom Checklist", groups=("adult",),
+      cat="ADHD", measures="ADHD symptoms (Part A screener + Part B)", ages="18+", minutes=5,
+      intro="Please answer the questions below, rating yourself on each of the criteria shown. As you answer each "
+            "question, choose the answer that best describes how you have felt and conducted yourself over the past "
+            "6 months.", stem="Over the past 6 months:",
+      items=[_q(i, t, _OFTEN5) for i, t in enumerate([
+          "How often do you have trouble wrapping up the final details of a project, once the challenging parts have "
+          "been done?", "How often do you have difficulty getting things in order when you have to do a task that "
+          "requires organization?", "How often do you have problems remembering appointments or obligations?",
+          "When you have a task that requires a lot of thought, how often do you avoid or delay getting started?",
+          "How often do you fidget or squirm with your hands or feet when you have to sit down for a long time?",
+          "How often do you feel overly active and compelled to do things, like you were driven by a motor?",
+          "How often do you make careless mistakes when you have to work on a boring or difficult project?",
+          "How often do you have difficulty keeping your attention when you are doing boring or repetitive work?",
+          "How often do you have difficulty concentrating on what people say to you, even when they are speaking to "
+          "you directly?", "How often do you misplace or have difficulty finding things at home or at work?",
+          "How often are you distracted by activity or noise around you?",
+          "How often do you leave your seat in meetings or in other situations in which you are expected to stay "
+          "seated?", "How often do you feel restless or fidgety?",
+          "How often do you have difficulty unwinding and relaxing when you have time to yourself?",
+          "How often do you find yourself talking too much when you are in social situations?",
+          "When you're in a conversation, how often do you find yourself finishing the sentences of the people you "
+          "are talking to, before they can finish them themselves?",
+          "How often do you have difficulty waiting your turn in situations when turn taking is required?",
+          "How often do you interrupt others when they are busy?"], 1)],
+      score=_score_asrs, series=[("Part A", 6), ("Part B", 12)],
+      credit="© World Health Organization 2003. Based on the Composite International Diagnostic Interview © 2001 WHO. "
+             "Kessler RC et al., Harvard Medical School.")
+
+_inst(id="gds15", name="GDS-15", title="Geriatric Depression Scale (short form) — older adults", groups=("adult",),
+      cat="Depression", measures="Depression symptoms in older adults", ages="55+ / older adults", minutes=3,
+      intro="Choose the best answer for how you have felt over the past week.", stem="Over the past week:",
+      items=[_q(i, t, _YN) for i, t in enumerate([
+          "Are you basically satisfied with your life?", "Have you dropped many of your activities and interests?",
+          "Do you feel that your life is empty?", "Do you often get bored?", "Are you in good spirits most of the time?",
+          "Are you afraid that something bad is going to happen to you?", "Do you feel happy most of the time?",
+          "Do you often feel helpless?",
+          "Do you prefer to stay at home, rather than going out and doing new things?",
+          "Do you feel you have more problems with memory than most?", "Do you think it is wonderful to be alive now?",
+          "Do you feel pretty worthless the way you are now?", "Do you feel full of energy?",
+          "Do you feel that your situation is hopeless?", "Do you think that most people are better off than you are?"],
+          1)],
+      score=_score_gds,
+      credit="Sheikh, J.I., & Yesavage, J.A. (1986). Geriatric Depression Scale (GDS): Recent evidence and development "
+             "of a shorter version. Public domain.")
+
+_BAM5 = [(0, "Not at all"), (8, "Slightly"), (15, "Moderately"), (22, "Considerably"), (30, "Extremely")]
+_days = lambda i, text, **kw: _q(i, text, kind="number", lo=0, hi=30, unit=kw.pop("unit", "days"), **kw)
+_used_drugs = lambda a: int(_val(a, 6)) > 0
+_inst(id="bam", name="BAM", title="Brief Addiction Monitor (continuous)", groups=("adult",), cat="Substance use",
+      measures="Recovery progress: substance use, risk and protective factors", ages="18+", minutes=5,
+      intro="This is a standard set of questions about several areas of your life such as your health, alcohol and "
+            "drug use, etc. The questions generally ask about the past 30 days. Please consider each question and "
+            "answer as accurately as possible.",
+      items=[_q(1, "In the past 30 days, how would you say your physical health has been?",
+                [(0, "Excellent"), (8, "Very Good"), (15, "Good"), (22, "Fair"), (30, "Poor")]),
+             _days(2, "In the past 30 days, how many nights did you have trouble falling asleep or staying asleep?",
+                   unit="nights"),
+             _days(3, "In the past 30 days, how many days have you felt depressed, anxious, angry or very upset "
+                      "throughout most of the day?"),
+             _days(4, "In the past 30 days, how many days did you drink ANY alcohol?"),
+             _days(5, "In the past 30 days, how many days did you have at least 5 drinks (if you are a man) or at least "
+                      "4 drinks (if you are a woman)? [One drink is considered one shot of hard liquor (1.5 oz.) or "
+                      "12-ounce can/bottle of beer or 5-ounce glass of wine.]", show=lambda a: int(_val(a, 4)) > 0),
+             _days(6, "In the past 30 days, how many days did you use any illegal or street drugs or abuse any "
+                      "prescription medications?")] +
+            [_days(q, t, stem="In the past 30 days, how many days did you use any of the following drugs:",
+                   show=_used_drugs) for q, t in (
+                ("7a", "Marijuana (cannabis, pot, weed)?"),
+                ("7b", "Sedatives and/or Tranquilizers (benzos, Valium, Xanax, Ativan, Ambien, barbs, Phenobarbital, "
+                       "downers, etc.)?"), ("7c", "Cocaine and/or Crack?"),
+                ("7d", "Other Stimulants (amphetamine, methamphetamine, Dexedrine, Ritalin, Adderall, speed, crystal "
+                       "meth, ice, etc.)?"),
+                ("7e", "Opiates (Heroin, Morphine, Dilaudid, Demerol, Oxycontin, oxy, codeine (Tylenol 2,3,4), "
+                       "Percocet, Vicodin, Fentanyl, etc.)?"),
+                ("7f", "Inhalants (glues, adhesives, nail polish remover, paint thinner, etc.)?"),
+                ("7g", "Other drugs (steroids, non-prescription sleep and diet pills, Benadryl, Ephedra, other "
+                       "over-the-counter or unknown medications)?"))] +
+            [_q(8, "In the past 30 days, how much were you bothered by cravings or urges to drink alcohol or use drugs?",
+                _BAM5),
+             _q(9, "How confident are you that you will NOT use alcohol and drugs in the next 30 days?", _BAM5),
+             _days(10, "In the past 30 days, how many days did you attend self-help meetings like AA or NA to support "
+                       "your recovery?"),
+             _days(11, "In the past 30 days, how many days were you in any situations or with any people that might put "
+                       "you at an increased risk for using alcohol or drugs (i.e., around risky “people, places or "
+                       "things”)?"),
+             _q(12, "Does your religion or spirituality help support your recovery?", _BAM5),
+             _days(13, "In the past 30 days, how many days did you spend much of the time at work, school, or doing "
+                       "volunteer work?"),
+             _q(14, "Do you have enough income (from legal sources) to pay for necessities such as housing, "
+                    "transportation, food and clothing for yourself and your dependents?", [(0, "No"), (30, "Yes")]),
+             _q(15, "In the past 30 days, how much have you been bothered by arguments or problems getting along with "
+                    "any family members or friends?", _BAM5),
+             _days(16, "In the past 30 days, how many days did you contact or spend time with any family members or "
+                       "friends who are supportive of your recovery?"),
+             _q(17, "How satisfied are you with your progress toward achieving your recovery goals?", _BAM5,
+                scored=False)],
+      score=_score_bam, series=[("Use", 90), ("Risk", 180), ("Protective", 180)],
+      credit="Brief Addiction Monitor (BAM), U.S. Department of Veterans Affairs. Public domain.")
+
+_ASQ_ANY = lambda a: any(int(_val(a, i)) == 1 for i in range(1, 5))
+_inst(id="asq", name="ASQ", title="Ask Suicide-Screening Questions", groups=("child", "adolescent", "adult"),
+      cat="Suicide risk & safety", measures="Suicide risk screen (with acuity question)",
+      ages="10+ (use judgment for 8–9)", minutes=1,
+      intro="These are a few questions about your safety. Please answer each one honestly. Your counselor will talk "
+            "with you about your answers.",
+      items=[_q(1, "In the past few weeks, have you wished you were dead?", _YN),
+             _q(2, "In the past few weeks, have you felt that you or your family would be better off if you were dead?",
+                _YN),
+             _q(3, "In the past week, have you been having thoughts about killing yourself?", _YN),
+             _q(4, "Have you ever tried to kill yourself?", _YN),
+             _q("4a", "When was the most recent attempt?", [(1, "Within the last 12 months"), (0, "Over 1 year ago")],
+                show=lambda a: int(_val(a, 4)) == 1),
+             _q(5, "Are you having thoughts of killing yourself right now?", _YN, show=_ASQ_ANY)],
+      score=_score_asq, risk_tool=True,
+      credit="Ask Suicide-Screening Questions (ASQ), National Institute of Mental Health (NIMH). Public domain. "
+             "www.nimh.nih.gov/asQ")
+
+_inst(id="cssrs", name="C-SSRS screener", title="Columbia-Suicide Severity Rating Scale — Screen (recent)",
+      groups=("adolescent", "adult"), cat="Suicide risk & safety", measures="Suicidal ideation and behavior",
+      ages="12+", minutes=2,
+      intro="These questions are about thoughts of suicide in the past month. Please answer each one honestly. Your "
+            "counselor will talk with you about your answers.",
+      stem="In the past month:",
+      items=[_q(1, "Have you wished you were dead or wished you could go to sleep and not wake up?", _YN),
+             _q(2, "Have you actually had any thoughts of killing yourself?", _YN),
+             _q(3, "Have you been thinking about how you might do this?", _YN, show=lambda a: int(_val(a, 2)) == 1),
+             _q(4, "Have you had these thoughts and had some intention of acting on them?", _YN,
+                show=lambda a: int(_val(a, 2)) == 1),
+             _q(5, "Have you started to work out or worked out the details of how to kill yourself? Do you intend to "
+                   "carry out this plan?", _YN, show=lambda a: int(_val(a, 2)) == 1),
+             _q(6, "Have you ever done anything, started to do anything, or prepared to do anything to end your life? "
+                   "(For example: collected pills, obtained a gun, gave away valuables, wrote a will or suicide note, "
+                   "took out pills but didn't swallow any, held a gun but changed your mind or it was grabbed from "
+                   "your hand, went to the roof but didn't jump; or actually took pills, tried to shoot yourself, cut "
+                   "yourself, tried to hang yourself, etc.)", _YN, stem=""),
+             _q("6a", "Was this within the past three months?", _YN, stem="", show=lambda a: int(_val(a, 6)) == 1)],
+      score=_score_cssrs, risk_tool=True,
+      credit="Columbia-Suicide Severity Rating Scale, Screen Version – Recent. © 2008 The Research Foundation for "
+             "Mental Hygiene, Inc. Kelly Posner, Ph.D.")
+
+_inst(id="crafft", name="CRAFFT 2.1", title="The CRAFFT Questionnaire (version 2.1)", groups=("adolescent",),
+      cat="Substance use", measures="Alcohol and drug use risk", ages="12–21", minutes=3,
+      intro="Please answer all questions honestly; your answers will be kept confidential.",
+      items=[_q(1, "Drink more than a few sips of beer, wine, or any drink containing alcohol? Put “0” if none.",
+                kind="number", lo=0, hi=365, unit="days",
+                stem="During the PAST 12 MONTHS, on how many days did you:"),
+             _q(2, "Use any marijuana (weed, oil, or hash, by smoking, vaping, or in food) or “synthetic marijuana” "
+                   "(like “K2,” “Spice”) or “vaping” THC oil? Put “0” if none.", kind="number", lo=0, hi=365,
+                unit="days", stem="During the PAST 12 MONTHS, on how many days did you:"),
+             _q(3, "Use anything else to get high (like other illegal drugs, prescription or over-the-counter "
+                   "medications, and things that you sniff, huff, or vape)? Put “0” if none.", kind="number", lo=0,
+                hi=365, unit="days", stem="During the PAST 12 MONTHS, on how many days did you:"),
+             _q(4, "Have you ever ridden in a CAR driven by someone (including yourself) who was “high” or had been "
+                   "using alcohol or drugs?", _YN)] +
+            [_q(i, t, _YN, show=lambda a: any(int(_val(a, j)) > 0 for j in (1, 2, 3))) for i, t in (
+                (5, "Do you ever use alcohol or drugs to RELAX, feel better about yourself, or fit in?"),
+                (6, "Do you ever use alcohol or drugs while you are by yourself, or ALONE?"),
+                (7, "Do you ever FORGET things you did while using alcohol or drugs?"),
+                (8, "Do your FAMILY or FRIENDS ever tell you that you should cut down on your drinking or drug use?"),
+                (9, "Have you ever gotten into TROUBLE while you were using alcohol or drugs?"))],
+      score=_score_crafft,
+      credit="© John R. Knight, MD, Boston Children’s Hospital, 2016. Reproduced with permission from the Center for "
+             "Adolescent Substance Abuse Research (CeASAR), Boston Children’s Hospital. www.crafft.org")
+
+_S2BI_OPTS = [(0, "Never"), (1, "Once or twice"), (2, "Monthly"), (3, "Weekly or more")]
+_S2BI_MORE = lambda a: any(int(_val(a, i)) > 0 for i in (1, 2, 3))
+_inst(id="s2bi", name="S2BI", title="Screening to Brief Intervention", groups=("adolescent",), cat="Substance use",
+      measures="Past-year substance use frequency (risk level)", ages="12–17", minutes=1,
+      intro="The following questions will ask about your use, if any, of alcohol, tobacco, and other drugs. Please "
+            "answer every question.", stem="In the past year, how many times have you used:",
+      items=[_q(i, t, _S2BI_OPTS, show=None if i <= 3 else _S2BI_MORE) for i, t in enumerate([
+          "Nicotine/Tobacco (including cigarettes, electronic cigarettes, or vapes)?", "Alcohol?",
+          "Marijuana (such as smoking, vaping or edibles)?",
+          "Prescription drugs that were not prescribed for you (such as pain medication or Adderall)?",
+          "Illegal drugs (such as cocaine, Ecstasy or Molly)?", "Inhalants (such as nitrous oxide)?",
+          "Herbs or synthetic drugs (such as salvia, “K2”, or bath salts)?"], 1)],
+      score=_score_s2bi,
+      credit="S2BI Tool developed at Boston Children’s Hospital with support from the National Institute on Drug Abuse. "
+             "© Boston Children’s Hospital. Licensed under CC BY-NC 4.0.")
+
+_SCARED_OPTS = [(0, "Not True or Hardly Ever True"), (1, "Somewhat True or Sometimes True"),
+                (2, "Very True or Often True")]
+_inst(id="scared", name="SCARED", title="Screen for Child Anxiety Related Disorders (child version)",
+      groups=("child", "adolescent"), cat="Anxiety, stress & distress", measures="Anxiety disorders (5 subscales)",
+      ages="8–18 (for 8–11, sit with them)", minutes=10,
+      intro="Below is a list of sentences that describe how people feel. Read each phrase and decide if it is “Not "
+            "True or Hardly Ever True” or “Somewhat True or Sometimes True” or “Very True or Often True” for you. "
+            "Choose the answer that seems to describe you for the last 3 months.",
+      stem="For the last 3 months:",
+      items=[_q(i, t, _SCARED_OPTS) for i, t in enumerate([
+          "When I feel frightened, it is hard to breathe.", "I get headaches when I am at school.",
+          "I don’t like to be with people I don’t know well.", "I get scared if I sleep away from home.",
+          "I worry about other people liking me.", "When I get frightened, I feel like passing out.", "I am nervous.",
+          "I follow my mother or father wherever they go.", "People tell me that I look nervous.",
+          "I feel nervous with people I don’t know well.", "I get stomachaches at school.",
+          "When I get frightened, I feel like I am going crazy.", "I worry about sleeping alone.",
+          "I worry about being as good as other kids.", "When I get frightened, I feel like things are not real.",
+          "I have nightmares about something bad happening to my parents.", "I worry about going to school.",
+          "When I get frightened, my heart beats fast.", "I get shaky.",
+          "I have nightmares about something bad happening to me.", "I worry about things working out for me.",
+          "When I get frightened, I sweat a lot.", "I am a worrier.", "I get really frightened for no reason at all.",
+          "I am afraid to be alone in the house.", "It is hard for me to talk with people I don’t know well.",
+          "When I get frightened, I feel like I am choking.", "People tell me that I worry too much.",
+          "I don’t like to be away from my family.", "I am afraid of having anxiety (or panic) attacks.",
+          "I worry that something bad might happen to my parents.", "I feel shy with people I don’t know well.",
+          "I worry about what is going to happen in the future.", "When I get frightened, I feel like throwing up.",
+          "I worry about how well I do things.", "I am scared to go to school.",
+          "I worry about things that have already happened.", "When I get frightened, I feel dizzy.",
+          "I feel nervous when I am with other children or adults and I have to do something while they watch me (for "
+          "example: read aloud, speak, play a game, play a sport).",
+          "I feel nervous when I am going to parties, dances, or any place where there will be people that I don’t "
+          "know well.", "I am shy."], 1)],
+      score=_score_scared, series=[("Total", 82)],
+      credit="Developed by Boris Birmaher, M.D., Suneeta Khetarpal, M.D., Marlane Cully, M.Ed., David Brent, M.D., and "
+             "Sandra McKenzie, Ph.D., University of Pittsburgh (1995). Available at no cost: pediatricbipolar.pitt.edu")
+
+_inst(id="smfq", name="SMFQ", title="Short Mood and Feelings Questionnaire (child self-report)", groups=("child",),
+      cat="Depression", measures="Depression symptoms", ages="6–17", minutes=3,
+      intro="This form is about how you might have been feeling or acting recently. For each question, choose how you "
+            "have been feeling or acting in the past two weeks. If a sentence was not true about you, choose NOT TRUE. "
+            "If a sentence was only sometimes true, choose SOMETIMES. If a sentence was true about you most of the "
+            "time, choose TRUE.", stem="In the past two weeks:",
+      items=[_q(i, t, [(0, "Not true"), (1, "Sometimes"), (2, "True")]) for i, t in enumerate([
+          "I felt miserable or unhappy.", "I didn’t enjoy anything at all.",
+          "I felt so tired I just sat around and did nothing.", "I was very restless.", "I felt I was no good anymore.",
+          "I cried a lot.", "I found it hard to think properly or concentrate.", "I hated myself.",
+          "I was a bad person.", "I felt lonely.", "I thought nobody really loved me.",
+          "I thought I could never be as good as other kids.", "I did everything wrong."], 1)],
+      score=_score_smfq,
+      credit="Mood and Feelings Questionnaire: Short Version. Copyright Adrian Angold & Elizabeth J. Costello, 1987; "
+             "Developmental Epidemiology Program, Duke University.")
+
+_PSC_CREDIT = ("Pediatric Symptom Checklist ©1988, M. Jellinek & J.M. Murphy, Massachusetts General Hospital (PSC-17 "
+               "created by W. Gardner & K. Kelleher).")
+_inst(id="psc17", name="PSC-17 (parent)", title="Pediatric Symptom Checklist-17 — completed by a parent",
+      groups=("child", "adolescent"), cat="Behavior & functioning",
+      measures="Emotional and behavioral difficulties (parent report)", ages="4–17", minutes=3, respondent="parent",
+      intro="For the parent or guardian: please mark the answer that best describes your child.",
+      stem="Your child:",
+      items=[_q(i, t, _NSO3) for i, t in enumerate([
+          "Feels sad, unhappy", "Feels hopeless", "Is down on self", "Worries a lot", "Seems to be having less fun",
+          "Fidgety, unable to sit still", "Daydreams too much", "Distracted easily", "Has trouble concentrating",
+          "Acts as if driven by a motor", "Fights with other children", "Does not listen to rules",
+          "Does not understand other people’s feelings", "Teases others", "Blames others for his/her troubles",
+          "Refuses to share", "Takes things that do not belong to him/her"], 1)] + [
+          _q("help", "Does your child have any emotional or behavioral problems for which she/he needs help?",
+             [(0, "No"), (1, "Yes")], stem="", scored=False)],
+      score=lambda a: _score_psc(a), series=[("Total", 34)], credit=_PSC_CREDIT)
+
+_inst(id="ypsc17", name="Y-PSC-17", title="Youth Pediatric Symptom Checklist-17 (self-report)",
+      groups=("adolescent",), cat="Behavior & functioning", measures="Emotional and behavioral difficulties",
+      ages="11+", minutes=3,
+      intro="Please mark the answer that best fits you.", stem="How often do you:",
+      items=[_q(i, t, _NSO3) for i, t in enumerate([
+          "Fidgety, unable to sit still", "Feel sad, unhappy", "Daydream too much", "Refuse to share",
+          "Do not understand other people’s feelings", "Feel hopeless", "Have trouble concentrating",
+          "Fight with other children", "Down on yourself", "Blame others for your troubles",
+          "Seem to be having less fun", "Do not listen to rules", "Act as if driven by a motor", "Tease others",
+          "Worry a lot", "Take things that do not belong to you", "Distract easily"], 1)],
+      score=lambda a: _score_psc(a, youth=True), series=[("Total", 34)],
+      credit=_PSC_CREDIT + " Youth form adapted with permission for Feelings Need Check Ups Too, 2004.")
+
+
+def score_assessment(iid, answers):
+    """Score one completed (or partly completed) administration. Returns the result dict."""
+    inst = ASSESS_INSTRUMENTS[iid]
+    res = dict(inst["score"](answers or {}))
+    res.setdefault("flags", [])
+    res.setdefault("lines", [])
+    res.setdefault("values", {})
+    res["risk"] = bool(res.get("risk") or res["flags"] and inst.get("risk_tool"))
+    return res
+
+
+def assessment_primary(entry):
+    """(value, max) used for the trend chart of one administration's main score (None if it has none)."""
+    r = entry.get("result") or {}
+    if r.get("total") is None:
+        return None
+    return r["total"], r.get("max") or 1
+
+
+def assessments_text(client, limit_days=None):
+    """One line per instrument (latest administration, with the change since the one before) for notes and the AI."""
+    by = {}
+    for a in client.get("assessments") or []:
+        if a.get("administered") and a.get("completed", True) and a.get("instrument") in ASSESS_INSTRUMENTS \
+                and ASSESS_INSTRUMENTS[a["instrument"]].get("measure_kind") is None:
+            by.setdefault(a["instrument"], []).append(a)
+    out = []
+    for iid, lst in by.items():
+        lst.sort(key=lambda x: (x.get("date", ""), x.get("added", "")))
+        last = lst[-1]
+        r = last.get("result") or {}
+        line = f"{ASSESS_INSTRUMENTS[iid]['name']} {r.get('summary', '')} on {fmt_date(last.get('date', ''))}"
+        if len(lst) > 1 and r.get("total") is not None and (lst[-2].get("result") or {}).get("total") is not None:
+            prev = lst[-2]["result"]["total"]
+            ch = r["total"] - prev
+            line += f" ({'up' if ch > 0 else 'down' if ch < 0 else 'no change'}" + (f" {abs(ch)}" if ch else "") + \
+                    f" from {prev} on {fmt_date(lst[-2].get('date', ''))})"
+        if r.get("flags"):
+            line += "; " + " ".join(f for f in r["flags"][:1])
+        out.append(line + ".")
+    return "\n".join(out)
 MEASURE_EXTRACT_PROMPT = """Below is the text of a patient's registration packet (read from a form). Find the \
 PHQ-9 and the GAD-7 questionnaires, if they are there, and read the patient's answers. Each answer is scored \
 0 = "Not at all", 1 = "Several days", 2 = "More than half the days", 3 = "Nearly every day". Use a total only if \
@@ -8563,10 +11791,11 @@ def edit_changed(draft, final):
 
 
 def record_edit(settings, client, kind, doc_key, draft, final):
-    """Remember one draft→final pair (names hidden). Returns True if it was new."""
+    """Remember one draft→final pair (names always hidden: what's learned applies to every patient).
+    Returns True if it was new."""
     if not edit_changed(draft, final):
         return False
-    hide = client_hider(client)
+    hide = client_hider(client, always=True)
     key = hashlib.sha256((draft + "\0" + final).encode("utf-8")).hexdigest()[:16]
     pairs = settings.setdefault("edit_pairs", [])
     if any(p.get("key") == key for p in pairs):
@@ -8730,7 +11959,7 @@ def _norm_word(w):
 def patient_speech(d, counselor_label, patient_label=None):
     """What the patient said in a session — the patient's own transcript lines when the patient can be told
     apart (see map_patient), otherwise everyone but the counselor — else the note."""
-    lines = d.get("lines") or []
+    lines = timed_lines(d) or d.get("lines") or []
     roles = d.get("roles") or {}
     label = lambda l: roles.get(l.get("speaker"), l.get("speaker")) or ""
     names = list(dict.fromkeys(label(l) for l in lines))
@@ -8776,10 +12005,17 @@ def _speech_counts(text, hide_names):
     return out
 
 
+_LABEL_WORDS = frozenset(w for phrase in _CLINICIAN_WORDS + _PATIENT_WORDS + ("patients", "clients", "speaker")
+                         for w in re.findall(r"[a-z]+", phrase.lower()))
+
+
 def session_themes(client, sessions, counselor_label, top_words=15, patient_label=None):
     """{"columns": [(date, words)], "themes": [(theme, [per-session rate per 1000 words], total)],
-    "words": [(word, [counts per session], sessions_with_it)]} — oldest session first."""
+    "words": [(word, [counts per session], sessions_with_it)]} — oldest session first. Speaker labels
+    ("Patient", "Therapist", your own labels) are never counted as words the patient used."""
     hide_names = frozenset(p.lower() for name, _ in client_name_map(client) for p in name.split() if len(p) > 1)
+    hide_names |= _LABEL_WORDS | frozenset(w for lab in (counselor_label, patient_label) if lab
+                                           for w in re.findall(r"[a-z]+", lab.lower()))
     cols, theme_counts, word_counts, surface = [], [], [], {}
     for _, d in sorted(sessions, key=lambda x: session_sort_key(x[1])):
         if d.get("meta", {}).get("kind") == "parent":
@@ -8995,6 +12231,13 @@ def caseload(pairs, today=None, include_dismissed=False):
                 raw["scores"].append({"client": c, "text": f"{kind} {t['previous']['total']} → {t['latest']['total']} "
                                                            f"({measure_band(kind, t['latest']['total'])})",
                                       "when": t["latest"]["date"], "select": "insights:scores"})
+        recent_cut = date.fromordinal(date.today().toordinal() - 60).isoformat()
+        for a_ in c.get("assessments") or []:           # positive suicide screens taken here in the last 60 days
+            r_ = a_.get("result") or {}
+            if a_.get("administered") and a_.get("instrument") != "bssa" and r_.get("risk") \
+                    and (a_.get("date") or "") >= recent_cut:
+                raw["risk"].append({"client": c, "text": f"{a_.get('name', 'Assessment')}: {r_.get('summary', '')}",
+                                    "when": a_["date"], "select": "assess"})
         for x in c.get("followups") or []:
             if not x.get("done"):
                 raw["followups"].append({"client": c, "text": x["text"], "when": x.get("date") or "", "fid": x["id"],
@@ -9027,6 +12270,27 @@ DASH_SECTIONS = [("risk", "Risk to look at", "Bad"), ("review", "Drafts to revie
                  ("homework", "Homework to check", "Accent"), ("goals", "Goals not worked on lately", "Muted")]
 
 
+# "CASE OVERVIEW", "# Case Overview — PT-01", "**CASE OVERVIEW: PT-01 (2026-11-13)**", but not a sentence
+_CASE_TITLE_RE = re.compile(r"^[\s#*_=\-]*case\s+overview\s*(?:(?:[:|(\-–—]|for\b)[^\n.!?]{0,40})?[\s#*_=\-)]*$",
+                            re.IGNORECASE)
+
+
+def strip_case_title(text):
+    """Drop the "CASE OVERVIEW" title line the model tends to put above CASE SNAPSHOT. It isn't one of
+    the template's sections, so it showed as an empty heading at the top of the Case overview tab."""
+    lines = (text or "").split("\n")
+    i = 0
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    if i < len(lines) and _CASE_TITLE_RE.match(lines[i].strip()):
+        rest = lines[i + 1:]
+        while rest and (not rest[0].strip() or set(rest[0].strip()) <= set("=-_*#")):
+            rest = rest[1:]                      # blank lines or an underline under the title
+        if any(x.strip() for x in rest):         # never leave an overview empty
+            return "\n".join(rest)
+    return text or ""
+
+
 def generate_case_overview(cfg, client, sessions, orientation, progress):
     """sessions: oldest-first list of session dicts."""
     hide = client_hider(client)
@@ -9040,6 +12304,7 @@ def generate_case_overview(cfg, client, sessions, orientation, progress):
             parts.append(f"{label.upper()}:\n{hide(d[key]).strip()}")
         if parts:
             blocks.append(f"=== {day_title(records)} — {fmt_date(day)} ===\n" + "\n\n".join(parts))
+    blocks = documents_blocks(client, hide) + blocks       # imported reports and records come first, as background
     text = "\n\n".join(blocks)
     max_chars = int(cfg.get("max_chars", 24000))
     if len(text) > max_chars:
@@ -9064,13 +12329,13 @@ def generate_case_overview(cfg, client, sessions, orientation, progress):
     else:
         source, kind = text, "all session documentation, in order"
     dates = [d.get("meta", {}).get("session_date", "") for d in sessions if d.get("meta", {}).get("session_date")]
-    return steps.run(len(groups), cfg, fill(read_template("case_overview.txt"), {
+    return strip_case_title(steps.run(len(groups), cfg, fill(read_template("case_overview.txt"), {
         "client_code": client.get("code", ""), "orientation": orientation or "not specified",
         "background": hide(client.get("background", "")).strip() or "(not provided)",
         "goals": hide(client.get("goals", "")).strip() or "(not provided)",
         "session_count": len(days),
         "date_range": f"{min(dates)} to {max(dates)}" if dates else "",
-        "source_kind": kind, "sessions": source}))
+        "source_kind": kind, "sessions": source})))
 
 
 def case_overview_documented_days(sessions):
@@ -9162,6 +12427,12 @@ CONTACT_NAMES = {"patient": ("Patient contact note", "Communication summary", "P
                  "other": ("Collateral contact note", "Conversation summary", "Collateral contact")}
 
 
+def is_contact_day(records):
+    """A date whose records are all outside-session contacts (contact notes) — shown in the Contact log, not the
+    session list."""
+    return bool(records) and all(d.get("meta", {}).get("kind") == "parent" for _, d in records)
+
+
 def contact_with(meta):
     """Who an outside-session contact was with; records from before this choice existed were with a parent."""
     w = (meta or {}).get("contact_with")
@@ -9208,6 +12479,201 @@ def doc_labels(meta):
     return KIND_LABELS.get((meta or {}).get("kind"), KIND_LABELS["progress"])
 
 
+# --------------------------------------------------------------------------- #
+# Windows Hello (fingerprint / face / Windows PIN) instead of typing the vault password — per computer.
+# A Windows Hello key (it never leaves Windows; only your fingerprint, face or PIN can use it) signs a fixed
+# random challenge; that signature locks a copy of the vault key, kept only on this computer
+# (%LOCALAPPDATA%\Session Scribe\hello.json), never in the shared data folder. If this PC's Windows Hello
+# doesn't sign the same way twice, it falls back to Windows' per-user encryption (DPAPI) behind a Windows
+# Hello check. The password always still works.
+# --------------------------------------------------------------------------- #
+HELLO_FILE = os.path.join(LOCAL_DIR, "hello.json")
+HELLO_PS1 = r'''param([string]$mode, [string]$name, [string]$arg)
+$ErrorActionPreference = 'Stop'
+try {
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+  $null = [Windows.Security.Credentials.KeyCredentialManager, Windows.Security.Credentials, ContentType = WindowsRuntime]
+  $null = [Windows.Security.Credentials.UI.UserConsentVerifier, Windows.Security.Credentials.UI, ContentType = WindowsRuntime]
+  $null = [Windows.Security.Cryptography.CryptographicBuffer, Windows.Security.Cryptography, ContentType = WindowsRuntime]
+  $m = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 }
+  $opT = ($m | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' })[0]
+  $actT = ($m | Where-Object { $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncAction' })[0]
+  function Await($op, [Type]$t) { $k = $opT.MakeGenericMethod($t).Invoke($null, @($op)); $k.Wait() | Out-Null; $k.Result }
+  $KCM = [Windows.Security.Credentials.KeyCredentialManager]
+  $UCV = [Windows.Security.Credentials.UI.UserConsentVerifier]
+  $CB = [Windows.Security.Cryptography.CryptographicBuffer]
+  $BUF = [System.Runtime.InteropServices.WindowsRuntime.WindowsRuntimeBufferExtensions]
+  # buffers Windows hands back arrive as plain COM objects that PowerShell won't pass on; reflection converts them
+  $ENC = $CB.GetMethod("EncodeToBase64String")
+  switch ($mode) {
+    'available' { "OK:" + (Await ($UCV::CheckAvailabilityAsync()) ([Windows.Security.Credentials.UI.UserConsentVerifierAvailability])) }
+    'create' {
+      $r = Await ($KCM::RequestCreateAsync($name, [Windows.Security.Credentials.KeyCredentialCreationOption]::ReplaceExisting)) ([Windows.Security.Credentials.KeyCredentialRetrievalResult])
+      if ($r.Status -ne 'Success') { "ERR:" + $r.Status } else { "OK:created" } }
+    'sign' {
+      $r = Await ($KCM::OpenAsync($name)) ([Windows.Security.Credentials.KeyCredentialRetrievalResult])
+      if ($r.Status -ne 'Success') { "ERR:" + $r.Status } else {
+        $s = Await ($r.Credential.RequestSignAsync($BUF::AsBuffer([Convert]::FromBase64String($arg)))) ([Windows.Security.Credentials.KeyCredentialOperationResult])
+        if ($s.Status -ne 'Success') { "ERR:" + $s.Status } else { "OK:" + $ENC.Invoke($null, @($s.Result)) } } }
+    'verify' { "OK:" + (Await ($UCV::RequestVerificationAsync($arg)) ([Windows.Security.Credentials.UI.UserConsentVerificationResult])) }
+    'delete' { $k = $actT.Invoke($null, @($KCM::DeleteAsync($name))); $k.Wait() | Out-Null; "OK:deleted" }
+  }
+} catch { "ERR:" + $_.Exception.Message }
+'''
+_HELLO_WORDS = {"UserCanceled": "Cancelled.", "Canceled": "Cancelled.", "NotFound": "This computer's Windows Hello key "
+                "is gone (Windows Hello was reset). Turn fingerprint unlock on again in Settings.",
+                "UserPrefersPassword": "Windows Hello wasn't used.", "SecurityDeviceLocked": "Windows Hello is "
+                "locked for now (too many tries). Use your password.", "NotConfiguredForUser": "Windows Hello isn't "
+                "set up for this Windows account (Settings ▸ Accounts ▸ Sign-in options).",
+                "DeviceNotPresent": "No fingerprint reader or camera was found.", "DeviceBusy": "Windows Hello is "
+                "busy — try again.", "RetriesExhausted": "Too many tries. Use your password.",
+                "DisabledByPolicy": "Windows Hello is turned off by policy on this computer."}
+
+
+def _hello_run(mode, name="", arg=""):
+    """Ask Windows Hello (through Windows PowerShell's WinRT access; nothing extra to install)."""
+    if not IS_WIN:
+        raise RuntimeError("Fingerprint unlock uses Windows Hello, which is only on Windows.")
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    path = os.path.join(LOCAL_DIR, "hello.ps1")
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            same = f.read() == HELLO_PS1
+    except OSError:
+        same = False
+    if not same:
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write(HELLO_PS1)
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path, mode, name or "_",
+                        arg or "_"], capture_output=True, text=True, timeout=180,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    lines = [l.strip() for l in (r.stdout or "").splitlines() if l.strip()]
+    last = next((l for l in reversed(lines) if l.startswith(("OK:", "ERR:"))), "")
+    if last.startswith("OK:"):
+        return last[3:]
+    why = last[4:] if last else ((r.stderr or "").strip()[-300:] or "no answer")
+    raise RuntimeError(_HELLO_WORDS.get(why, f"Windows Hello didn't work ({why})."))
+
+
+def _hello_front():
+    """Bring the Windows Hello prompt to the front (it can open behind the app)."""
+    if not IS_WIN:
+        return
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        for _ in range(60):
+            for title in ("Windows Security", "Windows-Sicherheit", "Sécurité Windows", "Seguridad de Windows"):
+                h = u.FindWindowW(None, title)
+                if h:
+                    u.ShowWindow(h, 5)
+                    u.SetForegroundWindow(h)
+                    return
+            time.sleep(0.2)
+    except Exception:
+        pass
+
+
+def _dpapi(data, protect=True):
+    """Windows' per-user encryption (only this Windows account on this computer can undo it)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    buf = ctypes.create_string_buffer(data, len(data))
+    inp, out = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), BLOB()
+    fn = ctypes.windll.crypt32.CryptProtectData if protect else ctypes.windll.crypt32.CryptUnprotectData
+    if not fn(ctypes.byref(inp), None, None, None, None, 0x1, ctypes.byref(out)):   # 0x1: never show UI
+        raise OSError("Windows couldn't " + ("protect" if protect else "read") + " the saved key.")
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(out.pbData)
+
+
+def _hello_wrap_key(signature, challenge):
+    return base64.urlsafe_b64encode(hashlib.sha256(b"session-scribe-hello\0" + challenge + signature).digest())
+
+
+def hello_state(vault_obj=None):
+    """This computer's Windows Hello setup for this vault, or None."""
+    try:
+        with open(HELLO_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if vault_obj is not None and st.get("vault") and st["vault"] != vault_obj.vault_id():
+        return None
+    return st
+
+
+def hello_available():
+    try:
+        return _hello_run("available") == "Available"
+    except Exception:
+        return False
+
+
+def hello_enroll(vault_obj):
+    """Set up fingerprint unlock (three Windows Hello prompts: create the key, then sign twice to check it
+    signs the same way). Returns the mode used."""
+    from cryptography.fernet import Fernet
+    key = vault_obj.raw_key()
+    if not key:
+        raise RuntimeError("Unlock the vault with your password first.")
+    name = "SessionScribe-" + secrets.token_hex(4)
+    _hello_run("create", name)
+    challenge = secrets.token_bytes(32)
+    c64 = base64.b64encode(challenge).decode()
+    s1 = base64.b64decode(_hello_run("sign", name, c64))
+    s2 = base64.b64decode(_hello_run("sign", name, c64))
+    if s1 == s2:
+        st = {"mode": "sign", "wrapped": Fernet(_hello_wrap_key(s1, challenge)).encrypt(key).decode()}
+    else:                                   # this PC's Hello signs differently each time: DPAPI + a Hello check
+        st = {"mode": "consent", "wrapped": base64.b64encode(_dpapi(key, True)).decode()}
+    st.update(version=1, name=name, challenge=c64, vault=vault_obj.vault_id(),
+              created=datetime.now().isoformat(timespec="seconds"))
+    os.makedirs(LOCAL_DIR, exist_ok=True)
+    tmp = HELLO_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f)
+    os.replace(tmp, HELLO_FILE)
+    return st["mode"]
+
+
+def hello_key(vault_obj=None):
+    """The vault key, after a Windows Hello check (raises RuntimeError with a plain message if it fails)."""
+    from cryptography.fernet import Fernet, InvalidToken
+    st = hello_state(vault_obj)
+    if not st:
+        raise RuntimeError("Fingerprint unlock isn't set up on this computer.")
+    if st.get("mode") == "sign":
+        sig = base64.b64decode(_hello_run("sign", st["name"], st["challenge"]))
+        try:
+            return Fernet(_hello_wrap_key(sig, base64.b64decode(st["challenge"]))).decrypt(st["wrapped"].encode())
+        except InvalidToken:
+            raise RuntimeError("Windows Hello answered, but the saved key didn't open. Turn fingerprint unlock off "
+                               "and on again in Settings.") from None
+    res = _hello_run("verify", "", "Unlock Session Scribe")
+    if res != "Verified":
+        raise RuntimeError(_HELLO_WORDS.get(res, f"Windows Hello didn't confirm it's you ({res})."))
+    return _dpapi(base64.b64decode(st["wrapped"]), False)
+
+
+def hello_disable():
+    st = hello_state()
+    if st and st.get("name"):
+        try:
+            _hello_run("delete", st["name"])
+        except Exception:
+            pass
+    try:
+        os.remove(HELLO_FILE)
+    except OSError:
+        pass
+
+
 def run_gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -9223,6 +12689,10 @@ def run_gui():
 
     cfg = load_config()
     vault = Vault(cfg["vault_dir"])
+    if engine_exe():                 # installer build: fit the AI and speech model to this computer (first start)
+        import atexit
+        atexit.register(lambda: _quiet(ENGINE.stop))
+        threading.Thread(target=lambda: _quiet(auto_tune, cfg), daemon=True).start()
 
     _dpi_aware()
     if IS_WIN:                       # its own taskbar button and icon (not grouped under "Python")
@@ -9238,11 +12708,11 @@ def run_gui():
         root.iconphoto(True, *root._icons)
     except Exception:
         pass
-    if IS_WIN and not cfg.get("shortcut_icon"):
+    if IS_WIN and (cfg.get("shortcut_icon") or 0) < APP_ICON_VERSION:
         def _icon_once():
             try:
                 if shortcut_icon_fix():
-                    cfg["shortcut_icon"] = 1
+                    cfg["shortcut_icon"] = APP_ICON_VERSION
                     save_config(cfg)
             except Exception:
                 pass
@@ -9459,6 +12929,26 @@ def run_gui():
         style.configure("TCheckbutton", background=p["bg"])
         style.configure("TRadiobutton", background=p["bg"])
         style.configure("Toolbutton", padding=(px(10), px(4)), background=p["bg"])
+        # Arrows and indicators: the theme sizes these in raw pixels, so with Windows display scaling they
+        # stayed tiny next to everything else. Sized with the rest of the app (and big enough for a finger).
+        for sb in ("TScrollbar", "Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(sb, arrowsize=px(17), arrowcolor=p["text"], background=p["surface2"],
+                            bordercolor=p["border"], lightcolor=p["surface2"], darkcolor=p["surface2"],
+                            gripcount=0)
+        style.map("TScrollbar", background=[("active", p["accent_soft"])])
+        style.configure("TCombobox", arrowsize=px(17))
+        style.map("TCombobox", fieldbackground=[("readonly", p["surface"]), ("disabled", p["surface2"])],
+                  foreground=[("readonly", p["text"]), ("disabled", p["muted"])],
+                  selectbackground=[("readonly", p["surface"])], selectforeground=[("readonly", p["text"])],
+                  background=[("active", p["accent_soft"]), ("readonly", p["surface"])])
+        style.configure("TSpinbox", arrowsize=px(14))
+        style.configure("TMenubutton", arrowsize=px(6), arrowpadding=px(8), arrowcolor=p["text"])
+        style.configure("Treeview", indicatorsize=px(15), foreground=p["text"])
+        style.configure("Item", indicatorsize=px(15), foreground=p["text"])
+        style.configure("TCheckbutton", indicatorsize=px(17), indicatormargin=(0, 0, px(8), 0),
+                        indicatorbackground=p["surface"], indicatorforeground=p["accent"])
+        style.configure("TRadiobutton", indicatorsize=px(17), indicatormargin=(0, 0, px(8), 0),
+                        indicatorbackground=p["surface"], indicatorforeground=p["accent"])
 
     _CARD = {"img": None}
 
@@ -9698,9 +13188,297 @@ def run_gui():
         if sc is not None:
             sc(e)
 
+    # ---- smooth scrolling: the wheel (and a touchpad) glide to where they're going ------------------
+    # Each notch moves the target; the view eases toward it a little every frame (~60 a second), fast at
+    # first and settling softly, instead of jumping a whole notch at once. Notches that come quickly
+    # add up, so a fast spin goes far but still glides.
+    WHEEL_PX = 100                     # how far one wheel notch goes (before scaling)
+    GLIDE_TAU = 0.07                   # seconds: smaller = snappier, larger = floatier
+
+    def _wheel_notches(e):
+        if getattr(e, "num", None) in (4, 5):
+            return 1.0 if e.num == 4 else -1.0
+        if IS_MAC:
+            return e.delta / 4.0
+        return e.delta / 120.0
+
+    def smooth_scroller(widget, get_top, set_top, get_range):
+        """A glide for one scrolling widget. get_top/set_top: the view's top in pixels; get_range: the
+        (lowest, highest) top it can have. Returns (add(pixels), stop())."""
+        st = {"pos": 0.0, "target": None, "job": None, "t": 0.0}
+
+        def stop():
+            if st["job"] is not None:
+                _quiet(widget.after_cancel, st["job"])
+            st["job"], st["target"] = None, None
+
+        def frame():
+            st["job"] = None
+            if st["target"] is None:
+                return
+            try:
+                if not widget.winfo_exists():
+                    return
+                now = time.monotonic()
+                dt = min(max(now - st["t"], 0.001), 0.05)
+                st["t"] = now
+                d = st["target"] - st["pos"]
+                if abs(d) <= 0.6:
+                    st["pos"] = st["target"]
+                    set_top(st["pos"])
+                    st["target"] = None
+                    return
+                step = d * (1.0 - math.exp(-dt / GLIDE_TAU))
+                if abs(step) < 0.6:
+                    step = math.copysign(min(0.6, abs(d)), d)
+                st["pos"] += step
+                _SCROLLING_UNTIL[0] = now + 0.25
+                set_top(st["pos"])
+                st["job"] = widget.after(15, frame)
+            except tk.TclError:
+                st["target"] = None
+
+        def add(dpx):
+            try:
+                if st["target"] is None:                # starting: from wherever the view is now
+                    st["pos"] = st["target"] = float(get_top())
+                    st["range"] = get_range()
+                lo, hi = st["range"]
+                st["target"] = min(max(st["target"] + dpx, float(lo)), float(max(hi, lo)))
+            except tk.TclError:
+                return
+            _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+            if st["job"] is None:
+                st["t"] = time.monotonic() - 0.016      # (move on this very event: no lag)
+                frame()
+        return add, stop
+
+    def _text_wheel(e):
+        """Text boxes glide too. One that has nothing to scroll passes the wheel to the page around it."""
+        t = e.widget
+        try:
+            a, b = t.yview()
+        except (tk.TclError, AttributeError):
+            return None
+        if a <= 0.0 and b >= 1.0:
+            sc = _find_scroll_canvas(getattr(t, "master", None))
+            if sc is not None:
+                sc(e)
+            return "break"
+        sm = getattr(t, "_smooth", None)
+        if sm is None:
+            box = {"done": 0}                          # pixels moved since this glide began
+
+            def get_top():
+                box["done"] = 0
+                return 0.0
+
+            def set_top(p):
+                n = int(round(p)) - box["done"]
+                if n:
+                    t.yview_scroll(n, "pixels")
+                    box["done"] += n
+
+            def get_range():
+                # how far it can go either way, measured from where this glide began
+                a_, b_ = t.yview()
+                total = max(t.winfo_height(), 1) / max(b_ - a_, 1e-6)
+                return -a_ * total, (1.0 - b_) * total
+            add, stop = smooth_scroller(t, get_top, set_top, get_range)
+            sm = t._smooth = {"add": add, "stop": stop}
+        sm["add"](-_wheel_notches(e) * px(WHEEL_PX * 0.8))
+        return "break"
+    root.bind_class("Text", "<MouseWheel>", _text_wheel)
+
     root.bind_all("<MouseWheel>", _global_wheel, add="+")
     root.bind_all("<Button-4>", _global_wheel, add="+")
     root.bind_all("<Button-5>", _global_wheel, add="+")
+
+    # ---- touchscreens: drag with a finger to scroll, flick to keep it gliding --------------------------
+    # Windows hands Tk a finger as a mouse, so a drag would select text or press buttons instead of
+    # scrolling. Mouse events that came from a finger or pen carry a mark (GetMessageExtraInfo); those
+    # drags scroll the nearest scrollable area instead. Settings › Touchscreen scrolling can also make
+    # every drag scroll (if a screen isn't recognized) or turn this off.
+    TOUCH = {"on": False, "pan": False, "w": None, "view": None, "y0": 0, "y": 0, "pos": 0.0, "v": 0.0,
+             "t": 0.0, "job": None, "replay": False, "press": None, "flush": None, "flush_view": None}
+    _NO_PAN = {"TScrollbar", "Scrollbar", "TScale", "Scale", "Panedwindow", "TPanedwindow", "Menu"}
+
+    def _from_finger():
+        mode = cfg.get("touch_scroll") or "auto"
+        if mode == "off":
+            return False
+        if mode == "on":
+            return True
+        if not IS_WIN:
+            return False
+        try:
+            import ctypes
+            f = ctypes.windll.user32.GetMessageExtraInfo
+            f.restype = ctypes.c_ssize_t
+            return (f() & 0xFFFFFF00) == 0xFF515700        # MI_WP_SIGNATURE: touch or pen
+        except Exception:
+            return False
+
+    def _pan_view(w):
+        """The nearest area under w that can scroll (vertically) right now."""
+        cur = w
+        while cur is not None:
+            view = getattr(cur, "_touch_view", None)
+            try:
+                if view is None and cur.winfo_class() in ("Text", "Listbox", "Treeview"):
+                    view = cur
+                if view is not None:
+                    a, b = view.yview()
+                    if a > 0.0 or b < 1.0:
+                        return view
+            except (tk.TclError, AttributeError, TypeError):
+                pass
+            cur = getattr(cur, "master", None)
+        return None
+
+    def _glide_stop():
+        if TOUCH["job"] is not None:
+            _quiet(root.after_cancel, TOUCH["job"])
+            TOUCH["job"] = None
+
+    def _pan_flush():
+        """Move the view once to where the finger has got to. A touchscreen sends far more moves than
+        the screen can redraw; moving on every one made the page's text tear and smear while its
+        widgets were still repainting (the mouse wheel already moves once per idle pass the same way)."""
+        TOUCH["flush"] = None
+        view = TOUCH["flush_view"]
+        if view is None:
+            return
+        try:
+            if view.winfo_exists():
+                _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+                view.yview_moveto(TOUCH["pos"])
+        except tk.TclError:
+            pass
+
+    def _pan_to(view, pos):
+        a, b = view.yview()
+        TOUCH["pos"] = max(0.0, min(pos, 1.0 - (b - a)))
+        _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+        TOUCH["flush_view"] = view
+        if TOUCH["flush"] is None:
+            TOUCH["flush"] = root.after_idle(_pan_flush)
+
+    def _pan_by(view, dy):
+        """Move the content with the finger: dy pixels down shows what's above."""
+        a, b = view.yview()
+        _pan_to(view, TOUCH["pos"] - (b - a) * dy / max(1, view.winfo_height()))
+
+    def _touch_begin(w, e):
+        _glide_stop()
+        cur = w                                        # a finger takes over from a wheel glide
+        while cur is not None:
+            st_ = getattr(getattr(cur, "_touch_view", None), "_smooth_stop", None)
+            if st_:
+                _quiet(st_)
+                break
+            cur = getattr(cur, "master", None)
+        if TOUCH["replay"] or not isinstance(w, tk.Misc) or not _from_finger():
+            TOUCH["on"] = False
+            return False
+        try:
+            if w.winfo_class() in _NO_PAN:
+                return False
+        except tk.TclError:
+            return False
+        view = _pan_view(w)
+        if view is None:
+            return False
+        TOUCH.update(on=True, pan=False, w=w, view=view, y0=e.y_root, y=e.y_root, v=0.0, t=time.monotonic(),
+                     pos=view.yview()[0], press=None)
+        tags = w.bindtags()
+        if "TouchPan" not in tags:                    # its motion/release go to TouchPan first (below)
+            w.bindtags(("TouchPan",) + tags)
+            w._touch_tag_added = True
+        return True
+
+    def _touch_press_any(e):                          # any widget: the press itself goes through as usual
+        _touch_begin(e.widget, e)
+    root.bind_all("<ButtonPress-1>", _touch_press_any, add="+")
+
+    def _touch_press_list(e):
+        """Lists: a finger only selects a row when it lifts without scrolling (so scrolling the patient
+        list doesn't open whoever was under the finger)."""
+        if TOUCH["replay"]:
+            return None
+        if _touch_begin(e.widget, e):
+            TOUCH["press"] = (e.x, e.y)
+            return "break"
+        return None
+
+    def _touch_motion(e):
+        if not TOUCH["on"] or e.widget is not TOUCH["w"]:
+            return None
+        if not TOUCH["pan"]:
+            if abs(e.y_root - TOUCH["y0"]) < px(10):
+                return "break" if TOUCH["press"] else None
+            TOUCH["pan"] = True                        # it's a scroll, not a tap: undo the press
+            w = TOUCH["w"]
+            _quiet(lambda: w.state(["!pressed", "!active"]))
+            try:
+                if w.winfo_class() == "Text":
+                    w.tag_remove("sel", "1.0", "end")
+            except tk.TclError:
+                pass
+            TOUCH["y"] = e.y_root
+        dy = e.y_root - TOUCH["y"]
+        now = time.monotonic()
+        dt = max(now - TOUCH["t"], 1e-3)
+        TOUCH["v"] = 0.6 * TOUCH["v"] + 0.4 * (dy / dt)      # pixels a second, smoothed
+        TOUCH["y"], TOUCH["t"] = e.y_root, now
+        _quiet(_pan_by, TOUCH["view"], dy)
+        return "break"
+
+    def _glide():
+        TOUCH["job"] = None
+        view = TOUCH["view"]
+        TOUCH["v"] *= 0.94
+        if abs(TOUCH["v"]) < px(40) or view is None or not view.winfo_exists():
+            return
+        _quiet(_pan_by, view, TOUCH["v"] * 0.016)
+        TOUCH["job"] = root.after(16, _glide)
+
+    def _touch_release(e):
+        if TOUCH["replay"] or not TOUCH["on"] or e.widget is not TOUCH["w"]:
+            return None
+        w, panned, press = TOUCH["w"], TOUCH["pan"], TOUCH["press"]
+        TOUCH.update(on=False, pan=False, press=None)
+        if getattr(w, "_touch_tag_added", False):     # put its bindings back as they were
+            w._touch_tag_added = False
+            root.after_idle(lambda: _quiet(lambda: w.bindtags(tuple(t for t in w.bindtags() if t != "TouchPan"))))
+        if panned:
+            if time.monotonic() - TOUCH["t"] < 0.08 and abs(TOUCH["v"]) > px(250):
+                TOUCH["job"] = root.after(16, _glide)
+            return "break"
+        if press:                                     # a tap on a list: select the row now
+            TOUCH["replay"] = True
+            try:
+                w.event_generate("<ButtonPress-1>", x=press[0], y=press[1])
+                w.event_generate("<ButtonRelease-1>", x=press[0], y=press[1])
+            finally:
+                TOUCH["replay"] = False
+            return "break"
+        return None
+
+    root.bind_class("TouchPan", "<B1-Motion>", _touch_motion)
+    root.bind_class("TouchPan", "<ButtonRelease-1>", _touch_release)
+    root.bind_class("TouchPan", "<ButtonPress-1>", _touch_press_list)
+
+    def _lists_take_touch(e):                         # lists get TouchPan first from the start (see above)
+        w = e.widget
+        try:
+            tags = w.bindtags()
+            if "TouchPan" not in tags:
+                w.bindtags(("TouchPan",) + tags)
+        except (tk.TclError, AttributeError):
+            pass
+    root.bind_class("Treeview", "<Map>", _lists_take_touch, add="+")
+    root.bind_class("Listbox", "<Map>", _lists_take_touch, add="+")
 
     def _realize_tree(widget, width_hint):
         """Synchronously realize all Flow layouts and wraplengths inside widget before first paint."""
@@ -9717,6 +13495,7 @@ def run_gui():
 
         def _sb_cmd(*args):
             _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
+            _quiet(lambda: canvas._smooth_stop())        # the scrollbar takes over from a glide
             canvas.yview(*args)
 
         sb = ttk.Scrollbar(outer, orient="vertical", command=_sb_cmd)
@@ -9752,38 +13531,33 @@ def run_gui():
 
         inner.bind("<Configure>", _on_inner_conf)
         canvas.bind("<Configure>", _on_canvas_conf)
-        canvas.configure(yscrollcommand=sb.set, yscrollincrement=px(2))
+        canvas.configure(yscrollcommand=sb.set, yscrollincrement=1)     # (1 px: the glide moves finely)
         sb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        wheel_state = {"steps": 0.0, "job": None}
-        step_px = max(1, px(2))
+        def _content_h():
+            try:
+                return max(float(str(canvas.cget("scrollregion")).split()[3]), 1.0)
+            except (IndexError, ValueError, tk.TclError):
+                return max(float(inner.winfo_reqheight()), 1.0)
 
-        def wheel_flush():
-            wheel_state["job"] = None
-            n = int(wheel_state["steps"])
-            wheel_state["steps"] -= n
-            if n and canvas.winfo_exists():
-                _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
-                canvas.yview_scroll(n, "units")
+        def _set_top(p):
+            canvas.yview_moveto(p / _content_h())
+
+        glide, glide_stop = smooth_scroller(
+            canvas, lambda: canvas.yview()[0] * _content_h(), _set_top,
+            lambda: (0.0, _content_h() - canvas.winfo_height()))
+        canvas._smooth_stop = glide_stop
 
         def wheel(e):
             if not canvas.winfo_exists() or canvas.yview() == (0.0, 1.0):
                 return
-            if e.num in (4, 5):
-                notches = 1.0 if e.num == 4 else -1.0
-            elif IS_MAC:
-                notches = e.delta / 4.0
-            else:
-                notches = e.delta / 120.0
-            _SCROLLING_UNTIL[0] = time.monotonic() + 0.25
-            wheel_state["steps"] -= (notches * px(72)) / step_px
-            if wheel_state["job"] is None:
-                wheel_state["job"] = canvas.after_idle(wheel_flush)
+            glide(-_wheel_notches(e) * px(WHEEL_PX))
 
         outer._scroll_wheel = wheel
         canvas._scroll_wheel = wheel
         inner._scroll_wheel = wheel
+        outer._touch_view = canvas._touch_view = inner._touch_view = canvas      # finger scrolling (below)
 
         def realize_all():
             """Force Tk to lay out, map, and rasterize the entire page (including offscreen sections
@@ -9811,7 +13585,21 @@ def run_gui():
                     canvas.update_idletasks()
             except tk.TclError:
                 pass
+            canvas._realized = True
+            apply_restore()
 
+        def apply_restore():
+            """Scroll to the spot a rebuilt page asked to keep (canvas._restore_y, in pixels from the top)."""
+            y = getattr(canvas, "_restore_y", None)
+            if not y or not canvas.winfo_exists():
+                return
+            try:
+                h = max(inner.winfo_reqheight(), 1)
+                canvas.yview_moveto(min(max(y / h, 0.0), 1.0))
+            except tk.TclError:
+                pass
+
+        canvas._apply_restore = apply_restore
         outer.realize_all = realize_all
         inner.realize_all = realize_all
         canvas.after_idle(realize_all)
@@ -9903,9 +13691,26 @@ def run_gui():
 
         def _on_conf(self, e):
             if time.monotonic() < _SCROLLING_UNTIL[0]:
+                # not while scrolling — but look again once it settles, so a size change that came
+                # during it (a page still laying itself out) isn't lost
+                if not getattr(self, "_retry", None):
+                    wait = int((_SCROLLING_UNTIL[0] - time.monotonic()) * 1000) + 60
+                    self._retry = self.after(max(wait, 60), self._retry_conf)
                 return
             if e.width > 1 and e.width != self._lastw:
                 self._lastw = e.width
+                self._schedule()
+
+        def _retry_conf(self):
+            self._retry = None
+            if not self.winfo_exists():
+                return
+            if time.monotonic() < _SCROLLING_UNTIL[0]:
+                self._retry = self.after(120, self._retry_conf)
+                return
+            w = self.winfo_width()
+            if w > 1 and w != self._lastw:
+                self._lastw = w
                 self._schedule()
 
         def _reflow(self, width_hint=None):
@@ -10478,6 +14283,81 @@ def run_gui():
         pw1.bind("<Return>", submit)
         pw2.bind("<Return>", submit)
         pw1.focus_set()
+        if not creating and hello_state(vault):
+            def accept(key):
+                if vault.unlock_key(key):
+                    frame.destroy()
+                    on_ok()
+                    return True
+                return False
+
+            def say(text, bad=False):
+                msg.config(text=text, style="Bad.TLabel" if bad else "Muted.TLabel")
+
+            def give_up(text):
+                say(text, True)
+                pw1.focus_set()
+            auto, again = hello_flow(lambda: frame.winfo_exists(), accept, say, give_up)
+            hb = hello_button(frame, again)
+            hb.pack(fill="x", pady=(px(8), 0), ipady=px(3))
+            frame._hello = again
+            frame.after(400, auto)                       # ask for the fingerprint straight away
+
+    HELLO_TRIES = 3
+
+    def hello_flow(alive, accept, say, give_up, tries=HELLO_TRIES):
+        """Windows Hello for an unlock screen: asks right away, tries again after a failed scan (up to `tries`
+        times, never after Cancel), then hands over to the password. Returns (start, start_again)."""
+        st = {"n": 0, "busy": False}
+
+        def attempt():
+            if st["busy"] or not alive():
+                return
+            st["busy"] = True
+            st["n"] += 1
+            say("Waiting for your fingerprint…" + (f" (try {st['n']} of {tries})" if st["n"] > 1 else ""))
+
+            def done(key, err):
+                st["busy"] = False
+                if not alive():
+                    return
+                if key and accept(key):
+                    return
+                cancelled = (err or "").startswith("Cancelled")
+                if not cancelled and st["n"] < tries:
+                    say((err or "That didn't work.") + " Trying again…", True)
+                    root.after(700, attempt)
+                    return
+                give_up(("Cancelled — " if cancelled else ((err or "Fingerprint didn't work.") + " "))
+                        + "type your password instead.")
+            hello_async(done)
+
+        def again():                                   # the fingerprint button: a fresh set of tries
+            st["n"] = 0
+            attempt()
+        return attempt, again
+
+    def hello_button(parent, cmd):
+        return ttk.Button(parent, text="👆  Use fingerprint (Windows Hello)", command=cmd)
+
+    def hello_async(on_done, vault_obj=None):
+        """Ask Windows Hello for the vault key without freezing the window; on_done(key, error_text)."""
+        box = {}
+
+        def work():
+            try:
+                box["key"] = hello_key(vault_obj or vault)
+            except Exception as e:
+                box["err"] = str(e) or e.__class__.__name__
+        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=_hello_front, daemon=True).start()
+
+        def poll():
+            if "key" in box or "err" in box:
+                on_done(box.get("key"), box.get("err"))
+            else:
+                root.after(150, poll)
+        root.after(150, poll)
 
     # ================================================================= App
     class App:
@@ -10676,7 +14556,7 @@ def run_gui():
                 side="left", padx=px(14))
             hdr_btns = Flow(header, align="right", gap=px(8))
             hdr_btns.pack(side="right", fill="x", expand=True)
-            self.queue_btn = hdr_btns.add(ttk.Button(hdr_btns, text="🎙  Queue recordings",
+            self.queue_btn = hdr_btns.add(ttk.Button(hdr_btns, text="🎙  Queue",
                                                      command=lambda: self.open_queue(self.client_id)))
             hdr_btns.add(ttk.Button(hdr_btns, text="⚙  Settings", command=self.open_setup))
             hdr_btns.add(ttk.Button(hdr_btns, text="🔒  Lock", command=self.lock))
@@ -10736,8 +14616,9 @@ def run_gui():
             items = [("Speech engine", engine_installed()),
                      ("FFmpeg", ffmpeg_installed()),
                      ("Speech models", ms["whisper"] and ms["align"] is not False and ms["speaker"] is not False),
-                     ("Speaker labels", bool(self.settings.get("hf_token")) or None),
-                     ("LM Studio", isinstance(self.lm_status, list) and bool(self.lm_status)
+                     ("Speaker labels", speakers_on(self.settings.get("hf_token")) or None),
+                     ("AI" if ai_engine(cfg) == "builtin" else "LM Studio",
+                      isinstance(self.lm_status, list) and bool(self.lm_status)
                       if self.lm_status is not None else None)]
             # Only problems are shown. Working parts, optional extras (speaker labels) and checks still
             # running stay hidden, so the top of the window is quiet when everything is fine.
@@ -11629,7 +15510,7 @@ def run_gui():
                      "Pick the patient on the left, then click ＋ New session. You'll be walked "
                      "through it one step at a time, and each note builds on the previous ones. Have several "
                      "recordings? Queue them and let them run while you're away.",
-                     ("🎙  Queue recordings…", lambda: self.open_queue())),
+                     ("🎙  Queue…", lambda: self.open_queue())),
                 ]
                 words = {2: "Two", 3: "Three"}
                 ttk.Label(f, text=(f"{n_pat} patient{'s' if n_pat != 1 else ''} in your vault. " if n_pat else "")
@@ -11654,8 +15535,12 @@ def run_gui():
                                   + ("FileVault" if IS_MAC else "BitLocker") + " (disk encryption). Always "
                                   "review drafts before they go in the EHR.",
                           style="Caption.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(18), 0))
+            self.show(build, is_home=True, home_key=self._home_key())
+
+        def _home_key(self):
+            """When Home can be shown as it is (anything that changes it changes this)."""
             with vault.one_look():
-                hkey = (
+                return (
                     vault.signature(),
                     date.today().isoformat(),
                     getattr(self, "setup_ok", None),
@@ -11663,7 +15548,19 @@ def run_gui():
                     getattr(THEME, "get", lambda _k: None)("mode"),
                     tuple(sorted(self._get_dash_collapsed())),
                 )
-            self.show(build, is_home=True, home_key=hkey)
+
+        def home_update(self, dkeys, hidden_delta=0):
+            """After Hide / ✕ / a ticked follow-up: take just those items off Home (no rebuild). Falls back to
+            redrawing Home where it can't (Home isn't the page on screen)."""
+            f = getattr(self, "_home_page_frame", None)
+            fn = getattr(f, "_dash_remove", None) if f is not None and self._alive(f) else None
+            if fn is not None and self._page_is_home_now() and self.page is f:
+                fn(list(dkeys), hidden_delta)
+                self._home_page_key = self._home_key()        # the page on screen is current: reuse it
+                return True
+            if not self.client_id and not self.wizard:
+                self.show_home_keep_scroll()
+            return False
 
         # ===================================================== client dialog
         def client_dialog(self, client=None):
@@ -11679,10 +15576,20 @@ def run_gui():
             ttk.Label(f, text="Something like initials + number (e.g. JD-07). Avoid full names.",
                       style="Muted.TLabel").grid(row=1, column=0, sticky="w")
             ttk.Entry(f, textvariable=code_var).grid(row=2, column=0, sticky="ew", pady=(2, 10))
-            ttk.Label(f, text="Names to hide from the AI", style="H2.TLabel").grid(row=3, column=0, sticky="w")
-            ttk.Label(f, text="One per line (or separated by ;) as  Name, Placeholder  — e.g.  Danielle, Patient  "
-                              "and  John, Husband.  Danielle becomes [Patient] and John becomes [Husband] before "
-                              "the AI sees anything. Include schools, workplaces and towns too.",
+            nhead = ttk.Frame(f)
+            nhead.grid(row=3, column=0, sticky="ew")
+            ttk.Label(nhead, text="Names", style="H2.TLabel").pack(side="left")
+            hide_var = tk.BooleanVar(value=bool(c.get("hide_names")) or not _AI_NAMES["on"])
+            hide_cb = ttk.Checkbutton(nhead, text="Keep names hidden from the AI for this patient", variable=hide_var)
+            hide_cb.pack(side="right")
+            if not _AI_NAMES["on"]:
+                hide_cb.config(state="disabled")         # hidden for everyone (Settings)
+            ttk.Label(f, text="One per line (or separated by ;) as  Name, Role  — e.g.  Danielle, Patient  and  "
+                              "John, Husband.  The AI on this computer reads names as they are, so notes say who "
+                              "said and did what" + ("" if _AI_NAMES["on"] else " (now off for everyone: Settings › "
+                              "Patient names for the AI)") + ". When names are hidden, Danielle becomes [Patient] and "
+                              "John [Husband] before the AI sees anything — include schools, workplaces and towns "
+                              "then. Names are always hidden in the supervision packet.",
                       style="Muted.TLabel", wraplength=px(580), justify="left").grid(row=4, column=0, sticky="w")
             nfr, names_txt = scrolled_text(f, height=4)
             nfr.grid(row=5, column=0, sticky="ew", pady=(2, 0))
@@ -11692,10 +15599,12 @@ def run_gui():
 
             def update_preview(_=None):
                 pairs = parse_name_map(get_text(names_txt))
-                preview.config(text=("Will replace:  " + "   ·   ".join(f"{n} → {p}" for n, p in pairs))
-                               if pairs else "Nothing to replace yet.")
+                verb = "When hidden, replaces" if not hide_var.get() else "Will replace"
+                preview.config(text=(f"{verb}:  " + "   ·   ".join(f"{n} → {p}" for n, p in pairs))
+                               if pairs else "No names listed yet.")
                 names_txt.edit_modified(False)
             names_txt.bind("<<Modified>>", update_preview)
+            hide_cb.config(command=update_preview)
             update_preview()
             ttk.Label(f, text="Treatment goals", style="H2.TLabel").grid(row=7, column=0, sticky="w")
             gfr, goals = scrolled_text(f, height=3)
@@ -11720,6 +15629,8 @@ def run_gui():
                        for x in vault.list_clients()):
                     return messagebox.showinfo(APP_NAME, "Another patient already uses that code.", parent=win)
                 pairs = parse_name_map(get_text(names_txt))
+                if _AI_NAMES["on"]:
+                    c["hide_names"] = bool(hide_var.get())
                 c.update(code=code, names_format=2,
                          names_to_hide="\n".join(f"{n}, {p.strip('[]')}" for n, p in pairs),
                          goals=get_text(goals).strip(), background=get_text(bg).strip())
@@ -11756,8 +15667,25 @@ def run_gui():
                 sessions = vault.sessions_for(cid)          # oldest first
                 if followups_sync(client, sessions):        # contact notes' "Follow-up:" lists → the checklist
                     _quiet(vault.save_client, client)
+                if self.repair_word_xml(client, sessions):  # imports read before the .docx fix
+                    client = vault.load_client(cid)
+                    sessions = vault.sessions_for(cid)
+                if resplit_contacts(client.get("communications") or []):   # threads logged before date-splitting
+                    _quiet(vault.save_client, client)
                 self._sig = vault.signature()              # what's on screen is current
             self.show(lambda f: self._client_page(f, client, sessions, select))
+
+        def refresh_client_page(self, cid, select=None):
+            """Show a change on the patient page that's open by redrawing just its list and open tab; any other
+            time (another page is showing) open the patient as usual."""
+            f = self.page
+            if (f is not None and self._alive(f) and getattr(f, "_client_id", None) == cid and self.client_id == cid
+                    and not self.wizard and getattr(f, "_refresh", None)):
+                self._sig = vault.signature()
+                f._refresh(select)
+                return True
+            self.open_client(cid, select=select)
+            return False
 
         def _client_page(self, f, client, sessions, select):
             top = ttk.Frame(f)
@@ -11769,9 +15697,13 @@ def run_gui():
             ttk.Label(name_row, text=client.get("code", ""), style="Title.TLabel").pack(side="left")
             if client.get("archived"):
                 ttk.Label(name_row, text="🗄  Archived", style="ChipWarn.TLabel").pack(side="left", padx=px(10))
+            if client.get("termination"):
+                ttk.Label(name_row, text=f"Terminated {fmt_date(client['termination'].get('date', ''))}",
+                          style="ChipMuted.TLabel").pack(side="left", padx=px(6))
             days = group_by_date(sessions)
-            last = days[-1][0] if days else ""
-            ttk.Label(titles, text=f"{len(days)} session{'s' if len(days) != 1 else ''}"
+            s_days = [x for x in days if not is_contact_day(x[1])]     # (contacts are counted in the Contact log)
+            last = s_days[-1][0] if s_days else ""
+            ttk.Label(titles, text=f"{len(s_days)} session{'s' if len(s_days) != 1 else ''}"
                                    + (f"  ·  last seen {fmt_date(last)}" if last else ""),
                       style="Muted.TLabel").pack(anchor="w")
             pbtns = Flow(top, align="right")
@@ -11786,7 +15718,7 @@ def run_gui():
             wmenu.add_command(label="✉  Letter…", command=lambda: self.letter_dialog(client))
             wmenu.add_command(label="＋  External communication…", command=lambda: self.external_comm(client))
             wmenu.add_separator()
-            wmenu.add_command(label="Import past notes…", command=lambda: self.import_dialog(client))
+            wmenu.add_command(label="Import document…", command=lambda: self.import_dialog(client))
             write["menu"] = wmenu
             pbtns.add(write)
             nfiles = len(client.get("files") or [])
@@ -11795,6 +15727,7 @@ def run_gui():
             menu.add_command(label="Edit patient…", command=lambda: self.edit_client(client))
             menu.add_command(label=f"📎  Files ({nfiles})…" if nfiles else "📎  Files…",
                              command=lambda: self.patient_files(client))
+            menu.add_command(label="📄  Termination letter…", command=lambda: self.termination_dialog(client))
             menu.add_command(label="⤓  Export…", command=lambda: self.export_all(client))
             menu.add_separator()
             menu.add_command(label="Queue recordings for this patient…", command=lambda: self.open_queue(client["id"]))
@@ -11926,7 +15859,30 @@ def run_gui():
                 items.append(("insights", None))
                 flags = self.insight_flags(client, sessions)
                 lb.insert("end", "📈  Progress & risk" + (f"  · {flags}" if flags else ""))
+                items.append(("assess", None))
+                n_as = len([m for m in client.get("measures") or [] if m.get("id") not in
+                            {a.get("measure_id") for a in client.get("assessments") or []}]) + \
+                    len(client.get("assessments") or [])
+                lb.insert("end", "🧾  Assessments" + (f"  · {n_as}" if n_as else ""))
+                docs = client.get("documents") or []
+                if docs:
+                    items.append(("docs", None))
+                    lb.insert("end", f"📁  Documents  · {len(docs)}")
+                if client.get("registration_info") or any(x.get("kind") == "registration"
+                                                          for x in client.get("files") or []):
+                    items.append(("reg", None))
+                    lb.insert("end", "🗂  Registration" + ("" if client.get("registration_info") else "  · not read yet"))
+                n_contacts = len(client.get("communications") or []) + \
+                    sum(1 for _, d in sessions if d["meta"].get("kind") == "parent")
+                items.append(("comms", None))                  # always there: the patient's contact history
+                lb.insert("end", "📞  Contact log" + (f"  · {n_contacts}" if n_contacts else ""))
+                term = client.get("termination")
+                if term:                                     # only once a letter has been filled out
+                    items.append(("term", None))
+                    lb.insert("end", f"📄  Termination  · {fmt_date(term.get('date', ''))}")
                 for day, records in (reversed(days) if newest_first() else days):
+                    if is_contact_day(records):
+                        continue                               # outside-session contacts live in the Contact log
                     items.append(("day", day))
                     n_docs = len(day_docs(records))
                     imported_only = all(d["meta"].get("source") == "imported" for _, d in records)
@@ -11954,8 +15910,19 @@ def run_gui():
                         self._render_day(viewer, client, val["day"], dict(days)[val["day"]],
                                          focus=(val["sid"], val["key"]), query=q)
                     return
-                self.view_select = kind if kind in ("case", "plan", "ask", "insights") else f"day:{val}"
-                if kind == "ask":
+                self.view_select = kind if kind in ("case", "plan", "ask", "insights", "assess", "term", "comms",
+                                                    "docs", "reg") else f"day:{val}"
+                if kind == "reg":
+                    self._render_registration(viewer, client, sessions)
+                elif kind == "docs":
+                    self._render_docs(viewer, client, sessions)
+                elif kind == "comms":
+                    self._render_comms(viewer, client, sessions)
+                elif kind == "assess":
+                    self._render_assessments(viewer, client, sessions)
+                elif kind == "term":
+                    self._render_termination(viewer, client, sessions)
+                elif kind == "ask":
                     self._render_ask(viewer, client, sessions)
                 elif kind == "insights":
                     self._render_insights(viewer, client, sessions)
@@ -12017,30 +15984,71 @@ def run_gui():
             f._search = {"var": q_var, "run": do_search, "list": lb, "items": items, "state": state}
             fill_list()
 
+            def pick(select):
+                s_d = [x for x in days if not is_contact_day(x[1])]
+                latest = s_d[-1][0] if s_d else None            # open on the most recent session
+                idx = next((i for i, it in enumerate(items) if it == ("day", latest)), min(1, len(items) - 1))
+                if select == "plan":
+                    idx = 1
+                elif select == "ask" or (isinstance(select, str) and select.startswith("ask:")):
+                    idx = 2
+                elif select == "insights" or (isinstance(select, str) and select.startswith("insights:")):
+                    if isinstance(select, str) and select.startswith("insights:"):
+                        self._insight_tab = select[9:]
+                    idx = 3
+                elif select in ("assess", "term", "comms", "docs", "reg"):
+                    idx = next((i for i, it in enumerate(items) if it[0] == select), idx)
+                elif select == "case" or (select is None and client.get("case_overview")):
+                    idx = 0
+                elif select:
+                    want = select[4:] if str(select).startswith("day:") else \
+                        next((d["meta"].get("session_date") for sid, d in sessions if sid == select), None)
+                    if want and is_contact_day(dict(days).get(want, [])):     # a contact note: in the Contact log
+                        self._contact_focus = ("day", want)
+                        idx = next((i for i, it in enumerate(items) if it[0] == "comms"), idx)
+                    else:
+                        idx = next((i for i, it in enumerate(items) if it[1] == want), idx)
+                return idx
+
+            def refresh_in_place(select=None):
+                """After a change on one tab (an assessment, document or message removed…): reload this patient
+                and redraw only the list on the left and the open tab — not the whole page."""
+                nonlocal client, sessions, days, dups, dup_days
+                client = vault.load_client(client["id"])
+                sessions = vault.sessions_for(client["id"])
+                days = group_by_date(sessions)
+                dups = duplicate_numbers(sessions)
+                dup_days = {d_ for ds in dups.values() for d_ in ds}
+                if state["query"]:
+                    state["results"] = search_patient(client, sessions, state["query"])
+                top_ = lb.yview()[0]
+                fill_list()
+                if not items:
+                    return
+                i_ = min(pick(select), len(items) - 1)
+                lb.yview_moveto(top_)                       # the list stays where it was
+                lb.selection_set(i_)
+                lb.see(i_)
+                render(i_)
+            f._refresh = refresh_in_place
+            f._client_id = client["id"]
+
+            if not sessions and any(it[0] == select for it in items if select in ("assess", "term", "comms", "docs",
+                                                                                  "reg")):
+                idx = next(i for i, it in enumerate(items) if it[0] == select)
+                lb.selection_set(idx)
+                lb.see(idx)
+                render(idx)
+                return
             if not sessions:
                 for w in viewer.winfo_children():
                     w.destroy()
                 ttk.Label(viewer, text="No sessions yet", style="H2.TLabel").pack(anchor="w", pady=(20, 4))
-                ttk.Label(viewer, text="Click ＋ New session to add the first recording, or Write ▸ Import past notes… "
+                ttk.Label(viewer, text="Click ＋ New session to add the first recording, or Write ▸ Import document… "
                                        "to bring in notes you've already written.", wraplength=px(560), justify="left",
                           style="Muted.TLabel").pack(anchor="w")
                 return
-            latest = days[-1][0] if days else None          # open on the most recent session
-            idx = next((i for i, it in enumerate(items) if it == ("day", latest)), min(1, len(items) - 1))
-            if select == "plan":
-                idx = 1
-            elif select == "ask" or (isinstance(select, str) and select.startswith("ask:")):
-                idx = 2
-            elif select == "insights" or (isinstance(select, str) and select.startswith("insights:")):
-                if isinstance(select, str) and select.startswith("insights:"):
-                    self._insight_tab = select[9:]
-                idx = 3
-            elif select == "case" or (select is None and client.get("case_overview")):
-                idx = 0
-            elif select:
-                want = select[4:] if str(select).startswith("day:") else \
-                    next((d["meta"].get("session_date") for sid, d in sessions if sid == select), None)
-                idx = next((i for i, it in enumerate(items) if it[1] == want), idx)
+            idx = pick(select)
             lb.selection_set(idx)
             lb.see(idx)
             render(idx)
@@ -12248,7 +16256,9 @@ def run_gui():
                 self._ask_view["show"]((question, "", self.waiting_text(("ask", client["id"]))))
 
         def _render_case(self, v, client, sessions, query=None):
-            case = client.get("case_overview") or {}
+            case = dict(client.get("case_overview") or {})
+            if case.get("text"):
+                case["text"] = strip_case_title(case["text"])     # overviews saved before the title was dropped
             head = Flow(v, gap=px(8))
             head.pack(fill="x")
             head.add(ttk.Label(head, text="Case overview", style="H2.TLabel"))
@@ -12257,7 +16267,7 @@ def run_gui():
                            gap=px(16))
             if not sessions:
                 btn.config(state="disabled")
-            all_btn = head.add(ttk.Button(head, text="↻  Refresh all",
+            all_btn = head.add(ttk.Button(head, text=f"↻  Refresh {client.get('code') or 'this patient'}",
                                           command=lambda: self.refresh_all_patients(only_client=client, select="case")))
             if not sessions:
                 all_btn.config(state="disabled")
@@ -12495,6 +16505,9 @@ def run_gui():
                 bar.add(ttk.Button(bar, text=f"Copy {label.split(' (')[0].lower()}", style="Accent.TButton",
                                    command=lambda: self.copy(d.get(key, ""), label)))
                 bar.add(ttk.Button(bar, text="Edit", command=lambda: self.start_wizard(client, sid, d)))
+                if key == "note" and d["meta"].get("source") == "imported":
+                    bar.add(ttk.Button(bar, text="📁  Move to Documents…",
+                                       command=lambda: self.move_to_documents(client, sid, d)))
                 if key == "note" and d.get("context_used"):
                     ttk.Label(tab, text="Built on: " + ", ".join(d["context_used"]),
                               style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(4, 0))
@@ -12912,10 +16925,39 @@ def run_gui():
                                         state="readonly", width=16), gap=px(4))
 
             msg_fr = ttk.Frame(f)
-            ttk.Label(msg_fr, text="Paste the messages (oldest first), or load them from files:",
-                      style="H2.TLabel").pack(anchor="w")
-            mfr, msgs = scrolled_text(msg_fr, height=12)
+            m_head = Flow(msg_fr, gap=px(12))                # the file button sits up here, so it's never cut off
+            m_head.pack(fill="x")
+            m_head.add(ttk.Label(m_head, text="Paste the messages, or load them from files:", style="H2.TLabel"))
+            load_btn = m_head.add(ttk.Button(m_head, text="📂  Load from files…"))
+            found_lbl = ttk.Label(msg_fr, text="", style="Caption.TLabel")
+            found_lbl.pack(anchor="w")
+            mfr, msgs = scrolled_text(msg_fr, height=10)
             mfr.pack(fill="both", expand=True, pady=(px(4), px(4)))
+            found = {"dates": [], "job": None}
+
+            def detect_dates(*_):
+                """Read the dates from what's pasted/loaded: they fill the Date box (one log entry per date)."""
+                found["job"] = None
+                txt = get_text(msgs)
+                ds = detect_contact_dates(txt) if txt.strip() else []
+                found["dates"] = ds
+                if ds:
+                    date_var.set(ds[0])
+                    found_lbl.config(text=("Date found in the messages: " + fmt_date(ds[0])) if len(ds) == 1 else
+                                     f"Dates found in the messages: {fmt_date(ds[0])} → {fmt_date(ds[-1])} "
+                                     f"({len(ds)} days — one log entry per date)")
+                else:
+                    found_lbl.config(text="No dates found in the messages — the Date above is used." if txt.strip()
+                                     else "")
+                if txt.strip() and (looks_like_email_print(txt) or looks_like_eml_dump(txt)):
+                    method_var.set("Email")
+
+            def soon(*_):
+                if found["job"]:
+                    _quiet(win.after_cancel, found["job"])
+                found["job"] = win.after(400, detect_dates)
+            for seq in ("<KeyRelease>", "<<Paste>>", "<ButtonRelease-2>"):
+                msgs.bind(seq, soon, add="+")
 
             def load_files():
                 paths = filedialog.askopenfilenames(parent=win, title="Messages to add", filetypes=[
@@ -12929,9 +16971,10 @@ def run_gui():
                         continue
                     cur = get_text(msgs).strip()
                     set_text(msgs, (cur + "\n\n" if cur else "") + txt.strip())
-                    if pth.lower().endswith(".eml"):
+                    if pth.lower().endswith(".eml") or looks_like_email_print(txt):
                         method_var.set("Email")
-            ttk.Button(msg_fr, text="Load from files…", command=load_files).pack(anchor="w")
+                detect_dates()
+            load_btn.config(command=load_files)
 
             call_fr = ttk.Frame(f)
             ttk.Label(call_fr, text="The phone-call recording:", style="H2.TLabel").pack(anchor="w")
@@ -12952,19 +16995,30 @@ def run_gui():
 
             obs_lbl = ttk.Label(f, text="Anything else to note? (optional)", style="H2.TLabel")
             ofr, obs = scrolled_text(f, height=3)
-            hint = ttk.Label(f, text=f"Before the AI sees anything, names on {code}'s “names to hide” list are replaced "
-                                     "and email addresses, phone numbers and links are removed. If the other person's "
-                                     "name (a parent, a teacher…) isn't on that list yet, add it under Edit patient first.",
+            draft_var = tk.BooleanVar(value=False)
+            draft_cb = ttk.Checkbutton(f, text="Also draft a contact note with the AI (otherwise it's just logged)",
+                                       variable=draft_var)
+            hint = ttk.Label(f, text=f"Texts and emails go into {code}'s Contact log, one entry per date. If you "
+                                     "also draft a contact note, names on the “names to hide” list are replaced and email "
+                                     "addresses, phone numbers and links are removed before the AI sees anything.",
                              style="Muted.TLabel", wraplength=px(820), justify="left")
             btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
             status = ttk.Label(btns, text="", style="Muted.TLabel")
             status.pack(side="left")
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
-            go = ttk.Button(btns, text="Write the note", style="Accent.TButton")
+            go = ttk.Button(btns, text="Save to log", style="Accent.TButton")
             go.pack(side="right", padx=px(8))
-            hint.pack(side="bottom", anchor="w", pady=(px(8), 0))      # bottom-up: hint, notes box, its heading
+            hint.pack(side="bottom", anchor="w", pady=(px(8), 0))      # bottom-up: hint, checkbox, notes box, heading
+            draft_cb.pack(side="bottom", anchor="w", pady=(px(6), 0))
             ofr.pack(side="bottom", fill="x", pady=(px(4), 0))
             obs_lbl.pack(side="bottom", anchor="w", pady=(px(8), 0))
+
+            def go_label(*_):
+                if mode_var.get() == "messages":
+                    go.config(text="Save and draft note" if draft_var.get() else "Save to log")
+                else:
+                    go.config(text="Add to queue and start")
+            draft_var.trace_add("write", go_label)
 
             def mode_changed(*_):
                 msgs_mode = mode_var.get() == "messages"
@@ -12972,7 +17026,9 @@ def run_gui():
                 (msg_fr if msgs_mode else call_fr).pack(fill="both", expand=msgs_mode, pady=(px(4), 0))
                 row.show(m_lbl, msgs_mode)
                 row.show(m_cb, msgs_mode)
-                go.config(text="Write the note" if msgs_mode else "Add to queue and start")
+                (draft_cb.pack(side="bottom", anchor="w", pady=(px(6), 0), before=ofr) if msgs_mode
+                 else draft_cb.pack_forget())
+                go_label()
             mode_var.trace_add("write", mode_changed)
             mode_changed()
 
@@ -12999,6 +17055,9 @@ def run_gui():
                     self.queue_start()
 
             def go_messages():
+                if found["job"]:
+                    _quiet(win.after_cancel, found["job"])
+                detect_dates()                           # (in case they were pasted from a menu)
                 text, day = get_text(msgs).strip(), date_var.get().strip()
                 if not text:
                     return status.config(text="Paste the messages (or load them from files) first.")
@@ -13013,6 +17072,25 @@ def run_gui():
                 w_, who_ = contact_choice()
                 remember_choice()
                 party = contact_party(w_, who_)
+                if looks_like_eml_dump(text):
+                    text = eml_thread(text)                    # .eml files: one dated block per email, oldest first
+                    method = "Email"
+                elif looks_like_email_print(text):
+                    text = tidy_email_thread(text) or text     # one dated block per email, no signatures/notices
+                elif method == "Text messages" or looks_like_message_export(text):
+                    # one line per message, without the copy app's repeats and the sender's phone number
+                    other = "Patient" if w_ == "patient" else ((who_ or "").strip().capitalize() or
+                                                               ("Contact" if w_ == "other" else "Parent"))
+                    text = tidy_message_thread(text, other=other) or text
+                # always: into the patient's External communication log, as they are (no AI)
+                self.comm_add(cid, {"date": day, "with": w_, "who": who_, "method": method, "text": text,
+                                    "notes": note_txt})
+                if not draft_var.get():
+                    win.destroy()
+                    self.set_status(f"{code}: {method.lower()} added to the External communication log.")
+                    if self.client_id == cid and not self.wizard:
+                        self.refresh_client_page(cid, select="comms")
+                    return
                 values.update(contact_method=method, contact_with=w_, contact_who=who_, source_kind=(
                     f"the text messages between the Counselor and {party}, copied by the clinician (oldest first)"
                     if method == "Text messages" else
@@ -13039,11 +17117,11 @@ def run_gui():
 
                 def failed(msg):
                     if self._alive(win):
-                        go.config(state="normal")
-                        status.config(text="")
-                    messagebox.showerror(APP_NAME, f"Couldn't write the note: {msg}\n\nNothing was saved; your "
-                                                   "messages are still in the window.",
-                                         parent=win if self._alive(win) else None)
+                        win.destroy()
+                    messagebox.showerror(APP_NAME, f"Couldn't write the contact note: {msg}\n\nThe messages are "
+                                                   "saved in the External communication log.")
+                    if self.client_id == cid and not self.wizard:
+                        self.refresh_client_page(cid, select="comms")
                 r = self.run_bg(lambda p: generate_documents(job_cfg, values, transcript, context, p, kind="parent",
                                                              reference=reference),
                                 done, failed, label=f"writing the contact note for {code}", patient=code,
@@ -13054,12 +17132,15 @@ def run_gui():
                                   else "Waiting in line — it starts when the current task finishes.")
             go.config(command=lambda: go_messages() if mode_var.get() == "messages" else go_call())
             self.parent_win = {"win": win, "with": with_var, "who": who_var, "mode": mode_var, "date": date_var,
-                               "method": method_var, "msgs": msgs,
-                               "obs": obs, "audio": audio_var, "go": go, "load": load_files, "status": status}
+                               "method": method_var, "msgs": msgs, "draft": draft_var,
+                               "obs": obs, "audio": audio_var, "go": go, "load": load_files, "status": status,
+                               "detect": detect_dates, "found": found_lbl}
 
         parent_comm = external_comm                     # (its earlier name)
 
-        FILE_KINDS = {"registration": "Registration form", "parent": "External communication", "other": "Other"}
+        FILE_KINDS = {"registration": "Registration form", "parent": "External communication",
+                      "assessment": "Assessment", "termination": "Termination form", "document": "Imported document",
+                      "other": "Other"}
         FILE_TYPES = [("Documents", "*.pdf *.docx *.doc *.txt *.md *.rtf *.png *.jpg *.jpeg *.gif *.heic *.tif *.tiff"),
                       ("All files", "*.*")]
 
@@ -13140,8 +17221,16 @@ def run_gui():
                     return messagebox.showerror(APP_NAME, f"Couldn't add that file: {friendly_error(ex)}", parent=win)
                 refresh(e["id"])
                 self.set_status(f"{client.get('code', '')}: {e['name']} added (encrypted).")
+                if k == "registration":
+                    try:                                       # every answer, organized (Registration tab)
+                        info = self.registration_read(cid, e)
+                        self.set_status(f"{client.get('code', '')}: {e['name']} added (encrypted) — "
+                                        f"{len(info['fields'])} answers organized on the Registration tab.")
+                    except Exception as ex:
+                        self.set_status(f"{client.get('code', '')}: {e['name']} added, but it couldn't be read: "
+                                        f"{friendly_error(ex)}")
                 if self.client_id == cid:
-                    self.open_client(cid)
+                    self.open_client(cid, select="reg" if k == "registration" else None)
                 if k == "registration" and messagebox.askyesno(
                         APP_NAME, "Read the PHQ-9 and GAD-7 scores from this registration form now? (The local AI "
                                   "reads it; you check the scores before they're saved.)", parent=win):
@@ -13233,6 +17322,1951 @@ def run_gui():
             if kind:
                 win.after(100, lambda: add(kind))
 
+        # ---------------------------------------------------------------- files shown from a tab
+        def vault_file_view(self, e, parent=None):
+            """Show a stored file's text inside Session Scribe (read in memory, no readable copy on disk);
+            files without text (scans, images) open as a temporary copy instead."""
+            try:
+                data = vault.load_file(e["id"])
+            except Exception as ex:
+                return messagebox.showerror(APP_NAME, friendly_error(ex), parent=parent)
+            ext = os.path.splitext(e.get("name", ""))[1].lower()
+            text = None
+            if ext in (".txt", ".md", ".rtf"):
+                text = data.decode("utf-8", errors="replace")
+            elif ext in (".docx", ".pdf"):
+                text = text_from_bytes(data, ext)
+            if not (text or "").strip():
+                return self.vault_file_open(e, parent)
+            vw = new_window(parent or root, e.get("name", "File"), "760x640")
+            vf = ttk.Frame(vw, padding=px(14))
+            vf.pack(fill="both", expand=True)
+            tb = register(tk.Text(vf, wrap="word", relief="flat", borderwidth=0, highlightthickness=1,
+                                  font=F["body"], padx=px(12), pady=px(10)), "doc")
+            tb.insert("1.0", text.strip())
+            tb.config(state="disabled")
+            tb.pack(fill="both", expand=True)
+            return vw
+
+        def vault_file_open(self, e, parent=None):
+            """Open a stored file in its usual program, as a temporary copy wiped when Session Scribe closes."""
+            try:
+                data = vault.load_file(e["id"])
+                os.makedirs(OPEN_DIR, exist_ok=True)
+                path = os.path.join(OPEN_DIR, e["id"][:8] + "_" + re.sub(r'[\\/:*?"<>|]', "_", e.get("name", "file")))
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                open_path(path)
+            except Exception as ex:
+                return messagebox.showerror(APP_NAME, f"Couldn't open it: {friendly_error(ex)}", parent=parent)
+            self.set_status(f"Opened a temporary copy of {e.get('name', 'the file')} — wiped when Session Scribe closes.")
+
+        def _file_entry(self, client, fid):
+            return next((x for x in client.get("files") or [] if x.get("id") == fid), None) if fid else None
+
+        def _file_buttons(self, row, client, fid):
+            e = self._file_entry(client, fid)
+            if not e:
+                return
+            row.add(ttk.Label(row, text=f"📎  {e['name']}", style="Caption.TLabel"), gap=px(12))
+            row.add(ttk.Button(row, text="View", command=lambda: self.vault_file_view(e)), gap=px(6))
+            row.add(ttk.Button(row, text="Open", command=lambda: self.vault_file_open(e)), gap=px(4))
+
+        # ---------------------------------------------------------------- Assessments tab
+        ASSESSMENT_NAMES = ["PCL-5 (PTSD)", "C-SSRS (Columbia suicide severity)", "ACE questionnaire",
+                            "AUDIT (alcohol)", "DAST-10 (drugs)", "BDI-II (Beck Depression)", "BAI (Beck Anxiety)",
+                            "MDQ (mood disorder)", "ASRS (adult ADHD)", "EPDS (postnatal depression)",
+                            "SCARED (child anxiety)", "Vanderbilt (ADHD)", "Intake questionnaire",
+                            "PHQ-9", "GAD-7"]
+
+        def _render_assessments(self, v, client, sessions):
+            client = vault.load_client(client["id"])
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Assessments", style="H2.TLabel"))
+            head.add(ttk.Button(head, text="▶  Take assessment…", style="Accent.TButton",
+                                command=lambda: self.take_assessment(client)), gap=px(16))
+            head.add(ttk.Button(head, text="＋  Record a result…", command=lambda: self.assessment_dialog(client)))
+            head.add(ttk.Button(head, text="＋  PHQ-9 / GAD-7",
+                                command=lambda: self.measure_dialog(client, select="assess")))
+            regs = [x for x in client.get("files") or [] if x.get("kind") == "registration"]
+            if regs:
+                head.add(ttk.Button(head, text="Read scores from registration form",
+                                    command=lambda: self.read_measures_from_file(client, regs[-1])))
+            ttk.Label(v, text="Every assessment this patient has taken, newest first. “Take assessment…” has them "
+                              "answer on this computer, full screen; “Record a result…” is for ones given elsewhere.",
+                      style="Muted.TLabel", wraplength=px(520), justify="left").pack(anchor="w", pady=(px(2), 0))
+            self.progress_panel(v, owner=("measures", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
+            sc, box = scrollable(v)
+            sc.pack(fill="both", expand=True, pady=(px(8), 0))
+            linked = {a.get("measure_id") for a in client.get("assessments") or [] if a.get("measure_id")}
+            rows = [("m", m["date"], m) for m in client.get("measures") or [] if m.get("id") not in linked] + \
+                   [("a", a.get("date", ""), a) for a in client.get("assessments") or []]
+            if not rows:
+                ttk.Label(box, text="No assessments yet. Use “Add assessment…” for any questionnaire or screening "
+                                    "(with its result and the completed form, if you have it), or “PHQ-9 / GAD-7 "
+                                    "score…” for those two.", style="Muted.TLabel", wraplength=px(680),
+                          justify="left").pack(anchor="w", pady=(px(6), 0))
+                return
+            for kind, day, x in sorted(rows, key=lambda r: (r[1], r[2].get("added", "")), reverse=True):
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(0, px(6)), padx=(0, px(8)))
+
+                def line(text, style="TLabel", pady=(px(2), 0)):
+                    ttk.Label(card, text=text, style=style, wraplength=px(500), justify="left").pack(anchor="w", pady=pady)
+                acts = Flow(card, gap=px(6))
+                if kind == "m":
+                    band = measure_band(x["kind"], x["total"])
+                    line(f"{fmt_date(x['date'])}   {x['kind']}", "Strong.TLabel", 0)
+                    line(f"{x['total']}" + (f"  ({band})" if band else "") + f"   · {x.get('source', 'manual')}")
+                    if x.get("items"):
+                        line("Answers: " + " ".join(map(str, x["items"])), "Caption.TLabel")
+                    if x.get("kind") == "PHQ-9" and x.get("items") and x["items"][8] > 0:
+                        line(f"⚠  Item 9 answered {x['items'][8]} — follow up and document a risk assessment.",
+                             "Bad.TLabel")
+                    acts.add(ttk.Button(acts, text="Remove",
+                                        command=lambda m=x: self.measure_remove(client, m["id"], select="assess")))
+                elif x.get("administered"):                # taken on this computer (or the safety assessment)
+                    r_ = x.get("result") or {}
+                    line(f"{fmt_date(x.get('date', ''))}   {x.get('name', 'Assessment')}"
+                         + ("" if x.get("completed", True) else "   · stopped early"), "Strong.TLabel", 0)
+                    line(r_.get("summary", x.get("score", "")))
+                    for fl in (r_.get("flags") or [])[:1]:
+                        line("⚠  " + fl, "Bad.TLabel")
+                    line(("Taken at " if x.get("instrument") != "bssa" else "") +
+                         self.assessment_session_label(client["id"], x.get("date", "")), "Caption.TLabel")
+                    acts.add(ttk.Button(acts, text="Results", style="Accent.TButton",
+                                        command=lambda a=x: self.assessment_results(client, a)))
+                    acts.add(ttk.Button(acts, text="Remove", command=lambda a=x: self.assessment_remove(client, a)),
+                             gap=px(12))
+                else:
+                    line(f"{fmt_date(x.get('date', ''))}   {x.get('name', 'Assessment')}", "Strong.TLabel", 0)
+                    if x.get("score"):
+                        line(x["score"])
+                    if x.get("notes"):
+                        line(x["notes"], "Muted.TLabel", (px(4), 0))
+                    self._file_buttons(acts, client, x.get("file_id"))
+                    acts.add(ttk.Button(acts, text="Edit…", command=lambda a=x: self.assessment_dialog(client, a)),
+                             gap=px(12))
+                    acts.add(ttk.Button(acts, text="Remove", command=lambda a=x: self.assessment_remove(client, a)))
+                acts.pack(fill="x", pady=(px(6), 0))
+            box.realize_all()
+
+        # ---------------------------------------------------------------- registration form, organized
+        def registration_read(self, cid, entry=None):
+            """Read the patient's registration form (the latest, or `entry`) and keep its answers, organized by
+            topic, on the patient. Returns the organized form."""
+            c = vault.load_client(cid)
+            regs = [x for x in c.get("files") or [] if x.get("kind") == "registration"]
+            entry = entry or (regs[-1] if regs else None)
+            if not entry:
+                raise ValueError("There's no registration form on file.")
+            info = read_registration(vault.load_file(entry["id"]), os.path.splitext(entry.get("name", ""))[1])
+            if not info["fields"]:
+                raise ValueError("No answers could be read from it (it may be a scan or picture).")
+            c = vault.load_client(cid)
+            c["registration_info"] = dict(info, file_id=entry["id"], file_name=entry.get("name", ""),
+                                          read=datetime.now().isoformat(timespec="seconds"))
+            vault.save_client(c)
+            self._sig = vault.signature()
+            return c["registration_info"]
+
+        def registration_names(self, client):
+            """[(name, role)] the form names that aren't on the patient's names-to-hide list yet."""
+            info = client.get("registration_info") or {}
+            have = {n.lower() for n, _ in client_name_map(client)}
+            out = []
+            for x in info.get("fields") or []:
+                who = (x.get("who") or "").strip()
+                if x["label"] == "Name" and x["topic"] == "Patient":
+                    who, role = x["value"].strip(), "Patient"
+                elif who:
+                    role = (x.get("role") or "").strip().title() or \
+                        ("Parent" if x["topic"].startswith("Parents") else "Emergency contact")
+                else:
+                    continue
+                if who and who.lower() not in have and not re.fullmatch(r"n/?a|none", who, re.I):
+                    out.append((who, role))
+                    have.add(who.lower())
+            return out
+
+        def registration_hide_names(self, client):
+            new = self.registration_names(vault.load_client(client["id"]))
+            if not new:
+                return messagebox.showinfo(APP_NAME, "Every name on the form is already on the names-to-hide list.")
+            if not messagebox.askyesno(APP_NAME, "Add these names to the patient's names-to-hide list? The AI will "
+                                                 "see the placeholder instead:\n\n" +
+                                       "\n".join(f"{n}  →  [{r}]" for n, r in new)):
+                return
+            c = vault.load_client(client["id"])
+            pairs = client_name_map(c) + [(n, f"[{r}]") for n, r in new]
+            c["names_to_hide"] = "\n".join(f"{n}, {ph.strip('[]')}" for n, ph in pairs)
+            c["names_format"] = 2
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.set_status(f"{c.get('code', '')}: {len(new)} name(s) added to the names-to-hide list.")
+            self.refresh_client_page(client["id"], select="reg")
+
+        def _render_registration(self, v, client, sessions):
+            """The registration form's answers, organized by topic, with what to notice first on top."""
+            client = vault.load_client(client["id"])
+            cid = client["id"]
+            info = client.get("registration_info")
+            regs = [x for x in client.get("files") or [] if x.get("kind") == "registration"]
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Registration", style="H2.TLabel"))
+
+            def read_again():
+                try:
+                    n = len(self.registration_read(cid)["fields"])
+                except Exception as ex:
+                    return messagebox.showerror(APP_NAME, f"Couldn't read the registration form: {friendly_error(ex)}")
+                self.set_status(f"{client.get('code', '')}: {n} answers read from the registration form.")
+                self.refresh_client_page(cid, select="reg")
+            if not info:
+                head.add(ttk.Button(head, text="Organize the registration form", style="Accent.TButton",
+                                    command=read_again), gap=px(16))
+                ttk.Label(v, text="Reads every answer on the form on file (on this computer, no AI) and lays them "
+                                  "out by topic: the patient, parents and contacts, treatment, safety, medical, "
+                                  "school, family, development, insurance and consents.", style="Muted.TLabel",
+                          wraplength=px(560), justify="left").pack(anchor="w", pady=(px(6), 0))
+                return
+            entry = next((x for x in regs if x["id"] == info.get("file_id")), regs[-1] if regs else None)
+            if entry:
+                head.add(ttk.Button(head, text="View form", command=lambda: self.vault_file_view(entry)), gap=px(16))
+            head.add(ttk.Button(head, text="Copy", command=lambda: self.copy(registration_text(info),
+                                                                             "Registration")))
+            if self.registration_names(client):
+                head.add(ttk.Button(head, text="Hide names from AI…",
+                                    command=lambda: self.registration_hide_names(client)))
+            head.add(ttk.Button(head, text="Read again", command=read_again))
+            age = registration_age(info)
+            sub = "  ·  ".join(x for x in (info.get("title", ""),
+                                           f"filled in {fmt_date(info['form_date'])}" if info.get("form_date") else "",
+                                           f"age {age}" if age is not None else "",
+                                           info.get("file_name", "")) if x)
+            ttk.Label(v, text=sub, style="Caption.TLabel", wraplength=px(520), justify="left").pack(
+                anchor="w", fill="x", pady=(px(4), 0))
+            for fl in registration_flags(info):
+                ttk.Label(v, text="⚠  " + fl, style="Warn.TLabel", wraplength=px(520), justify="left").pack(
+                    anchor="w", fill="x", pady=(px(2), 0))
+            sc, box = scrollable(v)
+            sc.pack(fill="both", expand=True, pady=(px(8), 0))
+            topic, grid, r = None, None, 0
+            for x in info.get("fields") or []:
+                if x["topic"] != topic:
+                    topic = x["topic"]
+                    card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                    card.pack(fill="x", pady=(0, px(8)), padx=(0, px(8)))
+                    ttk.Label(card, text=topic, style="Strong.TLabel").pack(anchor="w")
+                    grid = ttk.Frame(card)
+                    grid.pack(fill="x", pady=(px(4), 0))
+                    grid.columnconfigure(1, weight=1)
+                    r = 0
+                ttk.Label(grid, text=x["label"], style="Muted.TLabel", wraplength=px(190), justify="left").grid(
+                    row=r, column=0, sticky="nw", padx=(0, px(14)), pady=px(2))
+                ttk.Label(grid, text=x["value"], wraplength=px(420), justify="left").grid(
+                    row=r, column=1, sticky="nw", pady=px(2))
+                r += 1
+            box.realize_all()
+            v._registration = info
+
+        def assessment_save(self, cid, entry):
+            """Add or update one assessment (matched by id) on a fresh copy of the patient."""
+            c = vault.load_client(cid)
+            lst = c.setdefault("assessments", [])
+            for i, a in enumerate(lst):
+                if a.get("id") == entry["id"]:
+                    lst[i] = entry
+                    break
+            else:
+                lst.append(entry)
+            vault.save_client(c)
+            self._sig = vault.signature()
+
+        def assessment_remove(self, client, a):
+            msg = f"Remove the {a.get('name', 'assessment')} from {fmt_date(a.get('date', ''))}?"
+            if a.get("file_id"):
+                msg += "\n\nIts attached form is deleted from the vault too (on both computers)."
+            if not messagebox.askyesno(APP_NAME, msg):
+                return
+            if a.get("file_id"):
+                _quiet(self.patient_file_remove, client["id"], a["file_id"])
+            self.assessment_delete(client["id"], a.get("id"))     # (and its PHQ-9/GAD-7 score, if it made one)
+            self.refresh_client_page(client["id"], select="assess")
+
+        def assessment_dialog(self, client, existing=None):
+            cid = client["id"]
+            ex = dict(existing or {})
+            win = new_window(root, f"{client.get('code', '')} — {'edit' if existing else 'add'} assessment", "680x620")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Edit assessment" if existing else "Add an assessment", style="Title.TLabel").pack(anchor="w")
+            grid = ttk.Frame(f)
+            grid.pack(fill="x", pady=(px(10), 0))
+            grid.columnconfigure(1, weight=1)
+            name_var = tk.StringVar(value=ex.get("name", ""))
+            day_var = tk.StringVar(value=ex.get("date") or date.today().isoformat())
+            score_var = tk.StringVar(value=ex.get("score", ""))
+            ttk.Label(grid, text="Assessment").grid(row=0, column=0, sticky="w", pady=px(3))
+            name_cb = ttk.Combobox(grid, textvariable=name_var, values=self.ASSESSMENT_NAMES)
+            name_cb.grid(row=0, column=1, sticky="ew", padx=(px(10), 0))
+            ttk.Label(grid, text="Completed on").grid(row=1, column=0, sticky="w", pady=px(3))
+            date_field(grid, day_var).grid(row=1, column=1, sticky="w", padx=(px(10), 0))
+            ttk.Label(grid, text="Score / result").grid(row=2, column=0, sticky="w", pady=px(3))
+            ttk.Entry(grid, textvariable=score_var).grid(row=2, column=1, sticky="ew", padx=(px(10), 0))
+            ttk.Label(f, text="e.g. “42 — probable PTSD”, “Positive screen”, “ACE score 4”.", style="Caption.TLabel").pack(
+                anchor="w", pady=(px(2), 0))
+            ttk.Label(f, text="Notes", style="Strong.TLabel").pack(anchor="w", pady=(px(10), px(2)))
+            nfr, notes = scrolled_text(f, height=6)
+            nfr.pack(fill="both", expand=True)
+            set_text(notes, ex.get("notes", ""))
+            frow = Flow(f, gap=px(8))
+            frow.pack(fill="x", pady=(px(10), 0))
+            picked = {"path": None, "drop": False}
+            cur = self._file_entry(vault.load_client(cid), ex.get("file_id"))
+            file_lbl = ttk.Label(frow, text=f"📎  {cur['name']}" if cur else "No form attached", style="Muted.TLabel")
+
+            def pick():
+                path = filedialog.askopenfilename(parent=win, title="Choose the completed assessment",
+                                                  filetypes=self.FILE_TYPES)
+                if path:
+                    picked.update(path=path, drop=False)
+                    file_lbl.config(text=f"📎  {os.path.basename(path)} (added when you save)")
+            frow.add(ttk.Button(frow, text="Attach the completed form…", command=pick))
+            if cur:
+                frow.add(ttk.Button(frow, text="Remove form", command=lambda: (
+                    picked.update(path=None, drop=True), file_lbl.config(text="Form removed when you save"))))
+            frow.add(file_lbl, gap=px(10))
+            msg = ttk.Label(f, text="", style="Bad.TLabel", wraplength=px(620), justify="left")
+            msg.pack(anchor="w", pady=(px(6), 0))
+
+            def save():
+                name, day = name_var.get().strip(), day_var.get().strip()
+                if not name:
+                    return msg.config(text="Enter which assessment it was.")
+                if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+                    return msg.config(text="Enter the date it was completed.")
+                if name in MEASURES and not existing:
+                    win.destroy()                       # these two have their own form (answers, bands, trend)
+                    return self.measure_dialog(client, select="assess", kind=name)
+                file_id = ex.get("file_id", "")
+                try:
+                    if picked["path"]:
+                        e = self.patient_file_add(cid, picked["path"], "assessment", note=name)
+                        if file_id:
+                            _quiet(self.patient_file_remove, cid, file_id)
+                        file_id = e["id"]
+                    elif picked["drop"] and file_id:
+                        self.patient_file_remove(cid, file_id)
+                        file_id = ""
+                except Exception as err:
+                    return msg.config(text=f"Couldn't add that file: {friendly_error(err)}")
+                now = datetime.now().isoformat(timespec="seconds")
+                entry = {"id": ex.get("id") or uuid.uuid4().hex[:12], "name": name, "date": day,
+                         "score": score_var.get().strip(), "notes": get_text(notes).strip(), "file_id": file_id,
+                         "added": ex.get("added") or now, "updated": now}
+                self.assessment_save(cid, entry)
+                win.destroy()
+                self.set_status(f"{client.get('code', '')}: {name} saved.")
+                if self.client_id == cid and not self.wizard:
+                    self.refresh_client_page(cid, select="assess")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            self._assess_win = {"win": win, "name": name_var, "date": day_var, "score": score_var, "notes": notes,
+                                "pick": picked, "save": save}
+
+        # ---------------------------------------------------------------- Termination tab
+        TERMINATION_REASONS = [
+            "Lack of Progress Despite Treatment", "Patient Non-Compliance",
+            "Lack of Communication from Patient to Continue or Resume Treatment", "Patient has Unpaid Balance",
+            "Inappropriate Behavior", "Conflict of Interest", "Patient's Request To Terminate Treatment",
+            "Patient's Request To Pause Treatment", "Need for a Higher Level of Care", "Insurance Issues",
+            "Dual Relationships", "Geographical Considerations", "Outside the Scope of Practice", "Other (see below)"]
+
+        @staticmethod
+        def termination_letter(t):
+            """The practice's termination letter, filled in (the same wording as its form)."""
+            reasons = "\n".join(f"• {r}" for r in t.get("reasons") or [])
+            other = (t.get("other") or "").strip()
+            return (
+                "TERMINATION LETTER\n\n"
+                f"Date: {fmt_date(t.get('date', ''))}\n"
+                f"{t.get('patient_name', '').strip()}\n\n"
+                "We are writing to inform you that as of the date of this letter, we will be concluding our therapeutic "
+                "relationship. This decision has been taken after careful consideration and is based on reasons "
+                "included.\n\n"
+                "We are aware that ending therapy can be a challenging process and we are committed to making this "
+                "transition as smooth as possible for you. Psychology Today (psychologytoday.com) can provide listings "
+                "of therapists in our area that meet both in-person and virtually. You can filter by your insurance plan "
+                "to find a therapist that meets your needs.\n\n"
+                "The reason(s) for termination from South Shore Counseling and Psychological Services:\n"
+                f"{reasons}\n"
+                + (f"\nAdditional reason(s):\n{other}\n" if other else "")
+                + "\nIf you have any questions, please do not hesitate to reach out to our office.\n\n"
+                  "We wish you the very best going forward.\n\n"
+                  f"{t.get('therapist', '').strip()}\n")
+
+        def _render_termination(self, v, client, sessions):
+            client = vault.load_client(client["id"])
+            t = client.get("termination")
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Termination", style="H2.TLabel"))
+            if not t:
+                head.add(ttk.Button(head, text="Fill out termination letter…", style="Accent.TButton",
+                                    command=lambda: self.termination_dialog(client)), gap=px(16))
+                ttk.Label(v, text="Record the end of treatment with this patient: the date, the reasons and the "
+                                  "practice's termination letter, plus the completed form you submit to the practice "
+                                  "(kept encrypted with the rest of the patient's record). Nothing here is sent to "
+                                  "the AI.", style="Muted.TLabel", wraplength=px(680), justify="left").pack(
+                    anchor="w", pady=(px(4), 0))
+                return
+            text = self.termination_letter(t)
+            head.add(ttk.Button(head, text="Copy letter", style="Accent.TButton",
+                                command=lambda: self.copy(text, "Termination letter")), gap=px(16))
+            head.add(ttk.Button(head, text="Edit…", command=lambda: self.termination_dialog(client)))
+            head.add(ttk.Button(head, text="Remove…", command=lambda: self.termination_remove(client)))
+            info = Flow(v, gap=px(8))
+            info.pack(fill="x", pady=(px(6), 0))
+            info.add(ttk.Label(info, text=f"Terminated {fmt_date(t.get('date', ''))}", style="ChipWarn.TLabel"))
+            info.add(ttk.Label(info, text=f"by {t.get('therapist', '')}", style="Muted.TLabel"), gap=px(10))
+            self._file_buttons(info, client, t.get("file_id"))
+            if client.get("archived"):
+                info.add(ttk.Label(info, text="🗄  Archived", style="ChipMuted.TLabel"), gap=px(12))
+            fr, tb = scrolled_text(v, readonly=True, doc=True, tools=False)
+            fr.pack(fill="both", expand=True, pady=(px(8), 0))
+            set_text(tb, text)
+
+        def termination_remove(self, client):
+            c = vault.load_client(client["id"])
+            t = c.get("termination") or {}
+            if not messagebox.askyesno(APP_NAME, "Remove this patient's termination record?"
+                                       + ("\n\nThe attached form is deleted from the vault too (on both computers)."
+                                          if t.get("file_id") else "")):
+                return
+            if t.get("file_id"):
+                _quiet(self.patient_file_remove, client["id"], t["file_id"])
+                c = vault.load_client(client["id"])
+            c.pop("termination", None)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.refresh_clients(client["id"])
+            self.open_client(client["id"], select="term")
+
+        def termination_dialog(self, client):
+            cid = client["id"]
+            client = vault.load_client(cid)
+            ex = dict(client.get("termination") or {})
+            win = new_window(root, f"{client.get('code', '')} — termination letter", "760x820")
+            win.grab_set()
+            outer, f = scrollable(win, padding=(px(22), px(16)))
+            outer.pack(fill="both", expand=True)
+            ttk.Label(f, text="Termination letter", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="The same fields as the practice's form. Saved encrypted in this patient's record; "
+                              "nothing here goes to the AI.", style="Muted.TLabel", wraplength=px(680),
+                      justify="left").pack(anchor="w", pady=(px(2), px(8)))
+            grid = ttk.Frame(f)
+            grid.pack(fill="x")
+            grid.columnconfigure(1, weight=1)
+            names = client_name_map(client)
+            guess = next((n for n, ph in names if ph.lower() == "[patient]"), names[0][0] if names else "")
+            day_var = tk.StringVar(value=ex.get("date") or date.today().isoformat())
+            name_var = tk.StringVar(value=ex.get("patient_name") or guess)
+            ther_var = tk.StringVar(value=ex.get("therapist") or self.settings.get("therapist_name", ""))
+            ttk.Label(grid, text="Date *").grid(row=0, column=0, sticky="w", pady=px(3))
+            date_field(grid, day_var).grid(row=0, column=1, sticky="w", padx=(px(10), 0))
+            ttk.Label(grid, text="Patient name *").grid(row=1, column=0, sticky="w", pady=px(3))
+            ttk.Entry(grid, textvariable=name_var).grid(row=1, column=1, sticky="ew", padx=(px(10), 0))
+            ttk.Label(f, text="Reason(s) for termination *", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(2)))
+            rbox = ttk.Frame(f)
+            rbox.pack(fill="x")
+            rvars = {}
+            have = set(ex.get("reasons") or [])
+            for i, r in enumerate(self.TERMINATION_REASONS):
+                rvars[r] = tk.BooleanVar(value=r in have)
+                ttk.Checkbutton(rbox, text=r, variable=rvars[r]).grid(row=i, column=0, sticky="w", pady=px(1))
+            ttk.Label(f, text="Additional reason(s)", style="Strong.TLabel").pack(anchor="w", pady=(px(10), px(2)))
+            ofr, other = scrolled_text(f, height=4)
+            ofr.pack(fill="x")
+            set_text(other, ex.get("other", ""))
+            ttk.Label(f, text="Therapist name and credentials *", style="Strong.TLabel").pack(anchor="w", pady=(px(10), px(2)))
+            ttk.Entry(f, textvariable=ther_var).pack(fill="x")
+            frow = Flow(f, gap=px(8))
+            frow.pack(fill="x", pady=(px(12), 0))
+            picked = {"path": None, "drop": False}
+            cur = self._file_entry(client, ex.get("file_id"))
+            file_lbl = ttk.Label(frow, text=f"📎  {cur['name']}" if cur else "No completed form attached",
+                                 style="Muted.TLabel")
+
+            def pick():
+                path = filedialog.askopenfilename(parent=win, title="Choose the completed termination form",
+                                                  filetypes=self.FILE_TYPES)
+                if path:
+                    picked.update(path=path, drop=False)
+                    file_lbl.config(text=f"📎  {os.path.basename(path)} (added when you save)")
+            frow.add(ttk.Button(frow, text="Attach the completed form (PDF)…", command=pick))
+            if cur:
+                frow.add(ttk.Button(frow, text="Remove form", command=lambda: (
+                    picked.update(path=None, drop=True), file_lbl.config(text="Form removed when you save"))))
+            frow.add(file_lbl, gap=px(10))
+            arch_var = tk.BooleanVar(value=False)
+            if not client.get("archived"):
+                ttk.Checkbutton(f, text="Also archive this patient (they leave the patient list and the Home dashboard; "
+                                        "Patient ▸ Restore brings them back)", variable=arch_var).pack(
+                    anchor="w", pady=(px(10), 0))
+            msg = ttk.Label(f, text="", style="Bad.TLabel", wraplength=px(680), justify="left")
+            msg.pack(anchor="w", pady=(px(6), 0))
+
+            def save():
+                day = day_var.get().strip()
+                reasons = [r for r in self.TERMINATION_REASONS if rvars[r].get()]
+                if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+                    return msg.config(text="Enter the date of the letter.")
+                if not name_var.get().strip():
+                    return msg.config(text="Enter the patient's name.")
+                if not reasons:
+                    return msg.config(text="Tick at least one reason.")
+                if not ther_var.get().strip():
+                    return msg.config(text="Enter your name and credentials.")
+                file_id = ex.get("file_id", "")
+                try:
+                    if picked["path"]:
+                        e = self.patient_file_add(cid, picked["path"], "termination", note="Termination form")
+                        if file_id:
+                            _quiet(self.patient_file_remove, cid, file_id)
+                        file_id = e["id"]
+                    elif picked["drop"] and file_id:
+                        self.patient_file_remove(cid, file_id)
+                        file_id = ""
+                except Exception as err:
+                    return msg.config(text=f"Couldn't add that file: {friendly_error(err)}")
+                now = datetime.now().isoformat(timespec="seconds")
+                c = vault.load_client(cid)
+                c["termination"] = {"date": day, "patient_name": name_var.get().strip(), "reasons": reasons,
+                                    "other": get_text(other).strip(), "therapist": ther_var.get().strip(),
+                                    "file_id": file_id, "added": ex.get("added") or now, "updated": now}
+                if arch_var.get():
+                    c["archived"] = True
+                vault.save_client(c)
+                if ther_var.get().strip() != self.settings.get("therapist_name", ""):
+                    self.settings["therapist_name"] = ther_var.get().strip()     # filled in next time
+                    _quiet(vault.save_settings, self.settings)
+                self._sig = vault.signature()
+                win.destroy()
+                self.refresh_clients(cid)
+                self.set_status(f"{client.get('code', '')}: termination saved"
+                                + (" and patient archived." if arch_var.get() else "."))
+                if not self.wizard:
+                    self.open_client(cid, select="term")
+            btns = pin_bottom(ttk.Frame(win, padding=(px(22), 0, px(22), px(14))), pady=(px(6), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            self._term_win = {"win": win, "date": day_var, "name": name_var, "therapist": ther_var, "reasons": rvars,
+                              "other": other, "pick": picked, "archive": arch_var, "save": save}
+
+        # ---------------------------------------------------------------- assessments taken on this computer
+        def assessment_session_label(self, cid, day):
+            """Which session an assessment belongs to: the session on file for that date (found each time, so a
+            session added later still links up)."""
+            try:
+                recs = [(s, d) for s, d in vault.sessions_for(cid) if d.get("meta", {}).get("session_date") == day]
+            except Exception:
+                recs = []
+            if recs:
+                return f"{day_title(recs)} · {fmt_date(day)}"
+            return f"{fmt_date(day)} (no session on file for that date yet)"
+
+        def take_assessment(self, client):
+            """Pick the age group, then a questionnaire from that group's own list, then hand the computer over."""
+            cid, code = client["id"], client.get("code", "")
+            client = vault.load_client(cid)
+            win = new_window(root, f"{code} — take an assessment", "820x720")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Take an assessment", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Choose the age group first. Each group has its own list, so a child can't be given an "
+                              "adult measure. The patient answers on this computer, full screen; you see the results "
+                              "after you enter your vault password.", style="Muted.TLabel", wraplength=px(740),
+                      justify="left").pack(anchor="w", pady=(px(2), px(10)))
+            grp_var = tk.StringVar(value=client.get("assess_group", ""))
+            grow = Flow(f, gap=px(14))
+            grow.pack(fill="x")
+            for key, label, ages in ASSESS_GROUPS:
+                grow.add(ttk.Radiobutton(grow, text=f"{label} ({ages})", value=key, variable=grp_var))
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            start = ttk.Button(btns, text="Start (full screen)  ▶", style="Accent.TButton", state="disabled")
+            start.pack(side="right", padx=px(8))
+            ttk.Button(btns, text="Clinician form: Brief Suicide Safety Assessment…",
+                       command=lambda: (win.destroy(), self.bssa_dialog(client))).pack(side="left")
+            info = ttk.Label(f, text="", wraplength=px(740), justify="left")
+            info.pack(side="bottom", anchor="w", fill="x", pady=(px(8), 0))
+            when = ttk.Label(f, text="Taken today: " + self.assessment_session_label(cid, date.today().isoformat()),
+                             style="Caption.TLabel")
+            when.pack(side="bottom", anchor="w", pady=(px(6), 0))
+            box, tv = tree_box(f, columns=("measures", "ages", "mins"), show="tree headings", height=14,
+                               selectmode="browse")
+            tv.heading("#0", text="Assessment", anchor="w")
+            tv.column("#0", width=px(210), stretch=False)
+            for c_, t_, w_ in (("measures", "Measures", 330), ("ages", "Ages", 150), ("mins", "About", 70)):
+                tv.heading(c_, text=t_, anchor="w")
+                tv.column(c_, width=px(w_), anchor="w", stretch=(c_ == "measures"))
+            box.pack(fill="both", expand=True, pady=(px(10), 0))
+
+            def fill(*_):
+                tv.delete(*tv.get_children())
+                start.config(state="disabled")
+                info.config(text="")
+                g = grp_var.get()
+                if not g:
+                    info.config(text="Choose Children, Adolescents or Adults to see that list.", style="Muted.TLabel")
+                    return
+                for cat in ASSESS_CATEGORIES:
+                    insts = [i for i in ASSESS_INSTRUMENTS.values() if g in i["groups"] and i["cat"] == cat]
+                    if not insts:
+                        continue
+                    tv.insert("", "end", iid="cat:" + cat, text=cat, open=True)
+                    for i in insts:
+                        tv.insert("cat:" + cat, "end", iid=i["id"], text=i["name"],
+                                  values=(i["measures"] + ("  (parent completes)" if i["respondent"] == "parent" else ""),
+                                          i["ages"], f"{i['minutes']} min"))
+
+            def picked(*_):
+                sel = tv.selection()
+                iid = sel[0] if sel and sel[0] in ASSESS_INSTRUMENTS else None
+                start.config(state="normal" if iid else "disabled")
+                if iid:
+                    i = ASSESS_INSTRUMENTS[iid]
+                    n = len(i["items"])
+                    info.config(style="TLabel", text=f"{i['title']} — {n} questions, about {i['minutes']} min. "
+                                + ("Hand the computer to the PARENT or GUARDIAN. " if i["respondent"] == "parent" else "")
+                                + ("For ages 8–11, sit with the child in case they have questions. "
+                                   if iid == "scared" and grp_var.get() == "child" else ""))
+            grp_var.trace_add("write", fill)
+            tv.bind("<<TreeviewSelect>>", picked)
+
+            def go(*_):
+                sel = tv.selection()
+                if not sel or sel[0] not in ASSESS_INSTRUMENTS:
+                    return
+                g = grp_var.get()
+                try:
+                    c_ = vault.load_client(cid)
+                    if c_.get("assess_group") != g:
+                        c_["assess_group"] = g
+                        vault.save_client(c_)
+                except Exception:
+                    pass
+                win.destroy()
+                self.run_assessment(client, sel[0], g)
+            start.config(command=go)
+            tv.bind("<Double-1>", go)
+            fill()
+            self._take_win = {"win": win, "group": grp_var, "tv": tv, "start": go}
+
+        def run_assessment(self, client, iid, group):
+            """The patient's side: full screen, one question at a time, results hidden. Ends on a hand-back screen
+            that only your vault password gets past."""
+            inst = ASSESS_INSTRUMENTS[iid]
+            cid, code = client["id"], client.get("code", "")
+            pal = THEME["P"]
+            W = tk.Toplevel(root)
+            W.title(APP_NAME)
+            W.configure(background=pal["bg"])
+            try:
+                W.attributes("-fullscreen", True)
+            except tk.TclError:
+                W.state("zoomed")
+            _quiet(W.attributes, "-topmost", True)
+            W.protocol("WM_DELETE_WINDOW", lambda: None)          # Alt+F4 / the close box do nothing
+            fam = F["body"].actual("family")
+            disp = F["title"].actual("family")
+            fn = {"q": tkfont.Font(family=disp, size=22), "a": tkfont.Font(family=fam, size=17),
+                  "s": tkfont.Font(family=fam, size=14), "big": tkfont.Font(family=disp, size=30),
+                  "small": tkfont.Font(family=fam, size=11)}
+            colw = min(max(W.winfo_screenwidth() - px(120), px(500)), px(1040))
+            st = {"answers": {}, "qid": None, "hist": [], "start": time.time(), "closed": False, "entry": None,
+                  "stopped": False}
+            self._assessing = True
+            col = tk.Frame(W, background=pal["bg"])
+            col.place(relx=0.5, rely=0.5, anchor="center", width=colw)
+            top = tk.Frame(W, background=pal["bg"])
+            top.place(relx=0.5, y=px(24), anchor="n", width=colw)
+
+            def keep_front():
+                if st["closed"] or not W.winfo_exists():
+                    return
+                if st.get("hello"):                       # Windows Hello's prompt must be able to come in front
+                    W.after(800, keep_front)
+                    return
+                _quiet(W.lift)
+                _quiet(W.attributes, "-topmost", True)
+                try:
+                    if W.focus_get() is None:
+                        W.focus_force()
+                except (tk.TclError, KeyError):
+                    _quiet(W.focus_force)
+                self.last_activity = time.time()
+                W.after(800, keep_front)
+
+            def clear():
+                for w_ in list(col.winfo_children()) + list(top.winfo_children()):
+                    w_.destroy()
+                for k in [str(n) for n in range(1, 10)] + ["<Return>"]:
+                    _quiet(W.unbind, k if k.startswith("<") else f"<KeyPress-{k}>")
+
+            def lbl(parent, text, font, fg=None, **kw):
+                return tk.Label(parent, text=text, font=font, background=pal["bg"], foreground=fg or pal["text"],
+                                wraplength=colw, justify="left", anchor="w", **kw)
+
+            def big_btn(parent, text, cmd, accent=False, chosen=False):
+                b = tk.Button(parent, text=text, command=cmd, font=fn["a"], anchor="w", justify="left",
+                              relief="flat", borderwidth=0, cursor="hand2", wraplength=colw - px(60),
+                              padx=px(22), pady=px(12),
+                              background=pal["accent"] if accent else (pal["accent_soft"] if chosen else pal["surface"]),
+                              foreground=pal["on_accent"] if accent else pal["text"],
+                              activebackground=pal["accent_soft"], activeforeground=pal["text"],
+                              highlightthickness=2, highlightbackground=pal["accent"] if chosen else pal["border"],
+                              highlightcolor=pal["accent"])
+                return b
+
+            def small_btn(parent, text, cmd):
+                return tk.Button(parent, text=text, command=cmd, font=fn["small"], relief="flat", borderwidth=0,
+                                 cursor="hand2", background=pal["bg"], foreground=pal["muted"],
+                                 activebackground=pal["surface2"], activeforeground=pal["text"], padx=px(10),
+                                 pady=px(6))
+
+            def visible():
+                return assessment_visible(inst, st["answers"])
+
+            def intro():
+                clear()
+                lbl(col, inst["title"], fn["big"]).pack(anchor="w", fill="x")
+                if inst["respondent"] == "parent":
+                    lbl(col, "For the parent or guardian", fn["s"], pal["accent"]).pack(anchor="w", pady=(px(6), 0))
+                lbl(col, inst["intro"], fn["s"]).pack(anchor="w", fill="x", pady=(px(18), px(8)))
+                lbl(col, "Choose an answer for each question. You can go back to change an answer. When you're "
+                         "finished, hand the computer back to your counselor.", fn["s"], pal["muted"]).pack(
+                    anchor="w", fill="x", pady=(0, px(26)))
+                b = big_btn(col, "Start  ▶", lambda: ask(visible()[0]["id"]), accent=True)
+                b.pack(anchor="w")
+                b.focus_set()
+                W.bind("<Return>", lambda e: ask(visible()[0]["id"]))
+                small_btn(col, "Stop — I need to talk to my counselor", stop).pack(anchor="w", pady=(px(30), 0))
+
+            def progress(q):
+                vis = visible()
+                i = next((n for n, x in enumerate(vis) if x["id"] == q["id"]), 0)
+                lbl(top, f"Question {i + 1} of {len(vis)}", fn["small"], pal["muted"]).pack(anchor="w")
+                bar = tk.Canvas(top, height=px(6), highlightthickness=0, borderwidth=0, background=pal["surface2"])
+                bar.pack(fill="x", pady=(px(4), 0))
+                W.update_idletasks()
+                bar.create_rectangle(0, 0, colw * (i + 1) / max(len(vis), 1), px(6), fill=pal["accent"], outline="")
+
+            def ask(qid):
+                clear()
+                q = next(x for x in inst["items"] if x["id"] == qid)
+                st["qid"] = qid
+                progress(q)
+                stem = q.get("stem", inst.get("stem", ""))
+                if stem:
+                    lbl(col, stem, fn["s"], pal["muted"]).pack(anchor="w", fill="x", pady=(0, px(6)))
+                lbl(col, q["text"], fn["q"]).pack(anchor="w", fill="x", pady=(0, px(22)))
+                cur = st["answers"].get(qid)
+                if q["kind"] == "choice":
+                    for n, (score, label) in enumerate(q["opts"], 1):
+                        b = big_btn(col, f"{label}", lambda s=score: choose(qid, s), chosen=(cur == score))
+                        b.pack(fill="x", pady=px(5))
+                        if n <= 9:
+                            W.bind(f"<KeyPress-{n}>", lambda e, s=score: choose(qid, s))
+                else:
+                    row = tk.Frame(col, background=pal["bg"])
+                    row.pack(anchor="w", fill="x")
+                    var = tk.StringVar(value="" if cur is None else str(cur))
+                    en = tk.Entry(row, textvariable=var, font=fn["q"], width=6 if q["kind"] == "number" else 40,
+                                  relief="flat", highlightthickness=2, highlightbackground=pal["border"],
+                                  highlightcolor=pal["accent"], background=pal["surface"], foreground=pal["text"],
+                                  insertbackground=pal["text"])
+                    en.pack(side="left", ipady=px(6))
+                    if q["kind"] == "number":
+                        lbl(row, f"  {q.get('unit', '')}  (0–{q['hi']})", fn["s"], pal["muted"]).pack(side="left")
+                    err = lbl(col, "", fn["s"], pal["bad"])
+                    err.pack(anchor="w", pady=(px(6), 0))
+
+                    def submit(*_):
+                        raw = var.get().strip()
+                        if q["kind"] == "text":
+                            st["answers"][qid] = raw[:300]
+                            return advance(qid)
+                        if not re.fullmatch(r"\d{1,3}", raw) or not q.get("lo", 0) <= int(raw) <= q["hi"]:
+                            return err.config(text=f"Please type a number from {q.get('lo', 0)} to {q['hi']}.")
+                        choose(qid, int(raw), delay=0)
+                    bb = tk.Frame(col, background=pal["bg"])
+                    bb.pack(anchor="w", pady=(px(14), 0))
+                    big_btn(bb, "Next  ▶", submit, accent=True).pack(side="left")
+                    if q["kind"] == "text":
+                        big_btn(bb, "Skip", lambda: (st["answers"].pop(qid, None), advance(qid))).pack(
+                            side="left", padx=(px(10), 0))
+                    W.bind("<Return>", submit)
+                    en.focus_set()
+                nav = tk.Frame(col, background=pal["bg"])
+                nav.pack(anchor="w", fill="x", pady=(px(26), 0))
+                if st["hist"]:
+                    small_btn(nav, "◀  Back", back).pack(side="left")
+                small_btn(nav, "Stop — I need to talk to my counselor", stop).pack(side="right")
+
+            def choose(qid, value, delay=160):
+                st["answers"][qid] = value
+                W.after(delay, lambda: advance(qid))
+
+            def advance(qid):
+                if st["closed"] or st["qid"] != qid:
+                    return
+                vis = visible()
+                ids = [x["id"] for x in vis]
+                for k in list(st["answers"]):               # answers to questions that no longer apply
+                    if k not in ids:
+                        st["answers"].pop(k)
+                i = ids.index(qid) if qid in ids else -1
+                st["hist"].append(qid)
+                if i + 1 < len(ids):
+                    ask(ids[i + 1])
+                else:
+                    finish(completed=True)
+
+            def back():
+                if st["hist"]:
+                    ask(st["hist"].pop())
+
+            def stop():
+                st["stopped"] = True
+                finish(completed=False)
+
+            def finish(completed):
+                vis = visible()
+                answered = [q for q in vis if q["id"] in st["answers"]]
+                needed = [q for q in vis if q["kind"] != "text"]
+                complete = completed and all(q["id"] in st["answers"] for q in needed)
+                if answered:
+                    st["entry"] = self._assessment_store(cid, inst, group, st["answers"], complete, len(answered),
+                                                         len(needed), int(time.time() - st["start"]))
+                handback()
+
+            def handback():
+                clear()
+                lbl(col, "Thank you." if not st["stopped"] else "Okay.", fn["big"]).pack(anchor="w")
+                lbl(col, "Please hand the computer back to your counselor.", fn["q"]).pack(anchor="w", pady=(px(14), 0))
+                small_btn(col, "Counselor: continue", unlock_screen).pack(anchor="w", pady=(px(60), 0))
+
+            def unlock_screen():
+                clear()
+                lbl(col, "Counselor", fn["big"]).pack(anchor="w")
+                lbl(col, "Enter your vault password to see the results.", fn["s"], pal["muted"]).pack(
+                    anchor="w", pady=(px(8), px(14)))
+                pw = tk.Entry(col, show="•", font=fn["q"], width=24, relief="flat", highlightthickness=2,
+                              highlightbackground=pal["border"], highlightcolor=pal["accent"],
+                              background=pal["surface"], foreground=pal["text"], insertbackground=pal["text"])
+                pw.pack(anchor="w", ipady=px(6))
+                err = lbl(col, "", fn["s"], pal["bad"])
+                err.pack(anchor="w", pady=(px(6), 0))
+
+                def attempt(*_):
+                    if vault.verify(pw.get()):
+                        close()
+                    else:
+                        err.config(text="Incorrect password.")
+                        pw.delete(0, "end")
+                row = tk.Frame(col, background=pal["bg"])
+                row.pack(anchor="w", pady=(px(12), 0))
+                big_btn(row, "Continue", attempt, accent=True).pack(side="left")
+                if hello_state(vault):
+                    def accept(key):
+                        if not vault.key_ok(key):
+                            return False
+                        st["hello"] = False
+                        close()
+                        return True
+
+                    def say(text, bad=False):
+                        st["hello"] = True                    # the prompt must be able to come in front
+                        _quiet(W.attributes, "-topmost", False)
+                        err.config(text=text, foreground=pal["bad"] if bad else pal["muted"])
+
+                    def give_up(text):
+                        st["hello"] = False
+                        _quiet(W.attributes, "-topmost", True)
+                        err.config(text=text, foreground=pal["bad"])
+                        _quiet(pw.focus_set)
+                    auto, again = hello_flow(lambda: not st["closed"] and W.winfo_exists() and pw.winfo_exists(),
+                                             accept, say, give_up)
+                    big_btn(row, "👆  Fingerprint", again).pack(side="left", padx=(px(10), 0))
+                    st["hello_fn"] = again
+                    W.after(300, auto)                        # ask for the fingerprint straight away
+                small_btn(row, "Back to the patient's screen", handback).pack(side="left", padx=(px(14), 0))
+                W.bind("<Return>", attempt)
+                pw.focus_set()
+                st["pw"] = pw
+
+            def close():
+                st["closed"] = True
+                self._assessing = False
+                self.last_activity = time.time()
+                _quiet(W.grab_release)
+                W.destroy()
+                e = st["entry"]
+                if e is None:
+                    self.set_status(f"{code}: {inst['name']} stopped before any answers — nothing saved.")
+                    return
+                if not e.get("completed") and not messagebox.askyesno(
+                        APP_NAME, f"{inst['name']} was stopped after {e.get('answered', 0)} of {e.get('of', 0)} "
+                                  "questions. Keep the partial answers?"):
+                    self.assessment_delete(cid, e["id"])
+                    self.set_status(f"{code}: partial {inst['name']} discarded.")
+                    if self.client_id == cid and not self.wizard:
+                        self.refresh_client_page(cid, select="assess")
+                    return
+                if self.client_id == cid and not self.wizard:
+                    self.refresh_client_page(cid, select="assess")
+                self.assessment_results(vault.load_client(cid), e)
+
+            W.bind("<Escape>", lambda e: "break")
+            W.bind("<Control-Shift-Q>", lambda e: unlock_screen())       # counselor's way out at any point
+            W.bind("<Control-Shift-q>", lambda e: unlock_screen())
+            intro()
+            W.update_idletasks()
+            _quiet(W.grab_set)
+            W.focus_force()
+            keep_front()
+            self._assess_run = {"win": W, "state": st, "choose": choose, "ask": ask, "stop": stop,
+                                "unlock": unlock_screen, "visible": visible, "close": close}
+            return W
+
+        def _assessment_store(self, cid, inst, group, answers, completed, answered, of, secs):
+            """Save one administration right away (and a PHQ-9/GAD-7 also as a score for the charts and notes)."""
+            res = score_assessment(inst["id"], answers)
+            now = datetime.now()
+            entry = {"id": uuid.uuid4().hex[:12], "name": inst["name"], "instrument": inst["id"], "group": group,
+                     "date": now.date().isoformat(), "time": now.strftime("%H:%M"), "answers": dict(answers),
+                     "result": res, "score": res.get("summary", ""), "notes": "", "file_id": "", "administered": True,
+                     "completed": bool(completed), "answered": answered, "of": of, "duration": secs,
+                     "added": now.isoformat(timespec="seconds"), "updated": now.isoformat(timespec="seconds")}
+            c = vault.load_client(cid)
+            kind = inst.get("measure_kind")
+            if completed and kind:
+                try:
+                    m = measure_entry(kind, entry["date"], items=[int(answers[str(i)]) for i in
+                                                                  range(1, MEASURES[kind]["items"] + 1)],
+                                      source="taken here")
+                    c.setdefault("measures", []).append(m)
+                    entry["measure_id"] = m["id"]
+                except (ValueError, KeyError):
+                    pass
+            c.setdefault("assessments", []).append(entry)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            return entry
+
+        def assessment_delete(self, cid, aid):
+            c = vault.load_client(cid)
+            a = next((x for x in c.get("assessments") or [] if x.get("id") == aid), None)
+            c["assessments"] = [x for x in c.get("assessments") or [] if x.get("id") != aid]
+            if a and a.get("measure_id"):
+                c["measures"] = [m for m in c.get("measures") or [] if m.get("id") != a["measure_id"]]
+            vault.save_client(c)
+            self._sig = vault.signature()
+
+        def draw_assess_chart(self, parent, inst, entries):
+            """Each administration over time (oldest first); several scores share the chart as % of their maximum."""
+            series = inst.get("series") or [("Total", None)]
+            h = px(170)
+            c = register(tk.Canvas(parent, height=h, highlightthickness=0, borderwidth=0), "canvas")
+            c.configure(background=P("surface"))
+            colors = [P("accent"), P("warn"), P("good")]
+
+            def val(e, key):
+                r = e.get("result") or {}
+                v = (r.get("values") or {}).get(key)
+                if v is None and key == "Total":
+                    v = r.get("total")
+                return v
+
+            def draw(w):
+                c.delete("all")
+                left, right, top_, bottom = px(44), w - px(16), px(14), h - px(30)
+                n = len(entries)
+                X = lambda i: left + (right - left) * ((i + 0.5) / max(n, 1))
+                c.create_line(left, bottom, right, bottom, fill=P("border"))
+                for frac, txt in ((0, "0"), (1, "max")):
+                    y_ = bottom - (bottom - top_) * frac
+                    c.create_text(left - px(6), y_, text=txt, anchor="e", fill=P("muted"), font=F["caption"])
+                for si, (key, mx) in enumerate(series):
+                    mx = mx or (entries[-1].get("result") or {}).get("max") or 1
+                    pts = [(X(i), bottom - (bottom - top_) * min(float(val(e, key) or 0) / mx, 1.0), val(e, key))
+                           for i, e in enumerate(entries) if val(e, key) is not None]
+                    col_ = colors[si % len(colors)]
+                    if len(pts) >= 2:
+                        c.create_line(*[v for x_, y_, _ in pts for v in (x_, y_)], fill=col_, width=2)
+                    for x_, y_, v in pts:
+                        c.create_oval(x_ - 4, y_ - 4, x_ + 4, y_ + 4, fill=col_, outline=P("surface"))
+                        c.create_text(x_, y_ - px(10), text=f"{v:g}" if isinstance(v, (int, float)) else str(v),
+                                      fill=P("text"), font=F["caption_strong"])
+                    if len(series) > 1:
+                        c.create_text(right - px(4), top_ + px(14) * si, text=key, anchor="ne", fill=col_,
+                                      font=F["caption_strong"])
+                for i, e in enumerate(entries):
+                    c.create_text(X(i), bottom + px(5), text=fmt_date(e.get("date", "")), anchor="n", fill=P("muted"),
+                                  font=F["caption"])
+            c.bind("<Configure>", lambda e: draw(max(e.width, px(320))))
+            return c
+
+        def assessment_report(self, client, entry):
+            """Plain-text summary (for Copy)."""
+            inst = ASSESS_INSTRUMENTS.get(entry.get("instrument"), {})
+            r = entry.get("result") or {}
+            out = [f"{inst.get('title', entry.get('name', 'Assessment'))} ({entry.get('name', '')})",
+                   f"Taken {fmt_date(entry.get('date', ''))} {entry.get('time', '')} — "
+                   + self.assessment_session_label(client["id"], entry.get("date", "")),
+                   f"Result: {r.get('summary', '')}"]
+            if not entry.get("completed", True):
+                out.append(f"Stopped early: {entry.get('answered', 0)} of {entry.get('of', 0)} questions answered.")
+            out += [f"⚠ {x}" for x in r.get("flags") or []]
+            out += r.get("lines") or []
+            if entry.get("notes"):
+                out.append("Notes: " + entry["notes"])
+            return "\n".join(out)
+
+        def assessment_results(self, client, entry):
+            """The counselor's view of one administration: score, flags, meaning, trend, every answer."""
+            cid = client["id"]
+            client = vault.load_client(cid)
+            inst = ASSESS_INSTRUMENTS.get(entry.get("instrument"), {"title": entry.get("name", ""), "items": []})
+            r = entry.get("result") or {}
+            win = new_window(root, f"{client.get('code', '')} — {entry.get('name', '')} results", "920x800")
+            outer, box = scrollable(win, padding=(px(22), px(16)))
+            outer.pack(fill="both", expand=True)
+            ttk.Label(box, text=f"{entry.get('name', '')} — results", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(box, text=inst.get("title", ""), style="Muted.TLabel").pack(anchor="w")
+            meta = f"Taken {fmt_date(entry.get('date', ''))} {entry.get('time', '')}  ·  " + \
+                self.assessment_session_label(cid, entry.get("date", ""))
+            if entry.get("duration"):
+                meta += f"  ·  {entry['duration'] // 60} min {entry['duration'] % 60} s"
+            ttk.Label(box, text=meta, style="Caption.TLabel").pack(anchor="w", pady=(px(2), 0))
+            if not entry.get("completed", True):
+                ttk.Label(box, text=f"Stopped early: {entry.get('answered', 0)} of {entry.get('of', 0)} questions "
+                                    "answered — the score is incomplete.", style="Warn.TLabel").pack(anchor="w")
+            for fl in r.get("flags") or []:
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(px(8), 0))
+                ttk.Label(card, text="⚠  " + fl, style="BadStrong.TLabel", wraplength=px(780), justify="left").pack(
+                    anchor="w")
+            if entry.get("instrument") != "bssa" and (r.get("risk") or r.get("flags")):
+                ttk.Button(box, text="Start a Brief Suicide Safety Assessment…", style="Accent.TButton",
+                           command=lambda: self.bssa_dialog(client, entry)).pack(anchor="w", pady=(px(8), 0))
+            ttk.Label(box, text=r.get("summary", ""), style="Badge.TLabel", wraplength=px(800), justify="left").pack(
+                anchor="w", pady=(px(12), px(4)))
+            for line in r.get("lines") or []:
+                ttk.Label(box, text=line, wraplength=px(800), justify="left").pack(anchor="w", pady=px(1))
+            # trend: every completed administration of this instrument
+            same = sorted([a for a in client.get("assessments") or [] if a.get("instrument") == entry.get("instrument")
+                           and a.get("administered") and a.get("completed", True)],
+                          key=lambda a: (a.get("date", ""), a.get("added", "")))
+            if entry.get("instrument") in ASSESS_INSTRUMENTS and (r.get("values") or r.get("total") is not None):
+                ttk.Label(box, text="Trend", style="Strong.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+                if len(same) >= 2:
+                    self.draw_assess_chart(box, inst, same).pack(fill="x", padx=(0, px(8)))
+                    prev = [a for a in same if (a.get("date", ""), a.get("added", "")) <
+                            (entry.get("date", ""), entry.get("added", "")) and a.get("id") != entry.get("id")]
+                    if prev and r.get("total") is not None and (prev[-1].get("result") or {}).get("total") is not None:
+                        ch = r["total"] - prev[-1]["result"]["total"]
+                        better = (ch > 0) == bool(inst.get("higher_better"))
+                        word = "no change" if not ch else ("better" if better else "worse")
+                        ttk.Label(box, text=f"{'+' if ch > 0 else ''}{ch} since {fmt_date(prev[-1].get('date', ''))} "
+                                            f"({prev[-1]['result'].get('summary', '')}) — {word}.",
+                                  style="Good.TLabel" if word == "better" else "Warn.TLabel" if word == "worse"
+                                  else "Muted.TLabel").pack(anchor="w", pady=(px(4), 0))
+                else:
+                    ttk.Label(box, text="The trend appears once this has been taken again.", style="Muted.TLabel").pack(
+                        anchor="w")
+            # every answer
+            answers = entry.get("answers") or {}
+            items = [q for q in inst.get("items") or [] if q["id"] in answers]
+            if items:
+                ttk.Label(box, text="Answers", style="Strong.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+                for n, q in enumerate(items, 1):
+                    row = ttk.Frame(box)
+                    row.pack(fill="x", pady=px(1))
+                    v = answers[q["id"]]
+                    shown = _label_of(inst, q["id"], v) if q["kind"] == "choice" else (
+                        f"{v} {q.get('unit', '')}".strip() if q["kind"] == "number" else (v or "—"))
+                    ttk.Label(row, text=f"{n}. {q['text']}", wraplength=px(560), justify="left").pack(side="left",
+                                                                                                    anchor="w")
+                    ttk.Label(row, text=shown, style="Strong.TLabel", wraplength=px(220), justify="right").pack(
+                        side="right", anchor="e")
+            if entry.get("instrument") == "bssa":
+                for line in (entry.get("report") or []):
+                    ttk.Label(box, text=line, wraplength=px(800), justify="left").pack(anchor="w", pady=px(1))
+            ttk.Label(box, text="Notes", style="Strong.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+            nfr, notes = scrolled_text(box, height=4)
+            nfr.pack(fill="x")
+            set_text(notes, entry.get("notes", ""))
+            bar = Flow(box, gap=px(8))
+            bar.pack(fill="x", pady=(px(10), 0))
+
+            def save_notes():
+                c = vault.load_client(cid)
+                for a in c.get("assessments") or []:
+                    if a.get("id") == entry["id"]:
+                        a["notes"] = get_text(notes).strip()
+                        a["updated"] = datetime.now().isoformat(timespec="seconds")
+                        entry["notes"] = a["notes"]
+                vault.save_client(c)
+                self.set_status("Notes saved.")
+            bar.add(ttk.Button(bar, text="Save notes", command=save_notes))
+            bar.add(ttk.Button(bar, text="Copy summary",
+                               command=lambda: self.copy(self.assessment_report(client, entry), "Assessment summary")))
+            bar.add(ttk.Button(bar, text="Close", command=win.destroy))
+            if inst.get("credit"):
+                ttk.Label(box, text=inst["credit"], style="Caption.TLabel", wraplength=px(800), justify="left").pack(
+                    anchor="w", pady=(px(14), 0))
+            box.realize_all()
+            self._results_win = {"win": win, "notes": notes, "save": save_notes}
+            return win
+
+        BSSA_SYMPTOMS = ["Depression", "Anxiety", "Impulsivity / recklessness", "Hopelessness", "Anhedonia",
+                         "Isolation", "Irritability", "Substance or alcohol use", "Sleep problems", "Appetite changes",
+                         "Other concerning changes"]
+        BSSA_DISPOSITIONS = [
+            ("emergency", "Emergency psychiatric evaluation — imminent risk (current suicidal thoughts): send to the "
+                          "emergency department (unless the patient's current mental health provider is reached and an "
+                          "alternative safety plan for imminent risk is in place)."),
+            ("further", "Further evaluation of risk is necessary — review the safety plan; mental health referral as "
+                        "soon as possible (preferably within 72 hours)."),
+            ("nonurgent", "Might benefit from non-urgent mental health follow-up — review the safety plan; referral."),
+            ("none", "No further intervention is necessary at this time.")]
+
+        def bssa_dialog(self, client, from_entry=None):
+            """NIMH's Brief Suicide Safety Assessment as a form you fill in with the patient (after a positive
+            screen)."""
+            cid = client["id"]
+            win = new_window(root, f"{client.get('code', '')} — Brief Suicide Safety Assessment", "860x860")
+            win.grab_set()
+            outer, f = scrollable(win, padding=(px(22), px(16)))
+            outer.pack(fill="both", expand=True)
+            ttk.Label(f, text="Brief Suicide Safety Assessment", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="NIMH ASQ toolkit guide for clinicians, used after a positive suicide risk screen. Interview "
+                              "the patient alone. When you have enough information for a disposition, the assessment "
+                              "is complete." + (f"  Following: {from_entry.get('name')} "
+                                                f"{(from_entry.get('result') or {}).get('summary', '')} "
+                                                f"({fmt_date(from_entry.get('date', ''))})." if from_entry else ""),
+                      style="Muted.TLabel", wraplength=px(780), justify="left").pack(anchor="w", pady=(px(2), px(8)))
+            ttk.Label(f, text="Start by thanking them: “These can be hard things to talk about. Thank you for telling "
+                              "us.”", style="Caption.TLabel", wraplength=px(780), justify="left").pack(anchor="w")
+            v = {}
+
+            def head(t):
+                ttk.Label(f, text=t, style="H2.TLabel").pack(anchor="w", pady=(px(14), px(2)))
+
+            def prompt(t):
+                ttk.Label(f, text=t, style="Caption.TLabel", wraplength=px(780), justify="left").pack(anchor="w")
+
+            def yn(key, text):
+                row = Flow(f, gap=px(10))
+                row.pack(fill="x", pady=px(2))
+                row.add(ttk.Label(row, text=text, wraplength=px(520), justify="left"))
+                v[key] = tk.StringVar(value="")
+                for opt in ("Yes", "No"):
+                    row.add(ttk.Radiobutton(row, text=opt, value=opt, variable=v[key]))
+
+            def text(key, label, height=2):
+                ttk.Label(f, text=label).pack(anchor="w", pady=(px(4), 0))
+                fr_, t_ = scrolled_text(f, height=height)
+                fr_.pack(fill="x")
+                v[key] = t_
+
+            head("Frequency of suicidal thoughts")
+            prompt("“In the past few weeks, have you been thinking about killing yourself?” If yes: “How often?” "
+                   "“When was the last time you had these thoughts?”")
+            yn("thoughts", "Thoughts of killing themselves in the past few weeks")
+            text("frequency", "How often / last time")
+            prompt("“Are you having thoughts of killing yourself right now?” (If yes: imminent risk — urgent/STAT mental "
+                   "health evaluation; don't leave the patient alone.)")
+            yn("now", "Thoughts of killing themselves right now")
+            head("Suicide plan / intent to die")
+            prompt("“Do you have a plan to kill yourself?” If yes: “What is your plan?” If no: “If you were going to "
+                   "kill yourself, how would you do it?” Ask about method and access to means.")
+            yn("plan", "Has a plan")
+            text("plan_detail", "Plan, method and access to means")
+            row = Flow(f, gap=px(8))
+            row.pack(fill="x", pady=px(2))
+            row.add(ttk.Label(row, text="“On a scale from 0 to 10, how serious are you about killing yourself?”"))
+            v["serious"] = tk.StringVar(value="")
+            row.add(ttk.Spinbox(row, from_=0, to=10, textvariable=v["serious"], width=4))
+            head("Past behavior")
+            prompt("“Have you ever tried to hurt yourself?” “Have you ever tried to kill yourself?” If yes: “How? When? "
+                   "Why?” “Did you want to die?” “Did you receive medical/psychiatric treatment?” Past suicidal "
+                   "behavior is the strongest risk factor for future attempts.")
+            yn("selfharm", "Past self-injury")
+            yn("attempt", "Past suicide attempt")
+            text("past_detail", "Method, when, intent, treatment")
+            head("Symptoms (in the past few weeks)")
+            sym = ttk.Frame(f)
+            sym.pack(fill="x")
+            for i, s in enumerate(self.BSSA_SYMPTOMS):
+                v["sym:" + s] = tk.BooleanVar(value=False)
+                ttk.Checkbutton(sym, text=s, variable=v["sym:" + s]).grid(row=i // 3, column=i % 3, sticky="w",
+                                                                          padx=(0, px(14)), pady=px(1))
+            text("sym_detail", "Details")
+            head("Social support & stressors")
+            prompt("Support network (a trusted person; past counseling), family conflict, work pressure, domestic "
+                   "violence (“Are you worried that anyone in your life is trying to hurt you?”), suicide contagion, "
+                   "and reasons for living (“What are some of the reasons you would NOT kill yourself?”).")
+            text("support", "Supports and stressors", 3)
+            text("reasons", "Reasons for living")
+            head("Safety plan")
+            prompt("Not a “safety contract” (not effective, may be dangerous). Who they'll tell or call, coping "
+                   "strategies, and securing or removing lethal means (guns, medications, ropes…).")
+            text("plan_people", "Who they will tell / call (including 988)")
+            text("plan_coping", "Coping strategies")
+            text("plan_means", "Means restriction")
+            prompt("“Do you think you need help to keep yourself safe?” (A no doesn't mean they're safe; a yes is a "
+                   "reason to act immediately.)")
+            yn("needhelp", "Says they need help to keep themselves safe")
+            head("Disposition")
+            v["disp"] = tk.StringVar(value="")
+            for key, label in self.BSSA_DISPOSITIONS:
+                ttk.Radiobutton(f, text=label, value=key, variable=v["disp"]).pack(anchor="w", pady=px(2))
+            v["resources"] = tk.BooleanVar(value=True)
+            ttk.Checkbutton(f, text="Resources given: 988 Suicide & Crisis Lifeline (call, text, chat 988) and Crisis "
+                                    "Text Line (text HOME to 741741)", variable=v["resources"]).pack(anchor="w",
+                                                                                                   pady=(px(8), 0))
+            text("notes", "Other notes")
+            msg = ttk.Label(f, text="", style="Bad.TLabel")
+            msg.pack(anchor="w", pady=(px(6), 0))
+
+            def get(k):
+                x = v[k]
+                return get_text(x).strip() if isinstance(x, tk.Text) else x.get()
+
+            def save():
+                disp = get("disp")
+                if not disp:
+                    return msg.config(text="Choose a disposition.")
+                lab = dict(self.BSSA_DISPOSITIONS)[disp]
+                ans = {k: (get(k) if not isinstance(v[k], tk.BooleanVar) else bool(v[k].get())) for k in v}
+                report = []
+                for key, label in (("thoughts", "Thoughts in the past few weeks"), ("now", "Thoughts right now"),
+                                   ("plan", "Has a plan"), ("selfharm", "Past self-injury"),
+                                   ("attempt", "Past suicide attempt"), ("needhelp", "Needs help to stay safe")):
+                    if ans.get(key):
+                        report.append(f"{label}: {ans[key]}")
+                if ans.get("serious") not in ("", None):
+                    report.append(f"Seriousness (0–10): {ans['serious']}")
+                syms = [s for s in self.BSSA_SYMPTOMS if ans.get("sym:" + s)]
+                if syms:
+                    report.append("Symptoms: " + ", ".join(syms))
+                for key, label in (("frequency", "Frequency / last time"), ("plan_detail", "Plan / means"),
+                                   ("past_detail", "Past behavior"), ("sym_detail", "Symptom details"),
+                                   ("support", "Supports & stressors"), ("reasons", "Reasons for living"),
+                                   ("plan_people", "Safety plan — people to tell/call"),
+                                   ("plan_coping", "Safety plan — coping"), ("plan_means", "Means restriction"),
+                                   ("notes", "Notes")):
+                    if ans.get(key):
+                        report.append(f"{label}: {ans[key]}")
+                report.append("Disposition: " + lab)
+                if ans.get("resources"):
+                    report.append("Resources given: 988 Suicide & Crisis Lifeline; Crisis Text Line.")
+                flags = []
+                if ans.get("now") == "Yes":
+                    flags.append("Thoughts of killing themselves right now: imminent risk — urgent/STAT mental health "
+                                 "evaluation; don't leave the patient alone.")
+                if ans.get("needhelp") == "Yes":
+                    flags.append("Says they need help to keep themselves safe: act immediately to ensure safety.")
+                now = datetime.now()
+                short = lab.split(" — ")[0].split(" (")[0]
+                entry = {"id": uuid.uuid4().hex[:12], "name": "Brief Suicide Safety Assessment", "instrument": "bssa",
+                         "date": now.date().isoformat(), "time": now.strftime("%H:%M"), "answers": {}, "report": report,
+                         "fields": ans, "result": {"summary": short, "lines": [], "flags": flags, "risk": True,
+                                                   "values": {}, "total": None},
+                         "score": short, "notes": "", "file_id": "", "administered": True, "completed": True,
+                         "follows": (from_entry or {}).get("id", ""), "added": now.isoformat(timespec="seconds"),
+                         "updated": now.isoformat(timespec="seconds")}
+                c = vault.load_client(cid)
+                c.setdefault("assessments", []).append(entry)
+                vault.save_client(c)
+                self._sig = vault.signature()
+                win.destroy()
+                self.set_status(f"{client.get('code', '')}: brief suicide safety assessment saved ({short}).")
+                if self.client_id == cid and not self.wizard:
+                    self.refresh_client_page(cid, select="assess")
+            btns = pin_bottom(ttk.Frame(win, padding=(px(22), 0, px(22), px(14))), pady=(px(6), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            self._bssa_win = {"win": win, "v": v, "save": save}
+            return win
+
+        # ---------------------------------------------------------------- imported documents
+        def repair_word_xml(self, client, sessions):
+            """Documents and notes imported from .docx before the fix could contain Word's formatting XML.
+            Re-read documents from their kept original; strip the XML from anything else. True if it changed
+            something."""
+            changed = False
+            docs = client.get("documents") or []
+            for d in docs:
+                if "<w:" not in (d.get("text") or ""):
+                    continue
+                new = ""
+                fe = self._file_entry(client, d.get("file_id"))
+                if fe and fe.get("name", "").lower().endswith(".docx"):
+                    try:
+                        new = text_from_bytes(vault.load_file(fe["id"]), ".docx").strip()
+                    except Exception:
+                        new = ""
+                d["text"] = new or strip_word_xml(d["text"]).strip()
+                changed = True
+            if changed:
+                vault.save_client(client)
+            for sid, data in sessions:
+                if data.get("meta", {}).get("source") == "imported" and "<w:" in (data.get("note") or ""):
+                    try:
+                        full = vault.load_session(sid)
+                        full["note"] = strip_word_xml(full.get("note", "")).strip()
+                        vault.save_session(full, sid)
+                        changed = True
+                    except Exception:
+                        pass
+            return changed
+
+        def move_to_documents(self, client, sid, d):
+            """An imported entry that isn't a session (a psychological assessment, records…): take it out of the
+            session list and put it on the Documents tab."""
+            types = self.doc_types() or list(DEFAULT_DOC_TYPES)
+            text = d.get("note", "")
+            win = new_window(root, f"{client.get('code', '')} — move to Documents", "520x240")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(20), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Move to Documents", style="H2.TLabel").pack(anchor="w")
+            ttk.Label(f, text=f"From {fmt_date(d['meta'].get('session_date', ''))}. It leaves the session list and "
+                              "goes on the patient's Documents tab.", style="Muted.TLabel", wraplength=px(460),
+                      justify="left").pack(anchor="w", pady=(px(2), px(8)))
+            var = tk.StringVar(value=guess_doc_type(text, types) or types[0])
+            row = Flow(f, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="Type"))
+            row.add(ttk.Combobox(row, textvariable=var, values=types, state="readonly", width=30))
+
+            def go():
+                now = datetime.now().isoformat(timespec="seconds")
+                c = vault.load_client(client["id"])
+                c.setdefault("documents", []).append({
+                    "id": uuid.uuid4().hex[:12], "type": var.get(), "date": d["meta"].get("session_date", ""),
+                    "title": "", "text": strip_word_xml(text).strip(), "file_id": "", "added": now,
+                    "moved_from": "imported note"})
+                vault.save_client(c)
+                vault.delete_session(sid)
+                self._sig = vault.signature()
+                win.destroy()
+                self.set_status(f"{client.get('code', '')}: moved to Documents as {var.get().lower()}.")
+                self.open_client(client["id"], select="docs")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Move", style="Accent.TButton", command=go).pack(side="right", padx=px(8))
+            self._move_doc_win = {"win": win, "type": var, "go": go}
+            return win
+
+        def doc_types(self):
+            """Document types for Import document (Settings ▸ Document types)."""
+            t = self.settings.get("doc_types")
+            return list(DEFAULT_DOC_TYPES if t is None else t)
+
+        def doc_view(self, client, doc):
+            win = new_window(root, f"{client.get('code', '')} — {doc.get('type', 'Document')}", "820x720")
+            f = ttk.Frame(win, padding=px(16))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=doc.get("type", "Document"), style="H2.TLabel").pack(anchor="w")
+            ttk.Label(f, text=fmt_date(doc.get("date", "")) + (f"  ·  {doc['title']}" if doc.get("title") else ""),
+                      style="Muted.TLabel").pack(anchor="w")
+            bar = Flow(f, gap=px(8))
+            bar.pack(fill="x", pady=(px(8), 0))
+            bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(doc.get("text", ""), doc.get("type", ""))))
+            fe = self._file_entry(vault.load_client(client["id"]), doc.get("file_id"))
+            if fe:
+                bar.add(ttk.Button(bar, text="Open original", command=lambda: self.vault_file_open(fe, win)))
+            fr, tb = scrolled_text(f, readonly=True, doc=True, tools=False)
+            fr.pack(fill="both", expand=True, pady=(px(8), 0))
+            set_text(tb, doc.get("text", ""))
+            return win
+
+        def doc_set_type(self, client, doc):
+            types = self.doc_types()
+            if doc.get("type") and doc["type"] not in types:
+                types.append(doc["type"])
+            win = new_window(root, "Change document type", "460x200")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(20), px(16)))
+            f.pack(fill="both", expand=True)
+            var = tk.StringVar(value=doc.get("type", ""))
+            ttk.Label(f, text="Type").pack(anchor="w")
+            ttk.Combobox(f, textvariable=var, values=types, state="readonly", width=32).pack(anchor="w", pady=(px(4), 0))
+
+            def ok():
+                c = vault.load_client(client["id"])
+                for d in c.get("documents") or []:
+                    if d.get("id") == doc.get("id"):
+                        d["type"] = var.get()
+                vault.save_client(c)
+                win.destroy()
+                self.refresh_client_page(client["id"], select="docs")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=ok).pack(side="right", padx=px(8))
+
+        def doc_remove(self, client, doc):
+            if not messagebox.askyesno(APP_NAME, f"Remove the {doc.get('type', 'document').lower()} from "
+                                                 f"{fmt_date(doc.get('date', ''))}?"
+                                       + ("\n\nIts original file is deleted from the vault too (on both computers)."
+                                          if doc.get("file_id") else "")):
+                return
+            if doc.get("file_id"):
+                _quiet(self.patient_file_remove, client["id"], doc["file_id"])
+            c = vault.load_client(client["id"])
+            c["documents"] = [d for d in c.get("documents") or [] if d.get("id") != doc.get("id")]
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.refresh_client_page(client["id"], select="docs")
+
+        def _render_docs(self, v, client, sessions):
+            client = vault.load_client(client["id"])
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Documents", style="H2.TLabel"))
+            head.add(ttk.Button(head, text="＋  Import document…", style="Accent.TButton",
+                                command=lambda: self.import_dialog(client)), gap=px(16))
+            ttk.Label(v, text="Imported reports and records (psychological assessments, evaluations, school or "
+                              "medical records…). The AI uses them for the case overview, treatment plans and "
+                              "Ask AI.", style="Muted.TLabel", wraplength=px(520), justify="left").pack(
+                anchor="w", pady=(px(2), 0))
+            sc, box = scrollable(v)
+            sc.pack(fill="both", expand=True, pady=(px(8), 0))
+            for doc in sorted(client.get("documents") or [], key=lambda d: (d.get("date", ""), d.get("added", "")),
+                              reverse=True):
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
+                card.pack(fill="x", pady=(0, px(6)), padx=(0, px(8)))
+                ttk.Label(card, text=f"{fmt_date(doc.get('date', ''))}   {doc.get('type', 'Document')}",
+                          style="Strong.TLabel").pack(anchor="w")
+                if doc.get("title"):
+                    ttk.Label(card, text=doc["title"], style="Caption.TLabel").pack(anchor="w")
+                prev = " ".join((doc.get("text") or "").split())
+                ttk.Label(card, text=prev[:200] + ("…" if len(prev) > 200 else ""), style="Muted.TLabel",
+                          wraplength=px(500), justify="left").pack(anchor="w", pady=(px(2), 0))
+                acts = Flow(card, gap=px(6))
+                acts.add(ttk.Button(acts, text="View", style="Accent.TButton",
+                                    command=lambda d=doc: self.doc_view(client, d)))
+                fe = self._file_entry(client, doc.get("file_id"))
+                if fe:
+                    acts.add(ttk.Button(acts, text="Open original", command=lambda e=fe: self.vault_file_open(e)))
+                acts.add(ttk.Button(acts, text="Change type…", command=lambda d=doc: self.doc_set_type(client, d)))
+                acts.add(ttk.Button(acts, text="Remove", command=lambda d=doc: self.doc_remove(client, d)), gap=px(12))
+                acts.pack(fill="x", pady=(px(6), 0))
+            box.realize_all()
+
+        # ---------------------------------------------------------------- External communication log
+        def comm_save(self, cid, entry):
+            """Add (or update, by id) one texts/emails entry in the patient's External communication log."""
+            c = vault.load_client(cid)
+            lst = c.setdefault("communications", [])
+            now = datetime.now().isoformat(timespec="seconds")
+            entry = dict(entry, id=entry.get("id") or uuid.uuid4().hex[:12], added=entry.get("added") or now,
+                         updated=now)
+            for i, x in enumerate(lst):
+                if x.get("id") == entry["id"]:
+                    lst[i] = entry
+                    break
+            else:
+                lst.append(entry)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            return entry
+
+        def comm_add(self, cid, entry):
+            """Log new texts/emails/contacts: one entry per date, merged into an entry already there for the same
+            date, person and way of contact. Returns the (first) entry it went into."""
+            c = vault.load_client(cid)
+            lst = c.setdefault("communications", [])
+            touched = merge_contacts(lst, entry)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            return touched[0] if touched else None
+
+        def comm_remove(self, client, entry):
+            if not messagebox.askyesno(APP_NAME, f"Remove the {entry.get('method', 'messages').lower()} from "
+                                                 f"{fmt_date(entry.get('date', ''))} from the log?"):
+                return
+            c = vault.load_client(client["id"])
+            c["communications"] = [x for x in c.get("communications") or [] if x.get("id") != entry.get("id")]
+            vault.save_client(c)
+            self._sig = vault.signature()
+            self.refresh_client_page(client["id"], select="comms")
+
+        @staticmethod
+        def comm_party(entry):
+            if entry.get("mixed"):
+                return "several people"
+            w, who = entry.get("with", "patient"), (entry.get("who") or "").strip()
+            return {"patient": "Patient", "parent": "Parent / guardian"}.get(w, who.capitalize() or "Other contact")
+
+        def comm_view(self, client, entry):
+            win = new_window(root, f"{client.get('code', '')} — {entry.get('method', 'Messages')} "
+                                   f"{fmt_date(entry.get('date', ''))}", "780x680")
+            f = ttk.Frame(win, padding=px(16))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=f"{entry.get('method', 'Messages')} with {self.comm_party(entry).lower()}",
+                      style="H2.TLabel").pack(anchor="w")
+            ttk.Label(f, text=fmt_date(entry.get("date", "")), style="Muted.TLabel").pack(anchor="w")
+            if entry.get("notes"):
+                ttk.Label(f, text="Note: " + entry["notes"], wraplength=px(700), justify="left").pack(
+                    anchor="w", pady=(px(6), 0))
+            bar = Flow(f, gap=px(8))
+            bar.pack(fill="x", pady=(px(8), 0))
+            bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(entry.get("text", ""), "Messages")))
+            fr, tb = scrolled_text(f, readonly=True)
+            fr.pack(fill="both", expand=True, pady=(px(8), 0))
+            self.render_thread(tb, entry.get("text", ""))
+            return win
+
+        def contact_entries(self, client, sessions):
+            """The patient's contact history, newest first: logged contacts (calls, visits, texts, emails) and
+            contact notes. Each: (date, sort key, label, ("log", entry) | ("day", date))."""
+            out = []
+            for x in client.get("communications") or []:
+                when = (x.get("time") or "")
+                out.append((x.get("date", ""), (x.get("date", ""), when, x.get("added", "")),
+                            f"{fmt_date(x.get('date', ''))}" + (f"  {when}" if when else "") +
+                            f"   {x.get('method', 'Contact')}  ·  {self.comm_party(x)}", ("log", x)))
+            for day, records in group_by_date(sessions):
+                if is_contact_day(records):
+                    meta = records[0][1]["meta"]
+                    how = meta.get("contact_method") or ""
+                    review = any(d["meta"].get("needs_review") for _, d in records)
+                    out.append((day, (day, "", meta.get("created", "")),
+                                f"{fmt_date(day)}   {day_title(records)} note" + (f"  ·  {how}" if how else "")
+                                + ("  · ⚠ review" if review else ""), ("day", day)))
+            for x in client.get("contact_summaries") or []:
+                out.append((x.get("end", ""), (x.get("end", ""), "~", x.get("created", "")),
+                            f"{fmt_date(x.get('start', ''))} → {fmt_date(x.get('end', ''))}   📝 Contact summary"
+                            + ("  · ⚠ review" if x.get("needs_review") else ""), ("sum", x)))
+            out.sort(key=lambda e: e[1], reverse=True)
+            return out
+
+        def _render_contact_summary(self, detail, client, x):
+            """A contact summary note: editable, with Save, Copy, Export and Remove."""
+            bar = Flow(detail, gap=px(8))
+            bar.pack(fill="x")
+            bar.add(ttk.Label(bar, text="Contact summary", style="Strong.TLabel"))
+            bar.add(ttk.Label(bar, text=f"{fmt_date(x.get('start', ''))} → {fmt_date(x.get('end', ''))}"
+                                        + (f"  ·  {x['counts']}" if x.get("counts") else ""), style="Muted.TLabel"),
+                    gap=px(4))
+            fr, tb = scrolled_text(detail)
+            msg = ttk.Label(detail, text="⚠  Drafted by the AI — check it against the contacts, then Save."
+                            if x.get("needs_review") else "", style="Warn.TLabel")
+
+            def save():
+                c = vault.load_client(client["id"])
+                for s in c.get("contact_summaries") or []:
+                    if s.get("id") == x["id"]:
+                        s["text"] = get_text(tb).strip()
+                        s["needs_review"] = False
+                        s["updated"] = datetime.now().isoformat(timespec="seconds")
+                        x.update(s)
+                vault.save_client(c)
+                self._sig = vault.signature()
+                msg.config(text="")
+                self.set_status(f"{client.get('code', '')}: contact summary saved.")
+                self.refresh_client_page(client["id"], select="comms")
+
+            def remove():
+                if not messagebox.askyesno(APP_NAME, f"Remove the contact summary for {fmt_date(x.get('start', ''))} "
+                                                     f"→ {fmt_date(x.get('end', ''))}?"):
+                    return
+                c = vault.load_client(client["id"])
+                c["contact_summaries"] = [s for s in c.get("contact_summaries") or [] if s.get("id") != x.get("id")]
+                vault.save_client(c)
+                self._sig = vault.signature()
+                self.refresh_client_page(client["id"], select="comms")
+            title = f"Contact summary {fmt_date(x.get('start', ''))} to {fmt_date(x.get('end', ''))}"
+            bar.add(ttk.Button(bar, text="Save", style="Accent.TButton", command=save), gap=px(16))
+            bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(get_text(tb), "Contact summary")))
+            bar.add(ttk.Button(bar, text="Export…", command=lambda: self.export_text(
+                detail.winfo_toplevel(), title, get_text(tb),
+                f"{client.get('code', 'patient')}_contacts_{x.get('start', '')}_to_{x.get('end', '')}")))
+            bar.add(ttk.Button(bar, text="Remove", command=remove), gap=px(12))
+            msg.pack(anchor="w", pady=(px(4), 0))
+            fr.pack(fill="both", expand=True, pady=(px(6), 0))
+            set_text(tb, x.get("text", ""))
+            detail._summary = {"text": tb, "save": save}
+
+        def contact_summary_dialog(self, client):
+            """Pick two dates: the AI writes one detailed summary note of every text, email, call and contact
+            note between them."""
+            cid, code = client["id"], client.get("code", "")
+            client = vault.load_client(cid)
+            sessions = vault.sessions_for(cid)
+            days = sorted({x.get("date", "") for x in client.get("communications") or [] if x.get("date")} |
+                          {d for d, r in group_by_date(sessions) if is_contact_day(r)})
+            win = new_window(root, f"{code} — summarize contacts", "640x520")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Summarize a period", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="The AI writes one detailed note of every text, email, call and contact note between "
+                              "two dates (by date, concerns, what you shared, agreements, safety, relevance to "
+                              "treatment). It's saved in the Contact log as a draft for you to check.",
+                      style="Muted.TLabel", wraplength=px(580), justify="left").pack(anchor="w", pady=(px(2), px(10)))
+            today = date.today().isoformat()
+            # the last 30 days up to the latest contact (or today)
+            last = max(days[-1], today) if days else today
+            a_var = tk.StringVar(value=(date.fromisoformat(last) - timedelta(days=30)).isoformat())
+            b_var = tk.StringVar(value=last)
+            row = Flow(f, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="From"))
+            row.add(date_field(row, a_var, on_pick=lambda _d: recount()))
+            row.add(ttk.Label(row, text="to"), gap=px(10))
+            row.add(date_field(row, b_var, on_pick=lambda _d: recount()))
+            count_lbl = ttk.Label(f, text="", style="Caption.TLabel")
+            count_lbl.pack(anchor="w", pady=(px(6), 0))
+            ttk.Label(f, text="Anything to focus on or add? (optional)", style="H2.TLabel").pack(anchor="w",
+                                                                                               pady=(px(12), 0))
+            ofr, obs = scrolled_text(f, height=4)
+            ofr.pack(fill="x", pady=(px(4), 0))
+            ttk.Label(f, text="Names on the “names to hide” list are replaced, and email addresses, phone numbers and "
+                              "links removed, before the AI (on this computer) sees anything.", style="Muted.TLabel",
+                      wraplength=px(580), justify="left").pack(anchor="w", pady=(px(8), 0))
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            status = ttk.Label(btns, text="", style="Muted.TLabel")
+            status.pack(side="left")
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            go = ttk.Button(btns, text="Write summary", style="Accent.TButton")
+            go.pack(side="right", padx=px(8))
+
+            def period():
+                a, b = a_var.get().strip(), b_var.get().strip()
+                try:
+                    date.fromisoformat(a)
+                    date.fromisoformat(b)
+                except ValueError:
+                    return None
+                return (a, b) if a <= b else (b, a)
+
+            def recount(*_):
+                p = period()
+                if not p:
+                    count_lbl.config(text=f"Use dates like {fmt_date('2026-09-01')} (or pick them from the calendar).")
+                    return
+                _b, counts = contact_period_blocks(vault.load_client(cid), vault.sessions_for(cid), *p)
+                count_lbl.config(text=contact_counts_text(counts))
+            for v_ in (a_var, b_var):
+                v_.trace_add("write", lambda *_: win.after_idle(recount))
+            recount()
+
+            def run():
+                p = period()
+                if not p:
+                    return status.config(text="Enter both dates.")
+                start, end = p
+                fresh = vault.load_client(cid)
+                note_txt = get_text(obs).strip()
+                try:
+                    _code, hide, _context, _used, values = self._gen_inputs(fresh, None, end, "", note_txt)
+                except Exception as e:
+                    return messagebox.showerror(APP_NAME, friendly_error(e), parent=win)
+                blocks, counts = contact_period_blocks(fresh, vault.sessions_for(cid), start, end, hide)
+                if not blocks:
+                    return status.config(text="There are no contacts between those dates.")
+                job_cfg, counts_txt = dict(cfg), contact_counts_text(counts)
+
+                def done(text):
+                    now = datetime.now().isoformat(timespec="seconds")
+                    entry = {"id": uuid.uuid4().hex[:12], "start": start, "end": end, "text": (text or "").strip(),
+                             "counts": counts_txt, "observations": note_txt, "needs_review": True,
+                             "created": now, "updated": now}
+                    c = vault.load_client(cid)
+                    c.setdefault("contact_summaries", []).append(entry)
+                    vault.save_client(c)
+                    self._sig = vault.signature()
+                    if self._alive(win):
+                        win.destroy()
+                    self.set_status(f"{code}: contact summary written ({fmt_date(start)} → {fmt_date(end)}) — "
+                                    "review it.")
+                    self._contact_focus = ("sum", entry["id"])
+                    if self.client_id == cid and not self.wizard:
+                        self.refresh_client_page(cid, select="comms")
+                    else:
+                        self.open_client(cid, select="comms")
+
+                def failed(m):
+                    if self._alive(win):
+                        win.destroy()
+                    messagebox.showerror(APP_NAME, f"Couldn't write the contact summary: {m}")
+                r = self.run_bg(lambda prog: generate_contact_summary(job_cfg, values, blocks, start, end, prog),
+                                done, failed, label=f"summarizing contacts for {code}", patient=code, pausable=True)
+                if r:
+                    go.config(state="disabled")
+                    status.config(text="Writing… (you can keep working; it opens when it's done)" if r != "queued"
+                                  else "Waiting in line — it starts when the current task finishes.")
+            go.config(command=run)
+            self._summary_win = {"win": win, "a": a_var, "b": b_var, "obs": obs, "go": go, "count": count_lbl,
+                                 "status": status, "recount": recount}
+            return win
+
+        def _render_comms(self, v, client, sessions):
+            """Contact log: every contact outside sessions, dated like the session list; the one picked shows
+            below."""
+            client = vault.load_client(client["id"])
+            head = Flow(v, gap=px(8))
+            head.pack(fill="x")
+            head.add(ttk.Label(head, text="Contact log", style="H2.TLabel"))
+            head.add(ttk.Button(head, text="＋  Log a contact…", style="Accent.TButton",
+                                command=lambda: self.contact_log_dialog(client)), gap=px(16))
+            head.add(ttk.Button(head, text="Texts / emails / call recording…",
+                                command=lambda: self.external_comm(client)))
+            head.add(ttk.Button(head, text="📝  Summarize a period…",
+                                command=lambda: self.contact_summary_dialog(client)))
+            entries = self.contact_entries(client, sessions)
+            if not entries:
+                ttk.Label(v, text="No contacts yet. “Log a contact…” records a call, voicemail, visit or message "
+                                  "(date, who, how and a summary); “Texts / emails / call recording…” brings in the "
+                                  "messages themselves or a recorded call.", style="Muted.TLabel", wraplength=px(560),
+                          justify="left").pack(anchor="w", pady=(px(6), 0))
+                return
+            oldest = cfg.get("contact_sort", "desc") == "asc"        # (like the session list's order button)
+            if oldest:
+                entries.reverse()
+            srt = ttk.Frame(v)
+            srt.pack(fill="x", pady=(px(4), px(2)))
+            ttk.Label(srt, text=f"{len(entries)} contact{'s' if len(entries) != 1 else ''}",
+                      style="Caption.TLabel").pack(side="left")
+
+            def flip_order():
+                cfg["contact_sort"] = "desc" if oldest else "asc"
+                save_config(cfg)
+                self.refresh_client_page(client["id"], select="comms")
+            ttk.Button(srt, text="↑  Oldest first" if oldest else "↓  Newest first", command=flip_order).pack(
+                side="right")
+            lbox, clb = auto_scroll(v, lambda b: NiceList(b, "List.Treeview"))
+            lbox.pack(fill="x")
+            clb.configure(height=min(max(len(entries), 2), 4))      # (scrolls) — leaves the room for the thread
+            for e in entries:
+                clb.insert("end", e[2])
+            detail = ttk.Frame(v)
+            detail.pack(fill="both", expand=True, pady=(px(10), 0))
+
+            def show(i):
+                for w in detail.winfo_children():
+                    w.destroy()
+                kind, val = entries[i][3]
+                self._contact_focus = (kind, val.get("id") if kind in ("log", "sum") else val)
+                if kind == "day":
+                    recs = dict(group_by_date(sessions)).get(val, [])
+                    self._render_day(detail, client, val, recs)
+                    return
+                if kind == "sum":
+                    self._render_contact_summary(detail, client, val)
+                    return
+                x = val
+                bar = Flow(detail, gap=px(8))                # title, date and actions share one line
+                bar.pack(fill="x")
+                bar.add(ttk.Label(bar, text=f"{x.get('method', 'Contact')} with {self.comm_party(x).lower()}",
+                                  style="Strong.TLabel"))
+                bar.add(ttk.Label(bar, text=fmt_date(x.get("date", "")) + (f"  {x['time']}" if x.get("time") else ""),
+                                  style="Muted.TLabel"), gap=px(4))
+                if x.get("notes"):
+                    ttk.Label(detail, text="Note: " + x["notes"], wraplength=px(560), justify="left").pack(
+                        anchor="w", pady=(px(4), 0))
+                bar.add(ttk.Button(bar, text="⤢  Open", style="Accent.TButton",
+                                   command=lambda: self.comm_view(client, x)), gap=px(16))
+                bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(x.get("text", ""), "Contact")))
+                bar.add(ttk.Button(bar, text="Edit…", command=lambda: self.contact_log_dialog(client, x)))
+                bar.add(ttk.Button(bar, text="Remove", command=lambda: self.comm_remove(client, x)), gap=px(12))
+                fr, tb = scrolled_text(detail, readonly=True)
+                fr.pack(fill="both", expand=True, pady=(px(6), 0))
+                self.render_thread(tb, x.get("text", ""))
+
+            clb.bind("<<ListboxSelect>>", lambda e: clb.curselection() and show(clb.curselection()[0]))
+            focus = getattr(self, "_contact_focus", None)
+            i0 = next((i for i, e in enumerate(entries) if focus and (
+                (focus[0] in ("log", "sum") and e[3][0] == focus[0] and e[3][1].get("id") == focus[1]) or
+                (focus[0] == "day" and e[3] == ("day", focus[1])))), len(entries) - 1 if oldest else 0)
+            clb.selection_set(i0)                    # (the newest one, unless another was chosen)
+            clb.see(i0)
+            show(i0)
+            v._contacts = {"list": clb, "entries": entries, "show": show}
+
+        def render_thread(self, t, text):
+            """Show a logged thread so it's easy to follow: the subject, then each email or text under a bold
+            "who → whom" line with its date and time, emails as paragraphs, a rule between emails. Text that isn't
+            a dated thread (a typed summary) is shown as it is."""
+            pre, subject, blocks = contact_blocks(text)
+            t.config(state="normal")
+            t.delete("1.0", "end")
+            if not blocks:
+                t.insert("1.0", text or "")
+                t.config(state="disabled")
+                return
+            t.tag_configure("subj", font=F["sub"], spacing3=px(8))
+            t.tag_configure("who", font=F["strong"], spacing1=px(10))
+            t.tag_configure("when", font=F["caption"], foreground=P("muted"))
+            t.tag_configure("body", lmargin1=px(14), lmargin2=px(14), spacing1=px(2), spacing3=px(2))
+            t.tag_configure("react", font=F["caption"], foreground=P("muted"), lmargin1=px(14), lmargin2=px(14))
+            t.tag_configure("rule", foreground=P("border"), spacing1=px(6), spacing3=px(2))
+            if subject:
+                t.insert("end", subject + "\n", "subj")
+            if pre:
+                t.insert("end", reflow_paragraphs("\n".join(pre)).strip() + "\n", "body")
+            t.tag_configure("esubj", font=F["strong"], foreground=P("muted"), spacing1=px(10))
+            head_re = re.compile(r"^\[(\d{4}-\d\d-\d\d)(?: ([^\]]+))?\]\s*(.*)$", re.S)
+            subj_key = lambda s: re.sub(r"^((re|fwd?|aw|sv)\s*:\s*)+", "", (s or "").strip(), flags=re.I).lower()
+            last_subj = subj_key(subject)
+            for i, (d, _mins, tm, block) in enumerate(sorted(blocks, key=lambda b: b[1])):
+                first, _, rest = block.partition("\n")
+                esubj = ""
+                if rest.startswith("Subject: "):                        # an email's own subject (from .eml files)
+                    s_line, _, rest = rest.partition("\n")
+                    esubj = s_line[9:].strip()
+                m = head_re.match(first)
+                who_line = m.group(3) if m else first
+                when = fmt_date(d) + (f"  ·  {tm}" if tm else "")
+                react = " reacted (" in who_line and ": “" not in who_line.split(" reacted (")[0]
+                if rest.strip() or who_line.endswith(":") or esubj:   # an email: header line, then its body
+                    if i:
+                        t.insert("end", "─" * 48 + "\n", "rule")
+                    if esubj and subj_key(esubj) != last_subj:         # shown when the conversation changes
+                        t.insert("end", esubj + "\n", "esubj")
+                        last_subj = subj_key(esubj)
+                    t.insert("end", who_line.rstrip(":").strip(), "who")
+                    t.insert("end", "   " + when + "\n", "when")
+                    t.insert("end", reflow_paragraphs(rest).strip() + "\n", "body")
+                else:                                                    # a text: "Name: message"
+                    who, sep, msg_ = who_line.partition(": ")
+                    if react:
+                        t.insert("end", f"{tm}   " if tm else "", "when")
+                        t.insert("end", who_line + "\n", "react")
+                        continue
+                    t.insert("end", (who if sep else "") , "who")
+                    t.insert("end", "   " + (tm or when) + "\n", "when")
+                    t.insert("end", (msg_ if sep else who_line) + "\n", "body")
+            t.config(state="disabled")
+
+        CONTACT_METHODS = ["Phone call", "Voicemail left", "Text messages", "Email", "In person", "Video call",
+                           "Letter", "Other"]
+
+        def contact_log_dialog(self, client, existing=None):
+            """Log (or edit) one contact: when, with whom, how, and what was said or done."""
+            cid = client["id"]
+            ex = dict(existing or {})
+            win = new_window(root, f"{client.get('code', '')} — {'edit' if existing else 'log a'} contact", "680x600")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Edit contact" if existing else "Log a contact", style="Title.TLabel").pack(anchor="w")
+            grid = ttk.Frame(f)
+            grid.pack(fill="x", pady=(px(10), 0))
+            grid.columnconfigure(1, weight=1)
+            names = dict(CONTACT_WITH)
+            keys = {n: k for k, n in CONTACT_WITH}
+            day_var = tk.StringVar(value=ex.get("date") or date.today().isoformat())
+            time_var = tk.StringVar(value=ex.get("time") or datetime.now().strftime("%H:%M") if not existing else
+                                    ex.get("time", ""))
+            with_var = tk.StringVar(value=names.get(ex.get("with") or "patient", names["patient"]))
+            who_var = tk.StringVar(value=ex.get("who", ""))
+            how_var = tk.StringVar(value=ex.get("method") or "Phone call")
+            r = 0
+            for label, widget in (("Date", date_field(grid, day_var)),
+                                  ("Time (optional)", ttk.Entry(grid, textvariable=time_var, width=10)),
+                                  ("With", ttk.Combobox(grid, textvariable=with_var, values=[n for _, n in CONTACT_WITH],
+                                                        state="readonly", width=34)),
+                                  ("Their role, if someone else", ttk.Entry(grid, textvariable=who_var, width=30)),
+                                  ("How", ttk.Combobox(grid, textvariable=how_var, values=self.CONTACT_METHODS,
+                                                       width=24))):
+                ttk.Label(grid, text=label).grid(row=r, column=0, sticky="w", pady=px(3))
+                widget.grid(row=r, column=1, sticky="w", padx=(px(10), 0))
+                r += 1
+            ttk.Label(f, text="What happened (summary, or paste the messages)", style="Strong.TLabel").pack(
+                anchor="w", pady=(px(10), px(2)))
+            sfr, summ = scrolled_text(f, height=8)
+            sfr.pack(fill="both", expand=True)
+            set_text(summ, ex.get("text", ""))
+            found_lbl = ttk.Label(f, text="", style="Caption.TLabel")
+            found_lbl.pack(anchor="w")
+            msg = ttk.Label(f, text="", style="Bad.TLabel")
+            msg.pack(anchor="w", pady=(px(4), 0))
+            job = {"id": None}
+
+            def detect_dates(*_):
+                """Pasted texts/emails carry their own dates: they set the Date (one log entry per date)."""
+                job["id"] = None
+                txt = get_text(summ)
+                if not txt.strip() or existing:
+                    return found_lbl.config(text="")
+                ds = [d for d in detect_contact_dates(txt) if d]
+                if looks_like_email_print(txt):
+                    how_var.set("Email")
+                elif looks_like_message_export(txt):
+                    how_var.set("Text messages")
+                if not ds or not (looks_like_email_print(txt) or looks_like_message_export(txt)
+                                  or re.search(r"(?m)^\[\d{4}-\d\d-\d\d", txt)):
+                    return found_lbl.config(text="")          # a typed summary: the Date you chose stays
+                day_var.set(ds[0])
+                found_lbl.config(text=("Date found in the messages: " + fmt_date(ds[0])) if len(ds) == 1 else
+                                 f"Dates found: {fmt_date(ds[0])} → {fmt_date(ds[-1])} ({len(ds)} days — one log "
+                                 "entry per date)")
+
+            def soon(*_):
+                if job["id"]:
+                    _quiet(win.after_cancel, job["id"])
+                job["id"] = win.after(400, detect_dates)
+            for seq in ("<KeyRelease>", "<<Paste>>", "<ButtonRelease-2>"):
+                summ.bind(seq, soon, add="+")
+
+            def save():
+                if job["id"]:
+                    _quiet(win.after_cancel, job["id"])
+                    detect_dates()
+                day = day_var.get().strip()
+                if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+                    return msg.config(text="Enter the date of the contact.")
+                t_ = time_var.get().strip()
+                if t_ and not re.fullmatch(r"\d{1,2}:\d\d(\s?[AaPp][Mm])?", t_):
+                    return msg.config(text="Time like 14:30 or 2:30 PM (or leave it empty).")
+                w_ = keys.get(with_var.get(), "patient")
+                text = get_text(summ).strip()
+                if looks_like_email_print(text):
+                    text = tidy_email_thread(text) or text
+                elif how_var.get() == "Text messages" or looks_like_message_export(text):
+                    other = "Patient" if w_ == "patient" else ((who_var.get().strip().capitalize()) or
+                                                                ("Contact" if w_ == "other" else "Parent"))
+                    text = tidy_message_thread(text, other=other) or text
+                entry = dict(ex, date=day, time=t_, method=how_var.get().strip() or "Other", text=text,
+                             notes=ex.get("notes", ""), who=who_var.get().strip()[:60] if w_ == "other" else "")
+                entry["with"] = w_
+                saved = self.comm_save(cid, entry) if existing else self.comm_add(cid, entry)
+                win.destroy()
+                self._contact_focus = ("log", saved["id"])
+                self.set_status(f"{client.get('code', '')}: contact logged.")
+                if not self.wizard:
+                    self.refresh_client_page(cid, select="comms")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            self._contact_win = {"win": win, "date": day_var, "time": time_var, "with": with_var, "how": how_var,
+                                 "text": summ, "save": save, "detect": detect_dates, "found": found_lbl}
+            return win
+
         def edit_client(self, client):
             if self.client_dialog(client):
                 self.refresh_clients(client["id"])
@@ -13294,7 +19328,7 @@ def run_gui():
             client = vault.load_client(client["id"])
             sessions = vault.sessions_for(client["id"])
             days = sorted({d["meta"].get("session_date") for _, d in sessions if d["meta"].get("session_date")})
-            win = new_window(root, f"Export — {client.get('code', '')}", "720x640")
+            win = new_window(root, f"Export — {client.get('code', '')}", "720x700")
             win.grab_set()
             f = ttk.Frame(win, padding=(px(26), px(20)))
             f.pack(fill="both", expand=True)
@@ -13427,16 +19461,16 @@ def run_gui():
         def import_dialog(self, client):
             """Bring in notes written before using the app, so new notes and the case
             overview build on the full history."""
-            win = new_window(root, f"Import past notes — {client['code']}", "1000x700")
+            win = new_window(root, f"Import documents — {client['code']}", "1000x700")
             win.grab_set()
             f = ttk.Frame(win, padding=(px(24), px(20)))
             f.pack(fill="both", expand=True)
-            ttk.Label(f, text="Import past notes", style="Title.TLabel").pack(anchor="w")
-            ttk.Label(f, text="Add files (.txt, .docx, .pdf) or paste notes. TheraNest exports are split "
-                              "automatically: “INITIAL ASSESSMENT AND DIAGNOSTIC IMPRESSION” becomes the intake, "
-                              "“MUTUAL TREATMENT PLAN” a treatment plan (its “Date:”), and each “PROGRESS NOTES” a "
-                              "note (its “Service Date:”); pages of the same document are joined back together. "
-                              "Check each entry's date and type, then import.",
+            ttk.Label(f, text="Import documents", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Add files (.txt, .docx, .pdf) or paste text: past notes, or other documents such as a "
+                              "psychological assessment (choose its Type; add more types in Settings). TheraNest "
+                              "exports are split automatically: “INITIAL ASSESSMENT AND DIAGNOSTIC IMPRESSION” becomes "
+                              "the intake, “MUTUAL TREATMENT PLAN” a treatment plan (its “Date:”), and each “PROGRESS "
+                              "NOTES” a note (its “Service Date:”). Check each entry's date and type, then import.",
                       style="Muted.TLabel", wraplength=px(920), justify="left").pack(anchor="w", pady=(2, 8))
             items = []
             split_var = tk.BooleanVar(value=True)
@@ -13451,7 +19485,7 @@ def run_gui():
                 tv.column(c, width=px(wdt), minwidth=px(min(wdt, 90)), stretch=(c == "preview"), anchor="w")
             tv.pack(fill="x", pady=(8, 6))
 
-            ed = ttk.LabelFrame(f, text="Selected note", padding=8)
+            ed = ttk.LabelFrame(f, text="Selected document", padding=8)
             ed.pack(fill="both", expand=True)
             row = ttk.Frame(ed)
             row.pack(fill="x")
@@ -13462,18 +19496,21 @@ def run_gui():
             ttk.Label(row, text="Session #").pack(side="left")
             ttk.Entry(row, textvariable=n_var, width=6).pack(side="left", padx=(6, 16))
             ttk.Label(row, text="Type").pack(side="left")
-            ttk.Combobox(row, textvariable=k_var, values=["Progress note", "Intake assessment", "Patient contact",
-                                                          "Parent contact", "Collateral contact", "Treatment plan"],
-                         state="readonly", width=18).pack(side="left", padx=6)
-            rm = ttk.Button(row, text="Remove entry")
-            rm.pack(side="right")
-            tfr, txt = scrolled_text(ed, height=8, doc=True)
-            tfr.pack(fill="both", expand=True, pady=(6, 0))
             cur = {"i": None}
             kind_name = {"progress": "Progress note", "intake": "Intake assessment", "plan": "Treatment plan",
                          "parent": "Parent contact", "parent:patient": "Patient contact",
                          "parent:other": "Collateral contact"}
+            for t_ in self.doc_types():                      # your own types (Settings ▸ Document types)
+                if t_ not in kind_name.values():
+                    kind_name["doc:" + t_] = t_
             kind_key = {v: k for k, v in kind_name.items()}
+            ttk.Combobox(row, textvariable=k_var, values=list(kind_name.values()), state="readonly",
+                         width=24).pack(side="left", padx=6)
+            rm = ttk.Button(row, text="Remove entry")
+            rm.pack(side="right")
+            tfr, txt = scrolled_text(ed, height=8, doc=True)
+            tfr.pack(fill="both", expand=True, pady=(6, 0))
+            k_var.trace_add("write", lambda *_: store())
 
             META = re.compile(r"\b(dob|birth date|date|client|patient name|session (start|end) time|duration|"
                               r"provider\(s\)|provider|insurer\(s\)|insurer|place of service|cpt code|case #|"
@@ -13496,7 +19533,8 @@ def run_gui():
                 return (fallback or re.sub(r"\s+", " ", text))[:110]
 
             def row_values(it):
-                return (fmt_date(it["date"]) or "?", it["number"], kind_name[it["kind"]], it["source"], preview(it["text"]))
+                return (fmt_date(it["date"]) or "?", it["number"], kind_name.get(it["kind"], it["kind"].partition(":")[2]),
+                        it["source"], preview(it["text"]))
 
             def store():
                 i = cur["i"]
@@ -13521,15 +19559,16 @@ def run_gui():
                     n_var.set("")
                     k_var.set("")
                     set_text(txt, "")
-                count.config(text=f"{len(items)} note(s) ready to import")
+                count.config(text=f"{len(items)} document(s) ready to import")
 
             def show(i):
-                cur["i"] = i
+                cur["i"] = None                          # (setting the fields mustn't store into the old entry)
                 it = items[i]
                 d_var.set(it["date"])
                 n_var.set(it["number"])
-                k_var.set(kind_name[it["kind"]])
+                k_var.set(kind_name.get(it["kind"], it["kind"].partition(":")[2]))
                 set_text(txt, it["text"])
+                cur["i"] = i
 
             def on_select(_=None):
                 sel = tv.selection()
@@ -13538,27 +19577,35 @@ def run_gui():
                     show(int(sel[0]))
             tv.bind("<<TreeviewSelect>>", on_select)
 
-            def add_texts(pairs):
+            def add_texts(pairs, paths=None):
                 store()
-                for source, text in pairs:
-                    for n in split_notes(text, split_var.get()):
+                for k_, (source, text) in enumerate(pairs):
+                    parts_ = split_notes(text, split_var.get())
+                    for n in parts_:
                         n["source"] = source
+                        if paths and len(parts_) == 1:      # one document from one file: keep the original too
+                            n["path"] = paths[k_]
+                        if n["kind"] == "progress":         # a report, not a note? (title says so)
+                            g_ = guess_doc_type(n["text"], self.doc_types())
+                            if g_:
+                                n["kind"] = "doc:" + g_
                         items.append(n)
                 items.sort(key=lambda it: it["date"] or "9999")
                 refresh(len(items) - 1 if items else None)
 
             def add_files():
-                paths = filedialog.askopenfilenames(parent=win, title="Choose past notes", filetypes=[
-                    ("Notes", "*.txt *.md *.docx *.pdf"), ("All files", "*.*")])
-                pairs, errors = [], []
+                paths = filedialog.askopenfilenames(parent=win, title="Choose documents", filetypes=[
+                    ("Documents", "*.txt *.md *.docx *.pdf"), ("All files", "*.*")])
+                pairs, errors, ok_paths = [], [], []
                 for p in paths:
                     try:
                         pairs.append((os.path.basename(p), extract_text(p)))
+                        ok_paths.append(p)
                     except Exception as e:
                         errors.append(f"{os.path.basename(p)}: {e}")
                 if errors:
                     messagebox.showerror(APP_NAME, "Some files couldn't be read:\n\n" + "\n".join(errors), parent=win)
-                add_texts(pairs)
+                add_texts(pairs, ok_paths)
 
             def paste():
                 pw = new_window(win, "Paste notes", "720x500")
@@ -13592,13 +19639,13 @@ def run_gui():
                                     variable=split_var), gap=px(14))
             bottom = ttk.Frame(f)
             bottom.pack(fill="x", pady=(8, 0), side="bottom", before=ed)   # never squeezed off-screen
-            count = ttk.Label(bottom, text="0 note(s) ready to import", style="Muted.TLabel")
+            count = ttk.Label(bottom, text="0 document(s) ready to import", style="Muted.TLabel")
             count.pack(side="left")
 
             def do_import():
                 store()
                 if not items:
-                    return messagebox.showinfo(APP_NAME, "Add some notes first.", parent=win)
+                    return messagebox.showinfo(APP_NAME, "Add some documents first.", parent=win)
                 missing = [i for i, it in enumerate(items) if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", it["date"] or "")]
                 if missing:
                     tv.selection_set(str(missing[0]))
@@ -13609,7 +19656,22 @@ def run_gui():
                 now = datetime.now().isoformat(timespec="seconds")
                 existing_days = {d["meta"].get("session_date") for _, d in vault.sessions_for(client["id"])}
                 plans_in = [it for it in items if it["kind"] == "plan"]
-                notes_in = [it for it in items if it["kind"] != "plan"]
+                docs_in = [it for it in items if it["kind"].startswith("doc:")]
+                notes_in = [it for it in items if it["kind"] != "plan" and not it["kind"].startswith("doc:")]
+                for it in docs_in:    # other documents: the patient's Documents tab (original file kept, encrypted)
+                    fid = ""
+                    if it.get("path") and os.path.isfile(it["path"]):
+                        try:
+                            fid = self.patient_file_add(client["id"], it["path"], "document",
+                                                        note=it["kind"][4:])["id"]
+                        except Exception:
+                            fid = ""
+                    c = vault.load_client(client["id"])
+                    c.setdefault("documents", []).append({
+                        "id": uuid.uuid4().hex[:12], "type": it["kind"][4:], "date": it["date"],
+                        "title": it.get("source") if it.get("source") != "pasted" else "",
+                        "text": it["text"], "file_id": fid, "added": now})
+                    vault.save_client(c)
                 joined = sum(1 for it in notes_in if it["date"] in existing_days)
                 if plans_in:          # treatment plans join the patient's plan history, in date order
                     c = vault.load_client(client["id"])
@@ -13635,8 +19697,9 @@ def run_gui():
                         "context_used": []})
                 n = len(notes_in)
                 win.destroy()
-                self.open_client(client["id"])
+                self.open_client(client["id"], select="docs" if docs_in and not notes_in else None)
                 self.set_status(f"Imported {n} note(s)"
+                                + (f", {len(docs_in)} document(s) (on the Documents tab)" if docs_in else "")
                                 + (f" and {len(plans_in)} treatment plan(s)" if plans_in else "")
                                 + (f"; {joined} joined a date that already had a session "
                                                               "(shown as an extra tab)" if joined else "")
@@ -13644,7 +19707,7 @@ def run_gui():
 
             ttk.Button(bottom, text="Cancel", command=win.destroy).pack(side="right")
             ttk.Button(bottom, text="Import", style="Accent.TButton", command=do_import).pack(side="right", padx=6)
-            win._test = {"add_texts": add_texts, "items": items, "do_import": do_import}
+            win._test = {"add_texts": add_texts, "items": items, "do_import": do_import, "date": d_var, "kind": k_var}
             self._import_win = win
 
         def make_case_overview(self, client):
@@ -13820,12 +19883,12 @@ def run_gui():
             if rv.get("generated"):
                 head.add(ttk.Label(head, text=f"Written {fmt_date(rv['generated'][:10])}", style="Muted.TLabel"))
             ttk.Label(box, text="For your own learning and supervision — not part of the patient's note. Read on "
-                                "this computer only; names are hidden from the AI.",
+                                f"this computer only ({names_note(client)}).",
                       style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(box, owner=("review", sid)).pack(anchor="w", fill="x", pady=(px(4), 0))
 
             ttk.Label(box, text="Session map", style="Strong.TLabel").pack(anchor="w", pady=(px(12), px(4)))
-            m = session_map(d.get("lines"), d.get("roles") or {}, counselor, patient_label=patient)
+            m = session_map(timed_lines(d), d.get("roles") or {}, counselor, patient_label=patient)
             if m:
                 self.draw_session_map(box, m).pack(anchor="w", fill="x", padx=(0, px(8)))
                 facts = Flow(box, gap=px(8))             # the numbers as small tiles, not a paragraph
@@ -13835,7 +19898,8 @@ def run_gui():
                 tiles += [(f"{s_['pct']}%", f"{s_['label']} talking") for s_ in m["speakers"][:3]]
                 if q["total"]:
                     tiles.append((f"{q['open']} / {q['closed']}", "open / closed questions"))
-                tiles.append((f"{m['silence_pct']}%", "pauses"))
+                if not m.get("approx"):
+                    tiles.append((f"{m['silence_pct']}%", "pauses"))
                 for big, small in tiles:
                     tl = facts.add(ttk.Frame(facts, style="Card.TFrame", padding=(px(12), px(6))))
                     ttk.Label(tl, text=big, style="Strong.TLabel").pack(anchor="w")
@@ -13845,12 +19909,16 @@ def run_gui():
                     for hv in m["heavy"]:
                         ttk.Label(box, text=f"{fmt_ts(hv['t'])}   “{hv['quote']}”", style="Muted.TLabel",
                                   wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), 0))
+                if m.get("approx"):
+                    ttk.Label(box, text="Timings come from the transcript's timestamps, so talk time includes the "
+                                        "pauses after each turn.", style="Caption.TLabel", wraplength=px(760),
+                              justify="left").pack(anchor="w", pady=(px(8), 0))
                 ttk.Label(box, text="Tone follows only what the patient said (not your words or anyone else's): a "
                                     "simple count of feeling words every two minutes — a rough guide to where the "
                                     "session got heavy, not a measurement.",
                           style="Caption.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(8), 0))
             else:
-                ttk.Label(box, text="Only recorded sessions (with timings) have a session map.",
+                ttk.Label(box, text="Only sessions whose transcript has timestamps have a session map.",
                           style="Muted.TLabel").pack(anchor="w")
 
             for key, title, empty in (("feedback", "Skills feedback", "Click “Write feedback & find techniques” "
@@ -13958,7 +20026,7 @@ def run_gui():
             f.pack(fill="both", expand=True)
             ttk.Label(f, text="Supervision prep", style="Title.TLabel").pack(anchor="w")
             ttk.Label(f, text="A page for your next supervision meeting: for each patient, what happened, any risk, "
-                              "progress toward goals and questions to bring — plus the skills from your session "
+                              "progress toward goals and what to bring up — plus the skills from your session "
                               "reviews. Drafted by the local AI from your notes (names hidden); saved encrypted.",
                       style="Muted.TLabel", wraplength=px(800), justify="left").pack(anchor="w", pady=(px(2), px(10)))
             past = vault.list_reports("supervision")
@@ -13975,10 +20043,15 @@ def run_gui():
             plist = ttk.Frame(f)
             plist.pack(fill="x")
             picks = {}
-            ttk.Label(f, text="Questions you already want to bring (optional, one per line)", style="Strong.TLabel").pack(
-                anchor="w", pady=(px(12), px(2)))
-            qfr, qtxt = scrolled_text(f, height=4)
+            ttk.Label(f, text="What you'd like to focus on in this supervision session", style="Strong.TLabel").pack(
+                anchor="w", pady=(px(12), 0))
+            ttk.Label(f, text="Not just questions: cases you're stuck on, skills you want feedback on, reactions you "
+                              "noticed in yourself, anything else. Optional, one item per line; it goes at the top "
+                              "of the packet as you wrote it.", style="Caption.TLabel", wraplength=px(800),
+                      justify="left").pack(anchor="w", pady=(0, px(4)))
+            qfr, qtxt = scrolled_text(f, height=5)
             qfr.pack(fill="x")
+            win.after(300, lambda: _quiet(qtxt.focus_set))     # ready to type as soon as it opens
             info = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(800), justify="left")
             info.pack(anchor="w", pady=(px(8), 0))
             prev_fr = ttk.Frame(f)
@@ -14151,7 +20224,7 @@ def run_gui():
             )
             if not sessions:
                 btn_here.config(state="disabled")
-            all_btn = head.add(ttk.Button(head, text="↻  Refresh all",
+            all_btn = head.add(ttk.Button(head, text=f"↻  Refresh {client.get('code') or 'this patient'}",
                                           command=lambda: self.refresh_all_patients(only_client=client, select="insights")))
             if not sessions:
                 all_btn.config(state="disabled")
@@ -14257,7 +20330,7 @@ def run_gui():
             if not todo:
                 btn.config(state="disabled")
             src = "treatment plan" if current_plan(client) and plan_goals(current_plan(client)["text"]) else "profile"
-            ttk.Label(box, text=f"Goals from the {src}. Each note is read by the local AI (names hidden); results are "
+            ttk.Label(box, text=f"Goals from the {src}. Each note is read by the local AI ({names_note(client)}); results are "
                                 "saved with the session. New notes are checked when you click the button.",
                       style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(box, owner=("goals", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
@@ -14341,7 +20414,7 @@ def run_gui():
             if not todo:
                 btn.config(state="disabled")
             ttk.Label(box, text="Notes, overviews and the transcript lines that mention risk are read by the local AI "
-                                "(names hidden). This helps you find things — it doesn't replace your own risk "
+                                f"({names_note(client)}). This helps you find things — it doesn't replace your own risk "
                                 "assessment or your site's procedures.", style="Caption.TLabel", wraplength=px(720),
                       justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(box, owner=("risk", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
@@ -14497,31 +20570,33 @@ def run_gui():
                     side="left")
                 ttk.Button(r_, text="Remove", command=lambda m=m: self.measure_remove(client, m["id"])).pack(side="right")
 
-        def measure_remove(self, client, mid):
+        def measure_remove(self, client, mid, select="insights"):
             if not messagebox.askyesno(APP_NAME, "Remove this score?"):
                 return
             c = vault.load_client(client["id"])
             c["measures"] = [m for m in c.get("measures") or [] if m["id"] != mid]
             vault.save_client(c)
+            self._sig = vault.signature()
             self._insight_tab = "scores"
-            self.open_client(client["id"], select="insights")
+            self.refresh_client_page(client["id"], select=select)
 
-        def measures_add(self, client, entries):
+        def measures_add(self, client, entries, select="insights"):
             c = vault.load_client(client["id"])
             c.setdefault("measures", []).extend(entries)
             vault.save_client(c)
             self._sig = vault.signature()
             self._insight_tab = "scores"
             if self.client_id == client["id"] and not self.wizard:
-                self.open_client(client["id"], select="insights")
+                self.refresh_client_page(client["id"], select=select)
 
-        def measure_dialog(self, client):
+        def measure_dialog(self, client, select="insights", kind="PHQ-9"):
             win = new_window(root, f"{client.get('code', '')} — add a score", "720x720")
             win.grab_set()
             f = ttk.Frame(win, padding=(px(22), px(16)))
             f.pack(fill="both", expand=True)
             ttk.Label(f, text="Add a score", style="Title.TLabel").pack(anchor="w")
-            kind_var, day_var = tk.StringVar(value="PHQ-9"), tk.StringVar(value=date.today().isoformat())
+            kind_var = tk.StringVar(value=kind if kind in MEASURES else "PHQ-9")
+            day_var = tk.StringVar(value=date.today().isoformat())
             top_ = Flow(f, gap=px(10))
             top_.pack(fill="x", pady=(px(8), 0))
             for k in MEASURES:
@@ -14587,7 +20662,7 @@ def run_gui():
                 except ValueError as ex:
                     return msg.config(text=str(ex))
                 win.destroy()
-                self.measures_add(client, [e])
+                self.measures_add(client, [e], select=select)
                 self.set_status(f"{client.get('code', '')}: {e['kind']} {e['total']} saved.")
             btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
@@ -14826,8 +20901,10 @@ def run_gui():
             f = ttk.Frame(win, padding=(px(24), px(18)))
             f.pack(fill="both", expand=True)
             ttk.Label(f, text="Letter or document", style="Title.TLabel").pack(anchor="w")
-            ttk.Label(f, text="Drafted by the local AI from only what you tick below (names hidden while it writes, then "
-                              "filled back in on this computer). Review it before it leaves your hands.",
+            ttk.Label(f, text="Drafted by the local AI from only what you tick below (" + (
+                              "it reads names as they are" if names_to_ai(client) else
+                              "names hidden while it writes, then filled back in on this computer")
+                              + "). Review it before it leaves your hands.",
                       style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), px(8)))
             kind_var = tk.StringVar(value="attendance")
             krow = Flow(f, gap=px(12))
@@ -15010,7 +21087,7 @@ def run_gui():
                 if not ins:
                     return status.config(text="Type what to change (or pick one of the buttons).", style="Bad.TLabel")
                 job_cfg = dict(cfg)
-                record_instruction(self.settings, client_hider(client)(ins))
+                record_instruction(self.settings, client_hider(client, always=True)(ins))
                 _quiet(vault.save_settings, self.settings)
 
                 def done(new):
@@ -15189,7 +21266,7 @@ def run_gui():
             if not todo:
                 fb.config(state="disabled")
             ttk.Label(box, text="Contact notes' “Follow-up:” lists are added by themselves; “Find follow-ups” has the local "
-                                "AI read sessions for things you said you'd do (names hidden). Tick them off as you go.",
+                                f"AI read sessions for things you said you'd do ({names_note(client)}). Tick them off as you go.",
                       style="Caption.TLabel", wraplength=px(720), justify="left").pack(anchor="w", pady=(px(2), 0))
             self.progress_panel(box, owner=("followups", client["id"])).pack(anchor="w", fill="x", pady=(px(4), 0))
             fus = client.get("followups") or []
@@ -15414,111 +21491,117 @@ def run_gui():
                 self.open_client(self.client_id, select="insights")
             return r
 
-        def refresh_all_patients(self, force=False, only_client=None, select=None):
-            """Refresh both Progress & risk (risk, treatment goals, follow-ups) AND Case overviews
-            for every active patient at once, or for one patient when only_client is given."""
-            if only_client is not None:
-                clients = [vault.load_client(only_client["id"])]
-            else:
-                clients = [c for c in vault.list_clients() if not c.get("archived")]
-            if not clients:
-                self.set_status("No active patients to refresh yet.")
-                return False
-            single = clients[0].get("code", "") if only_client is not None else ""
-            scope = single or f"All {len(clients)} active patient(s)"
-            bundles, ins_plan, total_ins = self._collect_insights_work(clients, force=force)
-            case_todo = []
-            with_docs = []
-            for c in clients:
-                sess = vault.sessions_for(c["id"])
-                if not case_overview_documented_days(sess):
-                    continue
-                with_docs.append((c["id"], c.get("code", "")))
-                if force or case_overview_stale_days(c, sess) > 0:
-                    case_todo.append((c["id"], c.get("code", "")))
-            if not total_ins and not case_todo:
-                if not with_docs:
-                    self.set_status("No active patients have session documentation to refresh yet.")
-                    return False
-                if not messagebox.askyesno(
-                    APP_NAME,
-                    (f"{single} already has an up-to-date Progress & risk and Case overview.\n\nRefresh everything anyway?"
-                     if single else
-                     f"All {len(with_docs)} active patient(s) already have up-to-date Progress & risk checks and Case overviews.\n\n"
-                     "Refresh everything for all patients anyway?"),
-                    parent=root,
-                ):
-                    self.set_status(f"{scope}: Progress & risk and Case overview are already up to date.")
-                    return False
-                bundles, ins_plan, total_ins = self._collect_insights_work(clients, force=True)
-                case_todo = list(with_docs)
+        def _patient_refresh_work(self, cid, force=False):
+            """What one patient's refresh would do: pending Progress & risk checks, and whether the
+            Case overview is missing or out of date."""
+            c = vault.load_client(cid)
+            bundles, plan, n_ins = self._collect_insights_work([c], force=force)
+            sess = vault.sessions_for(cid)
+            docs = bool(case_overview_documented_days(sess))
+            case = docs and (force or case_overview_stale_days(vault.load_client(cid), sess) > 0)
+            return {"id": cid, "code": c.get("code", ""), "bundles": bundles, "plan": plan, "n_ins": n_ins,
+                    "case": case, "docs": docs}
+
+        def _queue_patient_refresh(self, w, select=None):
+            """One task (its own line in Queue › Tasks) that refreshes one patient's Progress & risk
+            checks and Case overview."""
+            cid, code = w["id"], w["code"]
+            bundles, ins_plan, needs_case = w["bundles"], w["plan"], w["case"]
             job_cfg, orient = dict(cfg), self.settings.get("orientation", "")
-            n_cases = len(case_todo)
-            has_ins = bool(bundles)
 
             def job(p):
-                ins_share = 50.0 if (has_ins and n_cases) else (100.0 if has_ins else 0.0)
-                case_share = 100.0 - ins_share
-                n_pat, n_risk, n_goals, n_fu = 0, 0, 0, 0
-                if has_ins:
+                ins_share = (50.0 if needs_case else 100.0) if bundles else 0.0
+                n_pat = n_risk = n_goals = n_fu = 0
+                if bundles:
                     def ins_p(t, pct=None):
-                        scaled = ( float(pct) * ins_share / 100.0 ) if pct is not None else 0.0
-                        p(t, scaled)
+                        p(t, (float(pct) * ins_share / 100.0) if pct is not None else 0.0)
                     steps = _Steps(ins_p, ins_plan) if ins_plan else None
                     _, n_pat, n_risk, n_goals, n_fu = self._run_insights_bundles(job_cfg, bundles, steps, 0, ins_p)
-                done_cases = 0
-                for idx, (cid, code) in enumerate(case_todo):
-                    base = ins_share + (idx * case_share) / max(n_cases, 1)
-                    span = case_share / max(n_cases, 1)
-
-                    def sub_p(t, pct=None, _b=base, _s=span, _i=idx, _c=code):
-                        scaled = (_b + (_s * float(pct) / 100.0)) if pct is not None else _b
-                        p(f"[Case {_i + 1}/{n_cases} · {_c}] {t}", scaled)
-
-                    c_cur = vault.load_client(cid)
+                done_case = 0
+                if needs_case:
+                    def case_p(t, pct=None):
+                        p(f"Case overview · {t}",
+                          ins_share + ((100.0 - ins_share) * float(pct) / 100.0) if pct is not None else ins_share)
                     sess_dicts = [d for _, d in vault.sessions_for(cid)]
-                    if not sess_dicts:
-                        continue
-                    text = generate_case_overview(job_cfg, c_cur, sess_dicts, orient, sub_p)
-                    c_latest = vault.load_client(cid)
-                    c_latest["case_overview"] = {
-                        "text": text,
-                        "session_count": len({d["meta"].get("session_date") for d in sess_dicts}),
-                        "generated": datetime.now().isoformat(timespec="seconds"),
-                    }
-                    vault.save_client(c_latest)
-                    done_cases += 1
+                    if sess_dicts:
+                        text = generate_case_overview(job_cfg, vault.load_client(cid), sess_dicts, orient, case_p)
+                        c_latest = vault.load_client(cid)
+                        c_latest["case_overview"] = {
+                            "text": text,
+                            "session_count": len({d["meta"].get("session_date") for d in sess_dicts}),
+                            "generated": datetime.now().isoformat(timespec="seconds"),
+                        }
+                        vault.save_client(c_latest)
+                        done_case = 1
                 p("Done.", 100)
-                return n_pat, n_risk, n_goals, n_fu, done_cases
+                return n_risk, n_goals, n_fu, done_case
 
             def done(res):
-                n_pat, n_risk, n_goals, n_fu, done_cases = res
+                n_risk, n_goals, n_fu, done_case = res
                 self._sig = vault.signature()
-                if self.client_id and not self.wizard:
-                    self.open_client(self.client_id, select=select) if select else self.open_client(self.client_id)
-                elif not self.client_id and not self.wizard:
-                    self.show_home()
+                if self.wizard:
+                    pass
+                elif self.client_id == cid:
+                    self.open_client(cid, select=select) if select else self.open_client(cid)
+                elif not self.client_id:
+                    self.show_home_keep_scroll()
                 self.set_status(
-                    f"Refreshed {single or 'all patients'}: {done_cases} case overview{'s' if done_cases != 1 else ''}, "
+                    f"Refreshed {code}: {'case overview, ' if done_case else ''}"
                     f"{n_risk} risk record{'s' if n_risk != 1 else ''}, "
                     f"{n_goals} goal note{'s' if n_goals != 1 else ''}, "
                     f"{n_fu} follow-up{'s' if n_fu != 1 else ''}."
                 )
 
-            r = self.run_bg(
-                job,
-                done,
-                label=(f"refreshing progress, risk & case overview for {single}" if single
-                       else "refreshing progress, risk & case overviews for all patients"),
-                owner=("all", clients[0]["id"]) if single else ("all", "*"),
-                patient=single,
-                pausable=True,
-            )
-            if r and self.client_id and not self.wizard:
-                self.open_client(self.client_id, select=select) if select else self.open_client(self.client_id)
-            elif r and not self.client_id and not self.wizard:
-                self.show_home()
-            return r
+            return self.run_bg(job, done, label=f"refreshing progress, risk & case overview for {code}",
+                               owner=("all", cid), patient=code, pausable=True)
+
+        def refresh_all_patients(self, force=False, only_client=None, select=None):
+            """Refresh Progress & risk (risk, treatment goals, follow-ups) AND the Case overview.
+            With only_client: just that patient. Without (Home): every active patient, each as its own
+            task in the queue, so each can be paused, moved or cancelled on its own."""
+            if only_client is not None:
+                w = self._patient_refresh_work(only_client["id"], force=force)
+                if not w["n_ins"] and not w["case"]:
+                    if not w["docs"]:
+                        self.set_status(f"{w['code']} has no session documentation to refresh yet.")
+                        return False
+                    if not messagebox.askyesno(
+                            APP_NAME, f"{w['code']} already has an up-to-date Progress & risk and Case overview."
+                                      "\n\nRefresh everything anyway?", parent=root):
+                        self.set_status(f"{w['code']}: Progress & risk and Case overview are already up to date.")
+                        return False
+                    w = self._patient_refresh_work(only_client["id"], force=True)
+                r = self._queue_patient_refresh(w, select=select)
+                if r and self.client_id and not self.wizard:
+                    self.open_client(self.client_id, select=select) if select else self.open_client(self.client_id)
+                return r
+            clients = [c for c in vault.list_clients() if not c.get("archived")]
+            if not clients:
+                self.set_status("No active patients to refresh yet.")
+                return False
+            works = [self._patient_refresh_work(c["id"], force=force) for c in clients]
+            todo = [w for w in works if w["n_ins"] or w["case"]]
+            if not todo:
+                with_docs = [w for w in works if w["docs"]]
+                if not with_docs:
+                    self.set_status("No active patients have session documentation to refresh yet.")
+                    return False
+                if not messagebox.askyesno(
+                        APP_NAME, f"All {len(with_docs)} active patient(s) already have up-to-date Progress & risk "
+                                  "checks and Case overviews.\n\nRefresh everything for all patients anyway?",
+                        parent=root):
+                    self.set_status(f"All {len(clients)} active patient(s): Progress & risk and Case overview "
+                                    "are already up to date.")
+                    return False
+                works = [self._patient_refresh_work(w["id"], force=True) for w in with_docs]
+                todo = [w for w in works if w["n_ins"] or w["case"]]
+            results = [self._queue_patient_refresh(w) for w in todo]
+            n = len(todo)
+            self.set_status(f"Refreshing {n} patient{'s' if n != 1 else ''}, one at a time — each is its own "
+                            "task in Queue › Tasks.")
+            if not self.client_id and not self.wizard:
+                self.show_home_keep_scroll()
+            return next((r for r in results if r), False)
 
         # ======================================================== CASELOAD DASHBOARD
         def _dashboard_pairs(self):
@@ -15623,8 +21706,46 @@ def run_gui():
                 state = "minimized"
             self._save_dash_collapsed()
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.show_home_keep_scroll()
             return state
+
+        def _page_scroll_canvas(self):
+            """The open page's main scrolling canvas (the outermost one made by scrollable)."""
+            p = self.page
+            if p is None or not self._alive(p):
+                return None
+            queue = [p]
+            while queue:
+                w = queue.pop(0)
+                if isinstance(w, tk.Canvas) and getattr(w, "_apply_restore", None):
+                    return w
+                try:
+                    queue.extend(w.winfo_children())
+                except tk.TclError:
+                    pass
+            return None
+
+        def show_home_keep_scroll(self):
+            """Rebuild Home (after a Hide, ✕, Unhide or ticked follow-up) and stay at the same scroll
+            position instead of jumping back to the top."""
+            y = None
+            old = self._page_scroll_canvas() if self._page_is_home_now() else None
+            if old is not None:
+                try:
+                    sr = str(old.cget("scrollregion")).split()
+                    h = float(sr[3]) if len(sr) == 4 else 0.0
+                    y = old.yview()[0] * h
+                except (tk.TclError, ValueError):
+                    y = None
+            self.show_home()
+            new = self._page_scroll_canvas()
+            if new is not None and y:
+                new._restore_y = y
+                if getattr(new, "_realized", False):
+                    new._apply_restore()
+
+        def _page_is_home_now(self):
+            return bool(getattr(self, "_page_is_home", False)) and not self.client_id and not self.wizard
 
         def dismiss_dashboard_items(self, client_or_id, dkeys, refresh=True):
             """Hide/dismiss one or more dashboard items for a client."""
@@ -15645,7 +21766,7 @@ def run_gui():
                 if getattr(self, "_dash_memo", None) is not None:
                     self._dash_memo = (self._sig, self._dash_memo[1], self._dash_memo[2])
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.home_update([dk for dk in dkeys if dk], hidden_delta=added)
             return added
 
         def dismiss_dashboard_batch(self, client_dkey_pairs, refresh=True):
@@ -15658,7 +21779,7 @@ def run_gui():
             for cid, dkeys in by_cid.items():
                 total += self.dismiss_dashboard_items(cid, dkeys, refresh=False)
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.home_update([dk for dks in by_cid.values() for dk in dks if dk], hidden_delta=total)
             return total
 
         def restore_dashboard_items(self, client_or_id=None, section_key=None, refresh=True):
@@ -15687,7 +21808,7 @@ def run_gui():
                 if getattr(self, "_dash_memo", None) is not None:
                     self._dash_memo = (self._sig, self._dash_memo[1], self._dash_memo[2])
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.show_home_keep_scroll()
             return restored
 
         def permanently_dismiss_dashboard_rows(self, rows, refresh=True):
@@ -15757,7 +21878,7 @@ def run_gui():
                 else:
                     self._sig = vault.signature()
             if refresh and not self.client_id and not self.wizard:
-                self.show_home()
+                self.home_update([r.get("dkey") for r in rows if r.get("dkey")])
             return removed_count
 
         def _dashboard(self, f):
@@ -15770,35 +21891,44 @@ def run_gui():
             total = sum(len(v) for v in data.values())
             bar = Flow(top_, align="right", gap=px(8))
             bar.pack(side="right", fill="x", expand=True)
-            if hidden_total > 0:
-                bar.add(
-                    ttk.Button(
-                        bar,
-                        text=f"Unhide dismissed ({hidden_total})",
-                        command=lambda: self.restore_dashboard_items(),
-                    )
-                )
+            n_pat = sum(1 for c in self.clients if not c.get("archived"))
+            # what's on the page, so Hide / ✕ / a ticked follow-up update just their rows (see dash_remove)
+            reg = {"rows": {}, "groups": {}, "secs": {}, "tiles": {}, "hidden": hidden_total, "unhide": None,
+                   "bar": bar, "tiles_flow": None, "box": None, "n_pat": n_pat}
+            unhide = ttk.Button(bar, text=f"Unhide dismissed ({hidden_total})",
+                                command=lambda: self.restore_dashboard_items())
+            bar.add(unhide)
+            bar.show(unhide, hidden_total > 0)
+            reg["unhide"] = unhide
             bar.add(ttk.Button(bar, text="↻  Refresh all patients", style="Accent.TButton", command=self.refresh_all_patients))
             bar.add(ttk.Button(bar, text="📋  Supervision prep", command=self.supervision_prep))
-            n_pat = sum(1 for c in self.clients if not c.get("archived"))
-            ttk.Label(f, text=f"Your caseload · {n_pat} active patient{'s' if n_pat != 1 else ''}"
-                              + (" · everything's up to date" if not total else "")
-                              + (f" · {hidden_total} hidden" if hidden_total else ""), style="Muted.TLabel").pack(
-                anchor="w", pady=(px(2), px(6)))
+
+            def caseload_text(n_items, hidden):
+                return (f"Your caseload · {n_pat} active patient{'s' if n_pat != 1 else ''}"
+                        + (" · everything's up to date" if not n_items else "")
+                        + (f" · {hidden} hidden" if hidden else ""))
+            cl_lbl = ttk.Label(f, text=caseload_text(total, hidden_total), style="Muted.TLabel")
+            cl_lbl.pack(anchor="w", pady=(px(2), px(6)))
+            reg["caseload"], reg["caseload_text"] = cl_lbl, caseload_text
             self.progress_panel(f, owner=("all", "*")).pack(anchor="w", fill="x", pady=(0, px(6)))
             tiles = Flow(f, gap=px(10))
             tiles.pack(fill="x")
+            reg["tiles_flow"] = tiles
             for key, title, tone in DASH_SECTIONS:
                 n = len(data[key])
                 if not n:
                     continue
                 t_ = tiles.add(ttk.Frame(tiles, style="Card.TFrame", padding=(px(14), px(8))))
-                ttk.Label(t_, text=str(n), style="Hero.TLabel").pack(anchor="w")
+                n_lbl = ttk.Label(t_, text=str(n), style="Hero.TLabel")
+                n_lbl.pack(anchor="w")
                 ttk.Label(t_, text=title, style="Bad.TLabel" if tone == "Bad" else "Muted.TLabel").pack(anchor="w")
+                reg["tiles"][key] = (t_, n_lbl)
             sc, box = scrollable(f)
             sc.pack(fill="both", expand=True, pady=(px(12), 0))
+            reg["box"] = box
             collapsed = self._get_dash_collapsed()
             dash_groups = {}
+            plural = lambda n, w: f"{n} {w}{'s' if n != 1 else ''}"
             for key, title, tone in DASH_SECTIONS:
                 rows = data[key]
                 if not rows:
@@ -15815,20 +21945,24 @@ def run_gui():
                 dash_groups[key] = by_patient
                 sec_hdr = ttk.Frame(box)
                 sec_hdr.pack(fill="x", pady=(px(14), px(4)))
-                ttk.Label(
+                sec_lbl = ttk.Label(
                     sec_hdr,
-                    text=f"{title} ({len(rows)} item{'s' if len(rows) != 1 else ''} across {len(by_patient)} patient{'s' if len(by_patient) != 1 else ''})",
+                    text=f"{title} ({plural(len(rows), 'item')} across {plural(len(by_patient), 'patient')})",
                     style="Strong.TLabel",
-                ).pack(side="left")
+                )
+                sec_lbl.pack(side="left")
+                reg["secs"][key] = {"hdr": sec_hdr, "lbl": sec_lbl, "title": title, "n": len(rows)}
+                live = lambda k, cid=None: [x["row"] for x in reg["rows"].values()
+                                            if x["key"] == k and (cid is None or x["cid"] == cid)]
                 ttk.Button(
                     sec_hdr,
                     text="✕  Dismiss list",
-                    command=lambda rs=rows: self.permanently_dismiss_dashboard_rows(rs),
+                    command=lambda k=key: self.permanently_dismiss_dashboard_rows(live(k)),
                 ).pack(side="right", padx=(px(4), 0))
                 ttk.Button(
                     sec_hdr,
                     text="Hide list",
-                    command=lambda rs=rows: self.dismiss_dashboard_batch([(r["client"], r["dkey"]) for r in rs]),
+                    command=lambda k=key: self.dismiss_dashboard_batch([(r["client"], r["dkey"]) for r in live(k)]),
                 ).pack(side="right")
                 all_cids = [cid for cid, _, _ in by_patient]
                 sec_widgets = []
@@ -15838,18 +21972,18 @@ def run_gui():
                 )
                 min_all_btn.pack(side="right", padx=(0, px(6)))
 
-                def toggle_all_in_sec(k=key, cids=all_cids, sw=sec_widgets, mb=min_all_btn):
+                def toggle_all_in_sec(k=key, sw=sec_widgets, mb=min_all_btn):
                     col = self._get_dash_collapsed()
-                    minimize = not all((k, c_) in col for c_ in cids)
-                    for c_id, cd, cnt, ib, b in sw:
+                    live = [g for g in sw if g["card"].winfo_exists()]
+                    minimize = not all((k, g["cid"]) in col for g in live)
+                    for g in live:
                         if minimize:
-                            col.add((k, c_id))
-                            ib.pack_forget()
-                            b.config(text=f"▶  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                            col.add((k, g["cid"]))
+                            g["ib"].pack_forget()
                         else:
-                            col.discard((k, c_id))
-                            ib.pack(fill="x", pady=(px(4), 0))
-                            b.config(text=f"▼  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                            col.discard((k, g["cid"]))
+                            g["ib"].pack(fill="x", pady=(px(4), 0))
+                        g["btn"].config(text=f"{'▶' if minimize else '▼'}  {g['code']} ({plural(g['n'], 'item')})")
                     mb.config(text="Expand all patients" if minimize else "Minimize all patients")
                     self._save_dash_collapsed()
 
@@ -15870,34 +22004,38 @@ def run_gui():
                         command=None,
                     )
 
-                    def make_toggle(k=key, c_id=cid, cd=code, cnt=len(p_rows), ib=items_box, b=t_btn):
+                    g = {"cid": cid, "code": code, "n": len(p_rows), "ib": items_box, "btn": t_btn, "card": p_card,
+                         "key": key}
+                    reg["groups"][(key, cid)] = g
+
+                    def make_toggle(g=g):
                         def _toggle():
                             col = self._get_dash_collapsed()
-                            pair = (k, c_id)
+                            pair = (g["key"], g["cid"])
                             if pair in col:
                                 col.remove(pair)
-                                ib.pack(fill="x", pady=(px(4), 0))
-                                b.config(text=f"▼  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                                g["ib"].pack(fill="x", pady=(px(4), 0))
                             else:
                                 col.add(pair)
-                                ib.pack_forget()
-                                b.config(text=f"▶  {cd} ({cnt} item{'s' if cnt != 1 else ''})")
+                                g["ib"].pack_forget()
+                            g["btn"].config(text=f"{'▶' if pair in col else '▼'}  {g['code']} ({plural(g['n'], 'item')})")
                             self._save_dash_collapsed()
                         return _toggle
 
                     t_btn.config(command=make_toggle())
                     t_btn.pack(side="left")
-                    sec_widgets.append((cid, code, len(p_rows), items_box, t_btn))
+                    sec_widgets.append(g)
                     ttk.Button(
                         p_hdr,
                         text="✕",
                         width=3,
-                        command=lambda rs=p_rows: self.permanently_dismiss_dashboard_rows(rs),
+                        command=lambda k=key, c_id=cid: self.permanently_dismiss_dashboard_rows(live(k, c_id)),
                     ).pack(side="right", padx=(px(4), 0))
                     ttk.Button(
                         p_hdr,
                         text="Hide client items",
-                        command=lambda c=p_client, rs=p_rows: self.dismiss_dashboard_items(c, [r["dkey"] for r in rs]),
+                        command=lambda c=p_client, k=key, c_id=cid: self.dismiss_dashboard_items(
+                            c, [r["dkey"] for r in live(k, c_id)]),
                     ).pack(side="right")
                     ttk.Button(
                         p_hdr,
@@ -15908,6 +22046,7 @@ def run_gui():
                     for r in p_rows:
                         r_ = ttk.Frame(items_box)
                         r_.pack(fill="x", pady=px(2), padx=(px(14), 0))
+                        reg["rows"][r["dkey"]] = {"w": r_, "key": key, "cid": cid, "row": r}
                         if key == "followups":
                             v = tk.BooleanVar(value=False)
                             r_._v = v                      # keep it alive, or the box shows as half ticked
@@ -15916,7 +22055,7 @@ def run_gui():
                                 variable=v,
                                 command=lambda r=r: (
                                     self.set_followup(r["client"], r["fid"], True, reopen=False),
-                                    self.show_home(),
+                                    self.home_update([r["dkey"]]),
                                 ),
                             ).pack(side="left")
                         ttk.Label(
@@ -15947,12 +22086,63 @@ def run_gui():
                             ttk.Label(r_, text=fmt_date(r["when"]), style="Muted.TLabel").pack(side="right", padx=px(8))
                     if not is_min:
                         items_box.pack(fill="x", pady=(px(4), 0))
-            if not total:
+            def all_clear():
                 ttk.Label(box, text="Nothing needs your attention right now. Drafts to review, plan reviews, risk, score "
                                     "changes, follow-ups and homework show up here as they come in.",
                           style="Muted.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(10), 0))
+            if not total:
+                all_clear()
+
+            def dash_remove(dkeys, hidden_delta=0):
+                """Take these items off the page where they are — their rows, and a patient's card or a whole list
+                once it's empty — and bring the counts up to date. Nothing else on the page is rebuilt."""
+                col = self._get_dash_collapsed()
+                for dk in dkeys:
+                    row = reg["rows"].pop(dk, None)
+                    if not row:
+                        continue
+                    _quiet(row["w"].destroy)
+                    k, cid = row["key"], row["cid"]
+                    data[k] = [r for r in data.get(k, []) if r.get("dkey") != dk]
+                    g = reg["groups"].get((k, cid))
+                    if g:
+                        g["n"] -= 1
+                        if g["n"] <= 0:
+                            _quiet(g["card"].destroy)
+                            reg["groups"].pop((k, cid), None)
+                        else:
+                            g["btn"].config(text=f"{'▶' if (k, cid) in col else '▼'}  {g['code']} ({plural(g['n'], 'item')})")
+                    s = reg["secs"].get(k)
+                    if s:
+                        s["n"] -= 1
+                        if s["n"] <= 0:
+                            _quiet(s["hdr"].destroy)
+                            reg["secs"].pop(k, None)
+                        else:
+                            n_p = sum(1 for (k2, _c) in reg["groups"] if k2 == k)
+                            s["lbl"].config(text=f"{s['title']} ({plural(s['n'], 'item')} across {plural(n_p, 'patient')})")
+                    t = reg["tiles"].get(k)
+                    if t:
+                        n_left = len(data.get(k, []))
+                        if n_left:
+                            t[1].config(text=str(n_left))
+                        else:
+                            _quiet(t[0].destroy)
+                            reg["tiles"].pop(k, None)
+                            reg["tiles_flow"]._layout = None
+                            reg["tiles_flow"]._schedule()
+                reg["hidden"] = max(0, reg["hidden"] + hidden_delta)
+                left = len(reg["rows"])
+                reg["caseload"].config(text=reg["caseload_text"](left, reg["hidden"]))
+                reg["unhide"].config(text=f"Unhide dismissed ({reg['hidden']})")
+                reg["bar"].show(reg["unhide"], reg["hidden"] > 0)
+                if not left and not getattr(box, "_all_clear", False):
+                    box._all_clear = True
+                    all_clear()
             f._dash = data
             f._dash_groups = dash_groups
+            f._dash_remove = dash_remove
+            f._dash_reg = reg
             sc.realize_all()
 
         # ========================================================== WIZARD
@@ -16188,15 +22378,39 @@ def run_gui():
             with_var.trace_add("write", kind_changed)
             kind_changed()
 
-            ttk.Label(f, text="Anything the recording won't capture? (optional)", style="H2.TLabel").grid(
-                row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
-            ttk.Label(f, text="Appearance, affect, body language, MSE observations, things said before "
-                              "recording started…", style="Muted.TLabel").grid(row=6, column=0, columnspan=3, sticky="w")
+            obs_head = ttk.Label(f, text="", style="H2.TLabel")
+            obs_head.grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
+            obs_sub = ttk.Label(f, text="", style="Muted.TLabel", wraplength=px(760), justify="left")
+            obs_sub.grid(row=6, column=0, columnspan=3, sticky="w")
             ofr, obs = scrolled_text(f, height=5)
             ofr.grid(row=7, column=0, columnspan=3, sticky="nsew", pady=(4, 0))
             f.rowconfigure(7, weight=1)
             set_text(obs, w["observations"])
             obs.bind("<<Modified>>", lambda e: obs.edit_modified() and w.update(dirty=True))
+
+            def is_written():                  # no recording and no pasted transcript: you write what happened
+                return not audio_var.get().strip() and not w["pasted"] and not (w["transcript"].strip() or w["lines"])
+
+            def box_mode(*_):
+                if is_written():
+                    obs_head.config(text="What happened in the session?")
+                    obs_sub.config(text="No recording? Write what occurred: topics discussed, the patient's "
+                                        "presentation and mood, interventions you used and how they responded, "
+                                        "any risk, homework and the plan. The note is written from this.")
+                    obs.config(height=12)
+                else:
+                    obs_head.config(text="Anything the recording won't capture? (optional)")
+                    obs_sub.config(text="Appearance, affect, body language, MSE observations, things said before "
+                                        "recording started…")
+                    obs.config(height=5)
+            audio_var.trace_add("write", box_mode)
+            _show_paste = show_paste
+
+            def show_paste(on):                # (the box changes with the paste toggle too)
+                _show_paste(on)
+                box_mode()
+            toggle.config(command=lambda: show_paste(not w["pasted"]))
+            box_mode()
 
             def collect():
                 w["audio"] = audio_var.get()
@@ -16208,12 +22422,29 @@ def run_gui():
                 w["observations"] = get_text(obs).strip()
                 if w["pasted"]:
                     w["transcript"] = get_text(paste_txt).strip()
+                if is_written() and not w["transcript"].strip():
+                    w["source"] = "written"
+                elif w.get("source") == "written":
+                    w["source"] = ""
             w["collect"] = collect
 
             def next_step():
                 collect()
                 if not w["date"]:
                     return messagebox.showinfo(APP_NAME, "Enter the session date.")
+                if is_written():
+                    if not w["observations"]:
+                        return messagebox.showinfo(APP_NAME, "Write what happened in the session (or choose its "
+                                                             "recording) first.")
+                    w["transcript"], w["lines"] = "", []
+                    w["source"], w["dirty"] = "written", True
+                    generate = not w["note"] or messagebox.askyesno(
+                        APP_NAME, "Rewrite the note and overview from what you wrote?\n\n(No keeps the current "
+                                  "drafts.)")
+                    self.goto(3)
+                    if generate:
+                        self.start_generation()
+                    return
                 if w["pasted"]:
                     if not w["transcript"]:
                         return messagebox.showinfo(APP_NAME, "Paste the transcript first.")
@@ -16264,7 +22495,7 @@ def run_gui():
             self.queue_refresh()
             self.open_client(cid)
             self.set_status(f"{code}: recording sent to {name}. You'll get a notification when the draft is ready "
-                            "to review — Queue recordings shows its progress.")
+                            "to review — Queue shows its progress.")
 
         # ---- step 2
         def _step_transcribe(self, f):
@@ -16447,10 +22678,11 @@ def run_gui():
 
             nav = Flow(f)                          # reserved at the bottom: never pushed off-screen
             nav.pack(side="bottom", fill="x", pady=(10, 0), before=nb)
-            nav.add(ttk.Button(nav, text="◀ Back", command=lambda: self.goto(2)))
+            written = w.get("source") == "written" and not w["transcript"].strip()
+            nav.add(ttk.Button(nav, text="◀ Back", command=lambda: self.goto(0 if written else 2)))
             rw = nav.add(ttk.Button(nav, text="✎  Rewrite with instructions…",
                                     command=lambda: (collect(), self.rewrite_dialog())))
-            if not (w["transcript"].strip() or w["note"].strip() or w["overview"].strip()):
+            if not (w["transcript"].strip() or w["note"].strip() or w["overview"].strip() or written):
                 rw.config(state="disabled")
             if w.get("undo"):
                 def undo():
@@ -16501,6 +22733,12 @@ def run_gui():
             code, hide, context, used, values = self._gen_inputs(client, w["sid"], w["date"], w["number"],
                                                                  w["observations"])
             transcript, job_cfg = hide(w["transcript"]), dict(cfg)
+            if w.get("source") == "written" and not w["transcript"].strip():
+                # no recording: the Counselor's own account of the session is what the note is written from
+                transcript = hide(w["observations"])
+                values["observations"] = "(none beyond the account below)"
+                values["source_kind"] = ("the Counselor's own written account of what happened in the session "
+                                         "(there is no recording or transcript; document only what it states)")
             if w["kind"] == "parent":
                 values["contact_method"] = w.get("contact_method") or "In person (recorded)"
                 values.update(contact_with=w.get("contact_with") or "parent", contact_who=w.get("contact_who", ""))
@@ -17525,7 +23763,7 @@ def run_gui():
             extra = f"  ·  {n_tasks} task{'s' if n_tasks != 1 else ''} waiting" if n_tasks else ""
             self.queue_btn.config(text=(f"🎙  Queue  {done}/{total}" if (Q["running"] or away) else
                                         ("🎙  Queue  ·  " + str(total)) if total else
-                                        "🎙  Queue" if n_tasks else "🎙  Queue recordings") + extra)
+                                        "🎙  Queue") + extra)
 
         def stay_awake(self, on):
             """Stop the computer from sleeping while the queue runs (you're away from it).
@@ -17578,7 +23816,7 @@ def run_gui():
                 return messagebox.showinfo(APP_NAME, "The speech engine isn't installed yet — open Settings first.",
                                            parent=win)
             if Q["write"] and not (isinstance(self.lm_status, list) and self.lm_status):
-                if not messagebox.askyesno(APP_NAME, "LM Studio doesn't seem to be running, so the notes can't be "
+                if not messagebox.askyesno(APP_NAME, f"{ai_name(cfg)[0].upper() + ai_name(cfg)[1:]} doesn't seem to be ready, so the notes can't be "
                                                      "written. Start the queue anyway? (Transcripts are still "
                                                      "saved; you can write the notes later.)", parent=win):
                     return
@@ -17651,7 +23889,7 @@ def run_gui():
             if not secs:
                 return None
             total = estimate_tx_secs(cfg.get("whisper_model") or "large-v3-turbo",
-                                     bool(self.settings.get("hf_token")), secs)
+                                     speakers_on(self.settings.get("hf_token")), secs)
             if it.get("write", self._q()["write"]):
                 total += estimate_write_secs(it.get("kind", "progress"), secs / 60 * CHARS_PER_AUDIO_MIN)
             return total
@@ -18763,7 +25001,8 @@ def run_gui():
             prog_lbl.grid(row=2, column=1, sticky="ew")
             pbf = ttk.Frame(fs)
             pbf.grid(row=2, column=2, sticky="ne")
-            ttk.Button(pbf, text="Move…", command=lambda: move_program_dialog()).pack(side="left")
+            if not BUNDLE:            # an installed copy stays where the installer put it (shortcuts, uninstall)
+                ttk.Button(pbf, text="Move…", command=lambda: move_program_dialog()).pack(side="left")
             ttk.Button(pbf, text="Open", command=lambda: open_program_folder()).pack(side="left", padx=(px(4), 0))
             ttk.Separator(fs).grid(row=3, column=0, columnspan=3, sticky="ew", pady=px(8))
             syncrow = ttk.Frame(fs)
@@ -18882,6 +25121,148 @@ def run_gui():
                     ttk.Button(r_, text="Remove", command=lambda d=d: remove_phone(d)).pack(side="right")
             show_phone()
 
+            # ---- fingerprint unlock (Windows Hello), per computer
+            if IS_WIN:
+                hw = ttk.LabelFrame(outer, text="Fingerprint unlock (Windows Hello)", padding=px(10))
+                hw.pack(fill="x", pady=(px(10), 0))
+                ttk.Label(hw, text="Unlock with your fingerprint, face or Windows PIN instead of typing the vault "
+                                   "password — at start-up, after auto-lock, and after a patient finishes an "
+                                   "assessment. Set up separately on each computer; the key it uses stays on this "
+                                   "computer (never in the shared folder). Your password always still works.",
+                          style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w")
+                hw_info = ttk.Label(hw, text="", wraplength=px(760), justify="left")
+                hw_info.pack(anchor="w", pady=(px(6), 0))
+                hw_row = Flow(hw, gap=px(8))
+                hw_row.pack(fill="x", pady=(px(6), 0))
+                hw_on_b = hw_row.add(ttk.Button(hw_row, text="Turn on…", style="Accent.TButton"))
+                hw_off_b = hw_row.add(ttk.Button(hw_row, text="Turn off"))
+
+                def hw_show(note=None):
+                    st_ = hello_state(vault)
+                    hw_info.config(style="TLabel", text=note or (
+                        f"On for this computer (set up {fmt_date(st_.get('created', '')[:10])})." if st_ else
+                        "Off on this computer."))
+                    hw_row.show(hw_on_b, not st_)
+                    hw_row.show(hw_off_b, bool(st_))
+
+                def hw_thread(fn, done):
+                    box = {}
+
+                    def work():
+                        try:
+                            box["ok"] = fn()
+                        except Exception as e:
+                            box["err"] = str(e) or e.__class__.__name__
+                    threading.Thread(target=work, daemon=True).start()
+                    threading.Thread(target=_hello_front, daemon=True).start()
+
+                    def poll():
+                        if "ok" in box or "err" in box:
+                            done(box.get("ok"), box.get("err"))
+                        else:
+                            win.after(200, poll)
+                    win.after(200, poll)
+
+                def hw_on():
+                    dlg = new_window(win, "Turn on fingerprint unlock", "460x220")
+                    dlg.grab_set()
+                    df = ttk.Frame(dlg, padding=(px(20), px(16)))
+                    df.pack(fill="both", expand=True)
+                    ttk.Label(df, text="Enter your vault password once more to set this up.",
+                              wraplength=px(400), justify="left").pack(anchor="w")
+                    pe = ttk.Entry(df, show="•", width=34)
+                    pe.pack(anchor="w", pady=(px(8), 0))
+                    em = ttk.Label(df, text="", style="Bad.TLabel")
+                    em.pack(anchor="w", pady=(px(4), 0))
+
+                    def go(*_):
+                        if not vault.verify(pe.get()):
+                            pe.delete(0, "end")
+                            return em.config(text="Incorrect password.")
+                        dlg.destroy()
+                        hw_on_b.config(state="disabled")
+                        hw_show("Follow the Windows Hello prompts — Windows asks three times (to create the key, "
+                                "then twice to check it). Touch the fingerprint reader each time.")
+
+                        def done(mode, why):
+                            hw_on_b.config(state="normal")
+                            if why:
+                                hello_disable()
+                                return hw_show(f"Not turned on: {why}")
+                            hw_show("On for this computer. Next time, click “👆 Use fingerprint” to unlock."
+                                    + ("" if mode == "sign" else " (Using Windows' account encryption with a "
+                                                                 "Windows Hello check on this PC.)"))
+                        hw_thread(lambda: hello_enroll(vault), done)
+                    btns_ = pin_bottom(ttk.Frame(df), pady=(px(10), 0))
+                    ttk.Button(btns_, text="Cancel", command=dlg.destroy).pack(side="right")
+                    ttk.Button(btns_, text="Continue", style="Accent.TButton", command=go).pack(side="right",
+                                                                                               padx=px(8))
+                    pe.bind("<Return>", go)
+                    pe.focus_set()
+                    win._hello_dlg = {"win": dlg, "entry": pe, "go": go}
+
+                def hw_off():
+                    if not messagebox.askyesno(APP_NAME, "Turn off fingerprint unlock on this computer? You'll unlock "
+                                                         "with your password.", parent=win):
+                        return
+                    hw_thread(hello_disable, lambda *_: hw_show("Turned off. (You can turn it on again any time.)"))
+                hw_on_b.config(command=hw_on)
+                hw_off_b.config(command=hw_off)
+                hw_show()
+                win._hello = {"on": hw_on, "off": hw_off, "info": hw_info}
+
+            # ---- document types for Write ▸ Import document
+            dt = ttk.LabelFrame(outer, text="Document types (for Write ▸ Import document)", padding=px(10))
+            dt.pack(fill="x", pady=(px(10), 0))
+            ttk.Label(dt, text="Besides progress notes, intakes, contact notes and treatment plans, you can import "
+                               "these kinds of documents. They go on the patient's Documents tab (with the original "
+                               "file, encrypted), and the AI uses them for the case overview, treatment plans and Ask "
+                               "AI. Removing a type here doesn't remove documents already imported.",
+                      style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w")
+            dt_list = ttk.Frame(dt)
+            dt_list.pack(fill="x", pady=(px(6), 0))
+            dt_row = Flow(dt, gap=px(8))
+            dt_row.pack(fill="x", pady=(px(6), 0))
+            dt_var = tk.StringVar()
+            dt_entry = dt_row.add(ttk.Entry(dt_row, textvariable=dt_var, width=34))
+            dt_msg = ttk.Label(dt, text="", style="Muted.TLabel")
+            dt_msg.pack(anchor="w")
+
+            def dt_save(types):
+                self.settings["doc_types"] = types
+                vault.save_settings(self.settings)
+
+            def dt_show():
+                for w_ in dt_list.winfo_children():
+                    w_.destroy()
+                for name in self.doc_types():
+                    r_ = ttk.Frame(dt_list)
+                    r_.pack(fill="x", pady=(px(1), 0))
+                    ttk.Label(r_, text=f"• {name}").pack(side="left")
+                    ttk.Button(r_, text="Remove", command=lambda n=name: dt_remove(n)).pack(side="right")
+
+            def dt_add(*_):
+                name = re.sub(r"\s+", " ", dt_var.get()).strip()[:60]
+                if not name:
+                    return dt_msg.config(text="Type the name of the new document type first.")
+                builtin = ["progress note", "intake assessment", "treatment plan", "patient contact",
+                           "parent contact", "collateral contact"]
+                if name.lower() in builtin + [t.lower() for t in self.doc_types()]:
+                    return dt_msg.config(text=f"“{name}” is already a type.")
+                dt_save(self.doc_types() + [name])
+                dt_var.set("")
+                dt_msg.config(text=f"Added “{name}”.")
+                dt_show()
+
+            def dt_remove(name):
+                dt_save([t for t in self.doc_types() if t != name])
+                dt_msg.config(text=f"Removed “{name}” (documents already imported keep it).")
+                dt_show()
+            dt_row.add(ttk.Button(dt_row, text="＋  Add type", command=dt_add))
+            dt_entry.bind("<Return>", dt_add)
+            dt_show()
+            win._doc_types = {"var": dt_var, "add": dt_add, "remove": dt_remove}
+
             # ---- writing preferences learned from your edits
             wp = ttk.LabelFrame(outer, text="Writing preferences (learned from your edits)", padding=px(10))
             wp.pack(fill="x", pady=(px(10), 0))
@@ -18983,6 +25364,33 @@ def run_gui():
                     log("✗ " + msg)
                     refresh()
                 if not self.run_bg(work, done, fail, label="Settings", quiet=True):
+                    log("Another task is running — try again when it finishes.")
+
+            def builtin_ai_row():
+                cur = find_model(cfg.get("model"))
+                if cur is None:
+                    return ("Built-in AI (writes the notes)", False,
+                            f"No AI model found. Put a .gguf model file in {LLM_DIRS[1]}, or reinstall.",
+                            ("Check again", retune))
+                pl = plan_model(cur, hardware_cached())
+                return ("Built-in AI (writes the notes)", pl["fit"] != "no",
+                        f"{cur['name']}: {FIT_LABEL[pl['fit']]} — {pl['why']}. Choose another model below.",
+                        ("Check this computer again", retune))
+
+            def retune():
+                log("Checking this computer's memory, processor and graphics…")
+
+                def done(msg):
+                    if msg:
+                        log("✓ " + msg)
+                    if ai_engine(cfg) == "builtin":
+                        sv["model"].set(cfg.get("model") or "")
+                        sv["whisper_model"].set(cfg.get("whisper_model") or "")
+                        _quiet(show_fit)
+                    refresh()
+                    self.refresh_strip()
+                if not self.run_bg(lambda progress: auto_tune(cfg, refresh=True), done,
+                                   lambda m: log("✗ " + m), label="Settings", quiet=True):
                     log("Another task is running — try again when it finishes.")
 
             def switch_python(py, ver, has):
@@ -19198,7 +25606,9 @@ def run_gui():
                                                     + [x.strip() for x in extra_var.get().split(",") if x.strip()]),
                            "appearance": next((k for k, v in APPEARANCE.items() if v == appear_var.get()), "system"),
                            "date_format": next((k for k, v in DATE_FORMATS.items() if v == datefmt_var.get()), "iso"),
-                           "remote_accept": remote_var.get()}
+                           "remote_accept": remote_var.get(),
+                           "touch_scroll": next((k for k, v in TOUCH_MODES.items() if v == touch_var.get()), "auto"),
+                           "ai_names": bool(names_var.get())}
                 except NetworkBlocked as e:
                     return messagebox.showerror(APP_NAME, str(e), parent=win)
                 except ValueError:
@@ -19296,7 +25706,7 @@ def run_gui():
                 folder_detail = (f"{droot}\n" + ("Synced by Google Drive, so your other computer sees the same patients, "
                                                  "notes and templates (encrypted)." if is_cloud_path(droot) else
                                                  "On this computer only.")
-                                 + f"\nThis computer's own settings (Python, LM Studio, speech model, look) are in "
+                                 + f"\nThis computer's own settings (Python, AI, speech model, look) are in "
                                    f"{LOCAL_DIR}.")
                 dl = in_downloads(APP_DIR)
                 prog_detail = (f"{APP_DIR}\n" + ("This is your Downloads folder — easy to clear out by accident. "
@@ -19309,11 +25719,12 @@ def run_gui():
                     ("FFmpeg (reads audio files)", ffmpeg_installed(),
                      "Found." if ffmpeg_installed() else "Not found.",
                      None if ffmpeg_installed() else ("Install", lambda: task(install_ffmpeg))),
-                    ("Speaker labels", bool(token_var.get().strip()) or None,
+                    ("Speaker labels", speakers_on(token_var.get().strip()) or None,
                      "Token saved." if token_var.get().strip() else
                      "Optional. Paste a free Hugging Face token below, accept the pyannote model terms "
                      "on huggingface.co, then click Download.", None),
                     ("Speech models", models_ok, model_detail, model_actions),
+                    builtin_ai_row() if ai_engine(cfg) == "builtin" else
                     ("LM Studio (writes the notes)",
                      None if lm is None else (isinstance(lm, list) and bool(lm)),
                      "Checking…" if lm is None else (
@@ -19406,8 +25817,55 @@ def run_gui():
                                                                textvariable=sv["previous_notes"], width=4))
             pr(3, 0, "Auto-lock (minutes, 0 = off)", ttk.Entry(pg, textvariable=sv["autolock_minutes"], width=6))
             pr(3, 2, "Condense transcripts over (chars)", ttk.Entry(pg, textvariable=sv["max_chars"], width=8))
-            pr(4, 0, "LM Studio address", ttk.Entry(pg, textvariable=sv["lmstudio_url"]))
-            pr(4, 2, "AI model (blank = loaded one)", ttk.Entry(pg, textvariable=sv["model"]))
+            if ai_engine(cfg) == "builtin":
+                if not find_model(sv["model"].get()):         # first start, before auto_tune has picked one
+                    first = find_model(BUNDLE.get("default_model")) or (model_files() or [{"name": ""}])[0]
+                    sv["model"].set(first["name"])
+                mf = ttk.Frame(pg)
+                ttk.Combobox(mf, textvariable=sv["model"], values=[m["name"] for m in model_files()],
+                             state="readonly", postcommand=lambda: mcb.config(
+                                 values=[m["name"] for m in model_files()])).pack(fill="x")
+                mcb = mf.winfo_children()[0]
+                fit_lbl = ttk.Label(mf, style="Caption.TLabel", wraplength=px(360), justify="left")
+                fit_lbl.pack(fill="x", pady=(px(2), 0))
+
+                hwf = ttk.Frame(pg)
+                hw_lbl = ttk.Label(hwf, style="Caption.TLabel", wraplength=px(360), justify="left")
+                hw_lbl.pack(fill="x")
+                ttk.Button(hwf, text="Check this computer again", command=retune).pack(anchor="w", pady=(px(4), 0))
+
+                def show_fit():
+                    hw_lbl.config(text=hardware_summary(hardware_cached()))
+                    m = find_model(sv["model"].get())
+                    if m is None:
+                        return fit_lbl.config(text=f"No AI model found. Add .gguf files to {LLM_DIRS[1]}.")
+                    pl = plan_model(m, hardware_cached())
+                    fit_lbl.config(text=f"{FIT_LABEL[pl['fit']]}: {pl['why']}. {m['bytes'] / GB:.1f} GB.")
+
+                def pick_model(_e=None):
+                    m = find_model(sv["model"].get())
+                    if m is None:
+                        return
+                    pl = plan_model(m, hardware_cached())
+                    if pl["fit"] == "no" and not messagebox.askyesno(
+                            APP_NAME, f"{m['name']} {pl['why']}, so it will probably fail to load here. "
+                                      "Use it anyway?", parent=win):
+                        sv["model"].set(cfg.get("model") or "")
+                        return show_fit()
+                    cfg.update(model=m["name"], lm_context=pl["ctx"], gpu_layers=pl["gpu_layers"])
+                    save_config(cfg)
+                    show_fit()
+                    log(f"✓ Notes will be written with {m['name']} from the next AI step on "
+                        "(it takes a minute to load the first time).")
+                    self.check_lmstudio()
+                mcb.bind("<<ComboboxSelected>>", pick_model, add="+")
+                show_fit()
+                pr(4, 0, "AI model (built in)", mf)
+                pr(4, 2, "This computer", hwf)
+            else:
+                show_fit = lambda: None
+                pr(4, 0, "LM Studio address", ttk.Entry(pg, textvariable=sv["lmstudio_url"]))
+                pr(4, 2, "AI model (blank = loaded one)", ttk.Entry(pg, textvariable=sv["model"]))
             pr(5, 0, "Appearance", ttk.Combobox(pg, textvariable=appear_var, values=list(APPEARANCE.values()),
                                                 state="readonly", width=16))
             datefmt_var = tk.StringVar(value=DATE_FORMATS.get(cfg.get("date_format", "iso"), DATE_FORMATS["iso"]))
@@ -19425,6 +25883,21 @@ def run_gui():
             pr(7, 2, None, ttk.Label(pg, text="Comma-separated, e.g. Parent/Guardian, Partner, Other. Used in Who's who and "
                                   "transcripts; earlier transcripts keep their labels.",
                       style="Caption.TLabel", wraplength=px(360), justify="left"))
+            names_var = tk.BooleanVar(value=bool(cfg.get("ai_names", True)))
+            pr(9, 0, "Patient names for the AI", ttk.Checkbutton(pg, text="The local AI reads real names",
+                                                                variable=names_var))
+            pr(9, 2, None, ttk.Label(pg, text="The AI runs on this computer, so names never leave it either way. With "
+                                              "names, notes say who said and did what. Turn off to replace names with "
+                                              "placeholders for every patient; a single patient can be set to keep "
+                                              "names hidden in their profile. The supervision packet always hides them.",
+                                     style="Caption.TLabel", wraplength=px(360), justify="left"))
+            TOUCH_MODES = {"auto": "Automatic (finger or pen)", "on": "Every drag scrolls", "off": "Off"}
+            touch_var = tk.StringVar(value=TOUCH_MODES.get(cfg.get("touch_scroll") or "auto", TOUCH_MODES["auto"]))
+            pr(8, 0, "Touchscreen scrolling", ttk.Combobox(pg, textvariable=touch_var, values=list(TOUCH_MODES.values()),
+                                                         state="readonly", width=22))
+            pr(8, 2, None, ttk.Label(pg, text="Drag with a finger to scroll pages, lists and notes; flick to keep "
+                                              "going. Choose “Every drag scrolls” if your screen isn't recognized.",
+                                     style="Caption.TLabel", wraplength=px(360), justify="left"))
             lay_prefs()
             ttk.Separator(prefs).grid(row=15, column=0, columnspan=4, sticky="ew", pady=px(2))
             ttk.Checkbutton(prefs, text="Offer to delete the recording after saving a session",
@@ -19647,7 +26120,7 @@ def run_gui():
                 return self._phone_reply(rid, state="error", text="That patient hasn't reached this computer yet "
                                                                   "(Google Drive is still syncing). Try again shortly.")
             if not (isinstance(self.lm_status, list) and self.lm_status):
-                return self._phone_reply(rid, state="error", text=f"LM Studio isn't running on "
+                return self._phone_reply(rid, state="error", text=f"The AI isn't running on "
                                                                   f"{platform.node() or 'this computer'}.")
             question = str(req.get("question") or "").strip()[:4000]
             if not question:
@@ -19700,7 +26173,8 @@ def run_gui():
                 if not engine_installed():
                     return False, "The speech engine isn't set up on this computer."
                 if Q["write"] and not (isinstance(self.lm_status, list) and self.lm_status):
-                    return False, "LM Studio isn't running, so the notes couldn't be written. Start LM Studio first."
+                    return False, ("The AI isn't ready, so the notes couldn't be written. "
+                                   + ("Check Settings." if ai_engine(cfg) == "builtin" else "Start LM Studio first."))
                 if self.busy:
                     return False, f"Another task is running ({self.task_label}). Start the queue when it finishes."
                 self.queue_start()
@@ -19852,9 +26326,45 @@ def run_gui():
             ttk.Button(box, text="Unlock", style="Accent.TButton", command=attempt).pack(fill="x", ipady=px(3))
             pw.bind("<Return>", attempt)
             pw.focus_set()
+            if hello_state(vault):
+                def accept(key):
+                    if not vault.key_ok(key):
+                        return False
+                    pw.delete(0, "end")
+                    f.destroy()
+                    self.locked = False
+                    self.last_activity = time.time()
+                    if self.setup_win is not None:
+                        self.setup_win["win"].deiconify()
+                    if q_was_open and self._alive(qwin["win"]):
+                        qwin["win"].deiconify()
+                    return True
+
+                def say(text, bad=False):
+                    err.config(text=text, style="Bad.TLabel" if bad else "Muted.TLabel")
+
+                def give_up(text):
+                    say(text, True)
+                    pw.focus_set()
+                auto, again = hello_flow(lambda: f.winfo_exists(), accept, say, give_up)
+                hello_button(box, again).pack(fill="x", pady=(px(8), 0), ipady=px(3))
+                self._lock_hello = again
+                # it locked while you were away: the fingerprint prompt opens as soon as you're back
+                woke = {"done": False}
+
+                def on_return(_e=None):
+                    if not woke["done"] and f.winfo_exists():
+                        woke["done"] = True
+                        root.after(150, auto)
+                for seq in ("<Motion>", "<KeyPress>", "<ButtonPress>"):
+                    f.bind(seq, on_return, add="+")
+                    box.bind(seq, on_return, add="+")
+                self._lock_wake = on_return
 
         def idle_check(self):
             mins = int(cfg.get("autolock_minutes", 0) or 0)
+            if getattr(self, "_assessing", False):          # a patient is taking an assessment: never lock under it
+                self.last_activity = time.time()
             if mins and not self.locked and time.time() - self.last_activity > mins * 60:
                 self.lock()
             root.after(15_000, self.idle_check)
@@ -19879,6 +26389,7 @@ def run_gui():
             self.clear_clipboard()
             wipe_open_copies()                         # readable copies made by "Open"
             _quiet(vault.save_local_index)
+            _quiet(ENGINE.stop)                        # the built-in AI gives its memory back
             root.destroy()
 
     def start():

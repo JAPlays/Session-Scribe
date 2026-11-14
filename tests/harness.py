@@ -64,7 +64,8 @@ class H:
         ss = importlib.util.module_from_spec(spec); sys.modules["ss"] = ss; spec.loader.exec_module(ss)
         cls.ss = ss
         ss.save_config(dict(ss.DEFAULT_CONFIG, data_dir=data, vault_dir=os.path.join(data, "vault"),
-                            lmstudio_url=f"http://127.0.0.1:{srv.server_port}/v1", model="mock-model"))
+                            lmstudio_url=f"http://127.0.0.1:{srv.server_port}/v1", model="mock-model",
+                            ai_names=False))   # most tests check the hidden-names path; test_names.py the other
         import tkinter as tk
         from tkinter import messagebox
         for n in ("showinfo", "showerror", "showwarning"):
@@ -87,6 +88,19 @@ class H:
             es[1].event_generate("<Return>")
             for _ in range(40):
                 root.update(); time.sleep(0.05)
+            if not hasattr(root, "_app"):      # the key press didn't reach the window (e.g. it isn't in front)
+                def buttons(w, out):
+                    for c in w.winfo_children():
+                        if c.winfo_class() == "TButton":
+                            out.append(c)
+                        buttons(c, out)
+                    return out
+                for b in buttons(root, []):
+                    if str(b.cget("text")) in ("Create vault", "Unlock"):
+                        b.invoke()
+                        break
+                for _ in range(40):
+                    root.update(); time.sleep(0.05)
             app = root._app
             app.lm_status = ["mock-model"]
             import gc

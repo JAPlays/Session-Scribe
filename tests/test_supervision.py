@@ -30,6 +30,10 @@ def script(app, root, V, h):
     codes = {cc["id"]: cc["code"] for cc in app.clients}
     picked = sorted(codes[k] for k, v in t["picks"].items() if v.get())
     h.ok("patients seen in the last week are ticked; others aren't", picked == ["AB1", "CD2"], picked)
+    h.ok("asks what you'd like to focus on (not just questions)",
+         "What you'd like to focus on in this supervision session" in h.texts(win) and "Not just questions" in h.texts(win))
+    h.pump(root, 0.6)
+    h.ok("…and the box is ready to type in when it opens", win.focus_lastfor() is t["q"], win.focus_lastfor())
     t["q"].insert("1.0", "When should I refer out?\nHow to handle no-shows")
     h.shot("sup_dialog.png")
     h.RESP[:] = [("SUPERVISION about one patient", PAT)]
@@ -46,7 +50,7 @@ def script(app, root, V, h):
     print("   ---\n" + txt[:900] + "\n   ---")
     h.ok("packet saved (encrypted) with the period and patients", reps and reps[0]["start"] <= d1 <= reps[0]["end"]
          and reps[0]["patients"] == ["AB1", "CD2"])
-    h.ok("packet has my questions, skills, and each patient", "MY QUESTIONS" in txt and "- When should I refer out?" in txt
+    h.ok("packet has what I want to focus on, skills, and each patient", "WHAT I'D LIKE TO FOCUS ON" in txt and "- When should I refer out?" in txt
          and "SKILLS I'M WORKING ON" in txt and "Stay with shame one beat longer." in txt and "AB1 —" in txt and "CD2 —" in txt
          and "EF3" not in txt)
     rid = reps[0]["id"]
@@ -66,7 +70,7 @@ def script(app, root, V, h):
     fd.asksaveasfilename = lambda **k: out
     ss_mod = h.ss
     app.export_text(root, "Supervision prep", V.load_report(rid)["text"], "x")
-    h.ok("exports to Word", os.path.exists(out) and "MY QUESTIONS".title() in zipfile.ZipFile(out).read("word/document.xml").decode())
+    h.ok("exports to Word", os.path.exists(out) and "What I&apos;d Like To Focus On" in zipfile.ZipFile(out).read("word/document.xml").decode().replace("'", "&apos;") and "Focus On" in zipfile.ZipFile(out).read("word/document.xml").decode())
     out2 = os.path.join(os.environ["HOME"], "packet.pdf")
     fd.asksaveasfilename = lambda **k: out2
     app.export_text(root, "Supervision prep", V.load_report(rid)["text"], "x")
