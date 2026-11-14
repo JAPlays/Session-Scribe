@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.28"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.29"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2682,6 +2682,8 @@ def collect_export(client, sessions, include, start="", end=""):
                 if inr(x.get("date", ""))]
         rows += [(day, "", "note", records) for day, records in group_by_date(sessions)
                  if inr(day) and is_contact_day(records)]
+        rows += [(s.get("end", ""), "11:59 PM", "sum", s) for s in client.get("contact_summaries") or []
+                 if inr(s.get("end", "")) and (not start or s.get("start", "") >= start)]
         if rows:
             if not first:
                 blocks.append(("break", ""))
@@ -2694,6 +2696,16 @@ def collect_export(client, sessions, include, start="", end=""):
                     if x.get("notes"):
                         blocks.append(("p", "Note: " + x["notes"]))
                     blocks += thread_export_blocks(x.get("text", ""))
+                elif kind == "sum":
+                    blocks.append(("h2", f"Contact summary — {fmt_date(x.get('start', ''))} to {fmt_date(day)}"))
+                    for para in _paras(x.get("text", "")):
+                        head, _, rest = para.partition("\n")
+                        if head.isupper() and len(head) < 60:            # its plain-text headings
+                            blocks.append(("h3", head))
+                            if rest.strip():
+                                blocks.append(("p", rest.strip()))
+                        else:
+                            blocks.append(("p", para))
                 else:
                     blocks.append(("h2", f"{fmt_date(day)} — {day_title(x)} note"))
                     for _label, key, _sid, d in day_docs(x):
@@ -9223,6 +9235,120 @@ def generate_documents(cfg, values, transcript, context, progress, kind="progres
         second = steps.run(n, cfg, context + prefs + "\n\n" + fill(read_template(t2), v) + extra)
     progress("Done.", 100)
     return first, second
+
+
+# ---- contact log: one detailed summary note of every contact over a period ---------------------
+CONTACT_PERIOD_PROMPT = """Write a CONTACT SUMMARY NOTE for the clinical record covering every contact outside of \
+therapy sessions about this patient from {start} to {end}: the texts, emails, phone calls, visits and other \
+contacts listed below, oldest first. Be detailed, factual and organized. Past tense, third person, using \
+"patient" and "Counselor". Never write a name the source doesn't give, and keep any placeholder exactly as \
+written (for example [PERSON_1], [EMAIL], [PHONE]). Never invent anything; if something is unclear, write \
+[VERIFY: ...].
+
+Use these plain-text headings, in this order (no other formatting):
+
+OVERVIEW
+2-4 sentences: the period, how many contacts and of what kinds, with whom, and the main reasons for contact.
+
+CONTACTS BY DATE
+One line per date, oldest first, each starting with "- " and the date, then the way of contact and who it was \
+with, then 1-3 sentences on what was communicated, asked or decided.
+
+KEY CONCERNS AND THEMES
+The concerns, reports, requests and questions raised over the period, and how they developed (one line each, \
+starting with "- ").
+
+WHAT THE COUNSELOR SHARED OR RECOMMENDED
+What the Counselor explained, advised, scheduled or recommended (one line each, starting with "- ").
+
+AGREEMENTS AND FOLLOW-UP
+Who agreed to do what, and by when if stated; whether earlier agreements were followed through; what is still \
+open (one line each, starting with "- "). If nothing was agreed, write "- None discussed".
+
+SAFETY, CONSENT AND CONFIDENTIALITY
+Any safety concern (suicidal ideation, self-harm, abuse, neglect, threats) and how it was addressed; consent, \
+release of information or limits of confidentiality. If none came up, say so in one sentence.
+
+RELEVANCE TO TREATMENT
+How these contacts relate to the treatment goals, and what may be worth exploring with the patient next \
+session. Label interpretations as hypotheses.
+
+Patient code: {client_code}
+Period: {start} to {end}
+Treatment goals: {goals}
+Clinician's notes or focus for this summary: {observations}
+
+Below are {source_kind}.
+
+{material}"""
+
+CONTACT_DIGEST_PROMPT = """These are part {part} of {total} of a patient's contacts outside therapy sessions \
+(texts, emails, calls, visits), oldest first. Condense them for a later summary: for each date, the way of \
+contact, who it was with, and every concern, request, piece of information, recommendation, agreement, and \
+anything about safety, consent or confidentiality. Keep dates, times and placeholders exactly as written. \
+Plain text, one date per paragraph, nothing invented.
+
+{chunk}"""
+
+
+def contact_period_blocks(client, sessions, start, end, hide=None):
+    """Every contact in the period (logged texts/emails/calls and contact notes), oldest first, as
+    "=== date time — how, with whom ===" blocks for the AI (names hidden, addresses/numbers/links removed).
+    Returns (blocks, counts by kind)."""
+    hide = hide or (lambda s: s or "")
+    inr = lambda d_: bool(d_) and start <= d_ <= end
+    rows, counts = [], {}
+    for x in client.get("communications") or []:
+        if not inr(x.get("date", "")):
+            continue
+        how = x.get("method", "Contact")
+        counts[how] = counts.get(how, 0) + 1
+        head = f"{fmt_date(x['date'])}" + (f" {x['time']}" if x.get("time") else "") + \
+            f" — {how} with {_export_party(x)}"
+        body = x.get("text", "") + (f"\n(Clinician's note: {x['notes']})" if x.get("notes") else "")
+        rows.append((x["date"], _clock(x.get("time", "")), f"=== {head} ===\n{hide(scrub_contact_details(body)).strip()}"))
+    for day, records in group_by_date(sessions):
+        if not (inr(day) and is_contact_day(records)):
+            continue
+        for _label, key, _sid, d in day_docs(records):
+            if key != "note" or not (d.get("note") or "").strip():
+                continue
+            m = d.get("meta", {})
+            how = m.get("contact_method") or "Contact"
+            counts["Contact note"] = counts.get("Contact note", 0) + 1
+            rows.append((day, -1, f"=== {fmt_date(day)} — {CONTACT_NAMES[contact_with(m)][0]}"
+                                  f"{' (' + how + ')' if how else ''} ===\n{hide(scrub_contact_details(d['note'])).strip()}"))
+    rows.sort(key=lambda r: (r[0], r[1]))
+    return [r[2] for r in rows], counts
+
+
+def contact_counts_text(counts):
+    if not counts:
+        return "No contacts in this period."
+    n = sum(counts.values())
+    return f"{n} contact{'s' if n != 1 else ''}: " + ", ".join(f"{v} × {k.lower()}" for k, v in
+                                                            sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+def generate_contact_summary(cfg, values, blocks, start, end, progress):
+    """One detailed summary note of every contact in the period (long periods are condensed first)."""
+    groups = group_blocks(blocks, int(cfg.get("max_chars", 24000)))
+    long_ = len(groups) > 1
+    steps = _Steps(progress, ([(f"Condensing the contacts, part {i} of {len(groups)}", 3000)
+                               for i in range(1, len(groups) + 1)] if long_ else []) +
+                   [("Writing the contact summary", 4500)])
+    if long_:
+        material = "\n\n".join(steps.run(i, cfg, fill(CONTACT_DIGEST_PROMPT, {"part": i + 1, "total": len(groups),
+                                                                             "chunk": g}))
+                               for i, g in enumerate(groups))
+        kind = f"condensed digests of the {len(blocks)} contacts in this period"
+    else:
+        material = "\n\n".join(blocks)
+        kind = f"the {len(blocks)} contacts in this period"
+    out = steps.run(len(groups) if long_ else 0, cfg, fill(CONTACT_PERIOD_PROMPT, dict(
+        values, start=fmt_date(start), end=fmt_date(end), source_kind=kind, material=material)))
+    progress("Done.", 100)
+    return out
 
 
 
@@ -18149,8 +18275,173 @@ def run_gui():
                     out.append((day, (day, "", meta.get("created", "")),
                                 f"{fmt_date(day)}   {day_title(records)} note" + (f"  ·  {how}" if how else "")
                                 + ("  · ⚠ review" if review else ""), ("day", day)))
+            for x in client.get("contact_summaries") or []:
+                out.append((x.get("end", ""), (x.get("end", ""), "~", x.get("created", "")),
+                            f"{fmt_date(x.get('start', ''))} → {fmt_date(x.get('end', ''))}   📝 Contact summary"
+                            + ("  · ⚠ review" if x.get("needs_review") else ""), ("sum", x)))
             out.sort(key=lambda e: e[1], reverse=True)
             return out
+
+        def _render_contact_summary(self, detail, client, x):
+            """A contact summary note: editable, with Save, Copy, Export and Remove."""
+            bar = Flow(detail, gap=px(8))
+            bar.pack(fill="x")
+            bar.add(ttk.Label(bar, text="Contact summary", style="Strong.TLabel"))
+            bar.add(ttk.Label(bar, text=f"{fmt_date(x.get('start', ''))} → {fmt_date(x.get('end', ''))}"
+                                        + (f"  ·  {x['counts']}" if x.get("counts") else ""), style="Muted.TLabel"),
+                    gap=px(4))
+            fr, tb = scrolled_text(detail)
+            msg = ttk.Label(detail, text="⚠  Drafted by the AI — check it against the contacts, then Save."
+                            if x.get("needs_review") else "", style="Warn.TLabel")
+
+            def save():
+                c = vault.load_client(client["id"])
+                for s in c.get("contact_summaries") or []:
+                    if s.get("id") == x["id"]:
+                        s["text"] = get_text(tb).strip()
+                        s["needs_review"] = False
+                        s["updated"] = datetime.now().isoformat(timespec="seconds")
+                        x.update(s)
+                vault.save_client(c)
+                self._sig = vault.signature()
+                msg.config(text="")
+                self.set_status(f"{client.get('code', '')}: contact summary saved.")
+                self.refresh_client_page(client["id"], select="comms")
+
+            def remove():
+                if not messagebox.askyesno(APP_NAME, f"Remove the contact summary for {fmt_date(x.get('start', ''))} "
+                                                     f"→ {fmt_date(x.get('end', ''))}?"):
+                    return
+                c = vault.load_client(client["id"])
+                c["contact_summaries"] = [s for s in c.get("contact_summaries") or [] if s.get("id") != x.get("id")]
+                vault.save_client(c)
+                self._sig = vault.signature()
+                self.refresh_client_page(client["id"], select="comms")
+            title = f"Contact summary {fmt_date(x.get('start', ''))} to {fmt_date(x.get('end', ''))}"
+            bar.add(ttk.Button(bar, text="Save", style="Accent.TButton", command=save), gap=px(16))
+            bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(get_text(tb), "Contact summary")))
+            bar.add(ttk.Button(bar, text="Export…", command=lambda: self.export_text(
+                detail.winfo_toplevel(), title, get_text(tb),
+                f"{client.get('code', 'patient')}_contacts_{x.get('start', '')}_to_{x.get('end', '')}")))
+            bar.add(ttk.Button(bar, text="Remove", command=remove), gap=px(12))
+            msg.pack(anchor="w", pady=(px(4), 0))
+            fr.pack(fill="both", expand=True, pady=(px(6), 0))
+            set_text(tb, x.get("text", ""))
+            detail._summary = {"text": tb, "save": save}
+
+        def contact_summary_dialog(self, client):
+            """Pick two dates: the AI writes one detailed summary note of every text, email, call and contact
+            note between them."""
+            cid, code = client["id"], client.get("code", "")
+            client = vault.load_client(cid)
+            sessions = vault.sessions_for(cid)
+            days = sorted({x.get("date", "") for x in client.get("communications") or [] if x.get("date")} |
+                          {d for d, r in group_by_date(sessions) if is_contact_day(r)})
+            win = new_window(root, f"{code} — summarize contacts", "640x520")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Summarize a period", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="The AI writes one detailed note of every text, email, call and contact note between "
+                              "two dates (by date, concerns, what you shared, agreements, safety, relevance to "
+                              "treatment). It's saved in the Contact log as a draft for you to check.",
+                      style="Muted.TLabel", wraplength=px(580), justify="left").pack(anchor="w", pady=(px(2), px(10)))
+            today = date.today().isoformat()
+            # the last 30 days up to the latest contact (or today)
+            last = max(days[-1], today) if days else today
+            a_var = tk.StringVar(value=(date.fromisoformat(last) - timedelta(days=30)).isoformat())
+            b_var = tk.StringVar(value=last)
+            row = Flow(f, gap=px(8))
+            row.pack(fill="x")
+            row.add(ttk.Label(row, text="From"))
+            row.add(date_field(row, a_var, on_pick=lambda _d: recount()))
+            row.add(ttk.Label(row, text="to"), gap=px(10))
+            row.add(date_field(row, b_var, on_pick=lambda _d: recount()))
+            count_lbl = ttk.Label(f, text="", style="Caption.TLabel")
+            count_lbl.pack(anchor="w", pady=(px(6), 0))
+            ttk.Label(f, text="Anything to focus on or add? (optional)", style="H2.TLabel").pack(anchor="w",
+                                                                                               pady=(px(12), 0))
+            ofr, obs = scrolled_text(f, height=4)
+            ofr.pack(fill="x", pady=(px(4), 0))
+            ttk.Label(f, text="Names on the “names to hide” list are replaced, and email addresses, phone numbers and "
+                              "links removed, before the AI (on this computer) sees anything.", style="Muted.TLabel",
+                      wraplength=px(580), justify="left").pack(anchor="w", pady=(px(8), 0))
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            status = ttk.Label(btns, text="", style="Muted.TLabel")
+            status.pack(side="left")
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            go = ttk.Button(btns, text="Write summary", style="Accent.TButton")
+            go.pack(side="right", padx=px(8))
+
+            def period():
+                a, b = a_var.get().strip(), b_var.get().strip()
+                try:
+                    date.fromisoformat(a)
+                    date.fromisoformat(b)
+                except ValueError:
+                    return None
+                return (a, b) if a <= b else (b, a)
+
+            def recount(*_):
+                p = period()
+                if not p:
+                    count_lbl.config(text=f"Use dates like {fmt_date('2026-09-01')} (or pick them from the calendar).")
+                    return
+                _b, counts = contact_period_blocks(vault.load_client(cid), vault.sessions_for(cid), *p)
+                count_lbl.config(text=contact_counts_text(counts))
+            for v_ in (a_var, b_var):
+                v_.trace_add("write", lambda *_: win.after_idle(recount))
+            recount()
+
+            def run():
+                p = period()
+                if not p:
+                    return status.config(text="Enter both dates.")
+                start, end = p
+                fresh = vault.load_client(cid)
+                note_txt = get_text(obs).strip()
+                try:
+                    _code, hide, _context, _used, values = self._gen_inputs(fresh, None, end, "", note_txt)
+                except Exception as e:
+                    return messagebox.showerror(APP_NAME, friendly_error(e), parent=win)
+                blocks, counts = contact_period_blocks(fresh, vault.sessions_for(cid), start, end, hide)
+                if not blocks:
+                    return status.config(text="There are no contacts between those dates.")
+                job_cfg, counts_txt = dict(cfg), contact_counts_text(counts)
+
+                def done(text):
+                    now = datetime.now().isoformat(timespec="seconds")
+                    entry = {"id": uuid.uuid4().hex[:12], "start": start, "end": end, "text": (text or "").strip(),
+                             "counts": counts_txt, "observations": note_txt, "needs_review": True,
+                             "created": now, "updated": now}
+                    c = vault.load_client(cid)
+                    c.setdefault("contact_summaries", []).append(entry)
+                    vault.save_client(c)
+                    self._sig = vault.signature()
+                    if self._alive(win):
+                        win.destroy()
+                    self.set_status(f"{code}: contact summary written ({fmt_date(start)} → {fmt_date(end)}) — "
+                                    "review it.")
+                    self._contact_focus = ("sum", entry["id"])
+                    if self.client_id == cid and not self.wizard:
+                        self.refresh_client_page(cid, select="comms")
+                    else:
+                        self.open_client(cid, select="comms")
+
+                def failed(m):
+                    if self._alive(win):
+                        win.destroy()
+                    messagebox.showerror(APP_NAME, f"Couldn't write the contact summary: {m}")
+                r = self.run_bg(lambda prog: generate_contact_summary(job_cfg, values, blocks, start, end, prog),
+                                done, failed, label=f"summarizing contacts for {code}", patient=code, pausable=True)
+                if r:
+                    go.config(state="disabled")
+                    status.config(text="Writing… (you can keep working; it opens when it's done)" if r != "queued"
+                                  else "Waiting in line — it starts when the current task finishes.")
+            go.config(command=run)
+            self._summary_win = {"win": win, "a": a_var, "b": b_var, "obs": obs, "go": go, "count": count_lbl,
+                                 "status": status, "recount": recount}
+            return win
 
         def _render_comms(self, v, client, sessions):
             """Contact log: every contact outside sessions, dated like the session list; the one picked shows
@@ -18163,6 +18454,8 @@ def run_gui():
                                 command=lambda: self.contact_log_dialog(client)), gap=px(16))
             head.add(ttk.Button(head, text="Texts / emails / call recording…",
                                 command=lambda: self.external_comm(client)))
+            head.add(ttk.Button(head, text="📝  Summarize a period…",
+                                command=lambda: self.contact_summary_dialog(client)))
             entries = self.contact_entries(client, sessions)
             if not entries:
                 ttk.Label(v, text="No contacts yet. “Log a contact…” records a call, voicemail, visit or message "
@@ -18184,10 +18477,13 @@ def run_gui():
                 for w in detail.winfo_children():
                     w.destroy()
                 kind, val = entries[i][3]
-                self._contact_focus = (kind, val.get("id") if kind == "log" else val)
+                self._contact_focus = (kind, val.get("id") if kind in ("log", "sum") else val)
                 if kind == "day":
                     recs = dict(group_by_date(sessions)).get(val, [])
                     self._render_day(detail, client, val, recs)
+                    return
+                if kind == "sum":
+                    self._render_contact_summary(detail, client, val)
                     return
                 x = val
                 bar = Flow(detail, gap=px(8))                # title, date and actions share one line
@@ -18211,7 +18507,7 @@ def run_gui():
             clb.bind("<<ListboxSelect>>", lambda e: clb.curselection() and show(clb.curselection()[0]))
             focus = getattr(self, "_contact_focus", None)
             i0 = next((i for i, e in enumerate(entries) if focus and (
-                (focus[0] == "log" and e[3][0] == "log" and e[3][1].get("id") == focus[1]) or
+                (focus[0] in ("log", "sum") and e[3][0] == focus[0] and e[3][1].get("id") == focus[1]) or
                 (focus[0] == "day" and e[3] == ("day", focus[1])))), 0)
             clb.selection_set(i0)
             clb.see(i0)
