@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.20"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.21"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7417,9 +7417,13 @@ _WEEKDAYS = "Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday"
 _MSG_FROM_RE = re.compile(
     r"^Message from (?P<who>[^,]+), (?P<body>.*), (?:" + _WEEKDAYS + r"), (?P<mon>[A-Za-z]+) (?P<day>\d{1,2}),? "
     r"(?P<year>\d{4}),? (?P<time>\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?)\.?$", re.S)
-_MSG_STAMP_RE = re.compile(r"^.{0,40}?\s*•\s*\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?$")   # "(631) 456-1234 • 1:15 PM"
-_MONTHS = {m: i for i, m in enumerate(("january", "february", "march", "april", "may", "june", "july", "august",
-                                       "september", "october", "november", "december"), 1)}
+# the sender/time header shown above a message: "(631) 456-1234 • 1:15 PM", "Christina • Sep 14, 10:02 AM",
+# or just "Sep 16, 11:46 AM" above your own
+_STAMP_CORE = r"(?:[A-Z][a-z]{2}\s+\d{1,2},\s+)?\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?"
+_MSG_STAMP_RE = re.compile(r"^(?:.{0,80}?\s*•\s*)?" + _STAMP_CORE + r"$")
+_MSG_STAMP_TAIL_RE = re.compile(r"\s+\S.{0,80}?\s*•\s*" + _STAMP_CORE + r"$")       # glued onto the line before
+_REACTION_RE = re.compile(r"^(Liked|Loved|Disliked|Laughed at|Emphasized|Questioned)\s+[“\"](?P<what>.*)[”\"]$", re.S)
+# (month names use _MONTHS from the date code above — "jan"…"dec" — looked up by their first three letters)
 
 
 def tidy_message_thread(text, other="Patient"):
@@ -7433,6 +7437,8 @@ def tidy_message_thread(text, other="Patient"):
     norm = lambda s: re.sub(r"\s+", " ", s).strip().lower()
     for raw in _INVISIBLE_RE.sub("", text or "").replace("\r\n", "\n").split("\n"):
         line = re.sub(r"^\s*[*•·-]\s*", "", raw).strip() if re.match(r"^\s*[*•·]", raw) else raw.strip()
+        if line and not _MSG_STAMP_RE.match(line):
+            line = _MSG_STAMP_TAIL_RE.sub("", line).strip()   # "…last words Christina • Sep 22, 2:44 PM"
         if not line:
             if out and out[-1] != "":
                 out.append("")
@@ -7444,15 +7450,23 @@ def tidy_message_thread(text, other="Patient"):
                 who = other                          # a phone number: the person on the other end
             elif who.lower() in ("you", "me", "myself"):
                 who = "Counselor"
-            mon = _MONTHS.get(m.group("mon").lower())
+            mon = _MONTHS.get(m.group("mon").lower()[:3])
             when = (f"{int(m.group('year')):04d}-{mon:02d}-{int(m.group('day')):02d} " if mon else "") + \
                 re.sub(r"\s+", " ", m.group("time")).upper().replace(".", "")
             body = m.group("body").strip()
-            out.append(f"[{when}] {who}: {body}")
+            r_ = _REACTION_RE.match(body)
+            if r_:                                   # an iPhone reaction, not a new message
+                what = re.sub(r"\s+", " ", r_.group("what")).strip()
+                out.append(f"[{when}] {who} reacted ({r_.group(1).lower()}) to: “"
+                           + (what[:80] + "…" if len(what) > 80 else what) + "”")
+            else:
+                out.append(f"[{when}] {who}: {body}")
             dup = norm(body)
             continue
         if _MSG_STAMP_RE.match(line):
             continue                                 # the sender/time header the app shows above a message
+        if re.fullmatch(r"[A-Z]{1,2}", line) and out and out[-1].startswith("["):
+            continue                                 # the contact's initial (their picture) under the header
         if dup and norm(line) and norm(line) in dup:
             continue                                 # the message's text again, right after its description
         dup = ""
@@ -7460,6 +7474,89 @@ def tidy_message_thread(text, other="Patient"):
     while out and out[-1] == "":
         out.pop()
     return "\n".join(out)
+
+
+_MAIL_HEAD_RE = re.compile(
+    r"^(?P<who>[^<\n]{1,80}?)\s*<(?P<addr>[^>\s]+@[^>\s]+)>\s+(?:[A-Z][a-z]{2},\s+)?(?P<mon>[A-Z][a-z]{2,8})\.?\s+"
+    r"(?P<day>\d{1,2}),\s+(?P<year>\d{4})(?:,)?\s+(?:at\s+)?(?P<time>\d{1,2}:\d\d\s*[AaPp]\.?[Mm]\.?)"
+    r"(?:\s*\(.*\))?\s*$")
+_MAIL_JUNK_RE = re.compile(r"^\s*(\[Quoted text hidden\]|\d+ messages?|To:\s.*|Cc:\s.*|Bcc:\s.*|"
+                           r"https?://mail\.google\.com/\S*|\d{1,2}/\d{1,2}/\d{2,4},\s+\d{1,2}:\d\d\s*[AP]M\s.*Mail\s+-\s+.*)"
+                           r"\s*$", re.I)
+_MAIL_NOTICE_RE = re.compile(r"^\s*(confidentiality notice|this (e-?mail|message|communication)( message)? (and any "
+                             r"attachments )?(is|are|may) (confidential|intended))", re.I)
+
+
+def looks_like_email_print(text):
+    """An email thread printed or saved from Gmail/Outlook ("Name <address>   Wed, Nov 11, 2026 at 3:15 PM")."""
+    return bool(re.search(r"(?m)^[^<\n]{1,80}<[^>\s]+@[^>\s]+>\s+(?:[A-Z][a-z]{2},\s+)?[A-Z][a-z]{2,8}\.?\s+\d{1,2},\s+"
+                          r"\d{4}", text or ""))
+
+
+def tidy_email_thread(text):
+    """An email thread as one dated block per email: "[2026-11-11 3:15 PM] Sender → Counselor:" and the message,
+    without the signature blocks, confidentiality notices, "[Quoted text hidden]" or print headers and links. The
+    mailbox the thread was printed from (its first line) is the Counselor. Text it doesn't recognize is kept."""
+    lines = _INVISIBLE_RE.sub("", text or "").replace("\r\n", "\n").split("\n")
+    me = ""
+    for l in lines:                       # the mailbox line ("Name <address>" alone) above the first email
+        if _MAIL_HEAD_RE.match(l.strip()):
+            break
+        m0 = re.match(r"^([^<\n]{1,80}?)\s*<([^>\s]+@[^>\s]+)>\s*$", l.strip())
+        if m0:
+            me = m0.group(2).lower()
+            break
+    msgs, pre, cur = [], [], None
+    for raw in lines:
+        line = raw.rstrip()
+        m = _MAIL_HEAD_RE.match(line.strip())
+        if m:
+            cur = {"who": m.group("who").strip().strip('"'), "addr": m.group("addr").lower(), "head": m,
+                   "to": "", "body": []}
+            msgs.append(cur)
+            continue
+        if cur is None:
+            pre.append(line)
+            continue
+        t_ = re.match(r"^\s*To:\s*(.*)$", line)
+        if t_ and not cur["body"]:
+            cur["to_raw"] = t_.group(1).lower()
+            cur["to"] = re.sub(r"\s*<[^>]*>", "", t_.group(1)).strip()
+            continue
+        cur["body"].append(line)
+    if not msgs:
+        return text or ""
+    subject = next((l.strip() for l in pre if l.strip() and not re.search(r"<[^>]+@", l)
+                    and not _MAIL_JUNK_RE.match(l)), "")
+    out = [f"Subject: {subject}"] if subject else []
+    for msg in msgs:
+        body = []
+        for l in msg["body"]:
+            if _MAIL_NOTICE_RE.match(l):
+                break                                     # the confidentiality notice runs to the end
+            if _MAIL_JUNK_RE.match(l):
+                continue
+            body.append(l.strip())
+        # the signature: from the sender's own name on a line of its own, near the end
+        name = msg["who"].lower()
+        for i in range(len(body) - 1, max(-1, len(body) - 14), -1):
+            if body[i].strip().lower() in (name, name.split()[0] if name else "", "-- ", "--"):
+                body = body[:i]
+                break
+        while body and not body[-1].strip():
+            body.pop()
+        while body and not body[0].strip():
+            body.pop(0)
+        h = msg["head"]
+        mon = _MONTHS.get(h.group("mon").lower()[:3])
+        when = (f"{int(h.group('year')):04d}-{mon:02d}-{int(h.group('day')):02d} " if mon else "") + \
+            re.sub(r"\s+", " ", h.group("time")).upper().replace(".", "")
+        who = "Counselor" if me and msg["addr"] == me else msg["who"]
+        to = msg["to"]
+        if me and to and me in msg.get("to_raw", ""):
+            to = "Counselor"
+        out.append(f"\n[{when}] {who}" + (f" → {to}" if to else "") + ":\n" + "\n".join(body).strip())
+    return "\n".join(out).strip()
 
 
 def looks_like_message_export(text):
@@ -11435,6 +11532,12 @@ CONTACT_NAMES = {"patient": ("Patient contact note", "Communication summary", "P
                  "other": ("Collateral contact note", "Conversation summary", "Collateral contact")}
 
 
+def is_contact_day(records):
+    """A date whose records are all outside-session contacts (contact notes) — shown in the Contact log, not the
+    session list."""
+    return bool(records) and all(d.get("meta", {}).get("kind") == "parent" for _, d in records)
+
+
 def contact_with(meta):
     """Who an outside-session contact was with; records from before this choice existed were with a parent."""
     w = (meta or {}).get("contact_with")
@@ -14545,8 +14648,9 @@ def run_gui():
                 ttk.Label(name_row, text=f"Terminated {fmt_date(client['termination'].get('date', ''))}",
                           style="ChipMuted.TLabel").pack(side="left", padx=px(6))
             days = group_by_date(sessions)
-            last = days[-1][0] if days else ""
-            ttk.Label(titles, text=f"{len(days)} session{'s' if len(days) != 1 else ''}"
+            s_days = [x for x in days if not is_contact_day(x[1])]     # (contacts are counted in the Contact log)
+            last = s_days[-1][0] if s_days else ""
+            ttk.Label(titles, text=f"{len(s_days)} session{'s' if len(s_days) != 1 else ''}"
                                    + (f"  ·  last seen {fmt_date(last)}" if last else ""),
                       style="Muted.TLabel").pack(anchor="w")
             pbtns = Flow(top, align="right")
@@ -14711,16 +14815,17 @@ def run_gui():
                 if docs:
                     items.append(("docs", None))
                     lb.insert("end", f"📁  Documents  · {len(docs)}")
-                comms = client.get("communications") or []
-                n_legacy = sum(1 for _, d in sessions if d["meta"].get("source") == "messages")
-                if comms or n_legacy:
-                    items.append(("comms", None))
-                    lb.insert("end", f"✉  External communication  · {len(comms) + n_legacy}")
+                n_contacts = len(client.get("communications") or []) + \
+                    sum(1 for _, d in sessions if d["meta"].get("kind") == "parent")
+                items.append(("comms", None))                  # always there: the patient's contact history
+                lb.insert("end", "📞  Contact log" + (f"  · {n_contacts}" if n_contacts else ""))
                 term = client.get("termination")
                 if term:                                     # only once a letter has been filled out
                     items.append(("term", None))
                     lb.insert("end", f"📄  Termination  · {fmt_date(term.get('date', ''))}")
                 for day, records in (reversed(days) if newest_first() else days):
+                    if is_contact_day(records):
+                        continue                               # outside-session contacts live in the Contact log
                     items.append(("day", day))
                     n_docs = len(day_docs(records))
                     imported_only = all(d["meta"].get("source") == "imported" for _, d in records)
@@ -14821,7 +14926,8 @@ def run_gui():
             fill_list()
 
             def pick(select):
-                latest = days[-1][0] if days else None          # open on the most recent session
+                s_d = [x for x in days if not is_contact_day(x[1])]
+                latest = s_d[-1][0] if s_d else None            # open on the most recent session
                 idx = next((i for i, it in enumerate(items) if it == ("day", latest)), min(1, len(items) - 1))
                 if select == "plan":
                     idx = 1
@@ -14838,7 +14944,11 @@ def run_gui():
                 elif select:
                     want = select[4:] if str(select).startswith("day:") else \
                         next((d["meta"].get("session_date") for sid, d in sessions if sid == select), None)
-                    idx = next((i for i, it in enumerate(items) if it[1] == want), idx)
+                    if want and is_contact_day(dict(days).get(want, [])):     # a contact note: in the Contact log
+                        self._contact_focus = ("day", want)
+                        idx = next((i for i, it in enumerate(items) if it[0] == "comms"), idx)
+                    else:
+                        idx = next((i for i, it in enumerate(items) if it[1] == want), idx)
                 return idx
 
             def refresh_in_place(select=None):
@@ -15772,7 +15882,7 @@ def run_gui():
                         continue
                     cur = get_text(msgs).strip()
                     set_text(msgs, (cur + "\n\n" if cur else "") + txt.strip())
-                    if pth.lower().endswith(".eml"):
+                    if pth.lower().endswith(".eml") or looks_like_email_print(txt):
                         method_var.set("Email")
             ttk.Button(msg_fr, text="Load from files…", command=load_files).pack(anchor="w")
 
@@ -15869,7 +15979,9 @@ def run_gui():
                 w_, who_ = contact_choice()
                 remember_choice()
                 party = contact_party(w_, who_)
-                if method == "Text messages" or looks_like_message_export(text):
+                if looks_like_email_print(text):
+                    text = tidy_email_thread(text) or text     # one dated block per email, no signatures/notices
+                elif method == "Text messages" or looks_like_message_export(text):
                     # one line per message, without the copy app's repeats and the sender's phone number
                     other = "Patient" if w_ == "patient" else ((who_ or "").strip().capitalize() or
                                                                ("Contact" if w_ == "other" else "Parent"))
@@ -17485,56 +17597,162 @@ def run_gui():
             set_text(tb, entry.get("text", ""))
             return win
 
+        def contact_entries(self, client, sessions):
+            """The patient's contact history, newest first: logged contacts (calls, visits, texts, emails) and
+            contact notes. Each: (date, sort key, label, ("log", entry) | ("day", date))."""
+            out = []
+            for x in client.get("communications") or []:
+                when = (x.get("time") or "")
+                out.append((x.get("date", ""), (x.get("date", ""), when, x.get("added", "")),
+                            f"{fmt_date(x.get('date', ''))}" + (f"  {when}" if when else "") +
+                            f"   {x.get('method', 'Contact')}  ·  {self.comm_party(x)}", ("log", x)))
+            for day, records in group_by_date(sessions):
+                if is_contact_day(records):
+                    meta = records[0][1]["meta"]
+                    how = meta.get("contact_method") or ""
+                    review = any(d["meta"].get("needs_review") for _, d in records)
+                    out.append((day, (day, "", meta.get("created", "")),
+                                f"{fmt_date(day)}   {day_title(records)} note" + (f"  ·  {how}" if how else "")
+                                + ("  · ⚠ review" if review else ""), ("day", day)))
+            out.sort(key=lambda e: e[1], reverse=True)
+            return out
+
         def _render_comms(self, v, client, sessions):
+            """Contact log: every contact outside sessions, dated like the session list; the one picked shows
+            below."""
             client = vault.load_client(client["id"])
             head = Flow(v, gap=px(8))
             head.pack(fill="x")
-            head.add(ttk.Label(head, text="External communication", style="H2.TLabel"))
-            head.add(ttk.Button(head, text="＋  Add…", style="Accent.TButton",
-                                command=lambda: self.external_comm(client)), gap=px(16))
-            ttk.Label(v, text="Texts, emails and other contacts outside sessions, newest first — kept for reference "
-                              "as they are.", style="Muted.TLabel", wraplength=px(520), justify="left").pack(
-                anchor="w", pady=(px(2), 0))
-            sc, box = scrollable(v)
-            sc.pack(fill="both", expand=True, pady=(px(8), 0))
-            rows = [("log", x.get("date", ""), x) for x in client.get("communications") or []]
-            rows += [("note", d["meta"].get("session_date", ""), (sid, d)) for sid, d in sessions
-                     if d["meta"].get("source") == "messages"]
-            if not rows:
-                ttk.Label(box, text="Nothing logged yet. Use “Add…” (or Write ▸ External communication) to paste texts "
-                                    "or emails.", style="Muted.TLabel", wraplength=px(520), justify="left").pack(anchor="w")
+            head.add(ttk.Label(head, text="Contact log", style="H2.TLabel"))
+            head.add(ttk.Button(head, text="＋  Log a contact…", style="Accent.TButton",
+                                command=lambda: self.contact_log_dialog(client)), gap=px(16))
+            head.add(ttk.Button(head, text="Texts / emails / call recording…",
+                                command=lambda: self.external_comm(client)))
+            entries = self.contact_entries(client, sessions)
+            if not entries:
+                ttk.Label(v, text="No contacts yet. “Log a contact…” records a call, voicemail, visit or message "
+                                  "(date, who, how and a summary); “Texts / emails / call recording…” brings in the "
+                                  "messages themselves or a recorded call.", style="Muted.TLabel", wraplength=px(560),
+                          justify="left").pack(anchor="w", pady=(px(6), 0))
                 return
-            for kind, day, x in sorted(rows, key=lambda r: (r[1], (r[2].get("added", "") if r[0] == "log"
-                                                                   else r[2][1]["meta"].get("created", ""))),
-                                       reverse=True):
-                card = ttk.Frame(box, style="Card.TFrame", padding=(px(12), px(8)))
-                card.pack(fill="x", pady=(0, px(6)), padx=(0, px(8)))
-                acts = Flow(card, gap=px(6))
-                if kind == "log":
-                    text = x.get("text", "")
-                    n_lines = len([l_ for l_ in text.splitlines() if l_.strip()])
-                    ttk.Label(card, text=f"{fmt_date(day)}   {x.get('method', 'Messages')}  ·  {self.comm_party(x)}",
-                              style="Strong.TLabel").pack(anchor="w")
-                    preview = " ".join(text.split())[:180] + ("…" if len(" ".join(text.split())) > 180 else "")
-                    ttk.Label(card, text=preview, style="Muted.TLabel", wraplength=px(500), justify="left").pack(
-                        anchor="w", pady=(px(2), 0))
-                    if x.get("notes"):
-                        ttk.Label(card, text="Note: " + x["notes"], wraplength=px(500), justify="left").pack(
-                            anchor="w", pady=(px(2), 0))
-                    acts.add(ttk.Button(acts, text=f"View ({n_lines} line{'s' if n_lines != 1 else ''})",
-                                        command=lambda e=x: self.comm_view(client, e)))
-                    acts.add(ttk.Button(acts, text="Copy", command=lambda e=x: self.copy(e.get("text", ""), "Messages")))
-                    acts.add(ttk.Button(acts, text="Remove", command=lambda e=x: self.comm_remove(client, e)), gap=px(12))
-                else:
-                    sid, d = x
-                    m = d["meta"]
-                    ttk.Label(card, text=f"{fmt_date(day)}   {m.get('contact_method', 'Messages')}  ·  contact note",
-                              style="Strong.TLabel").pack(anchor="w")
-                    ttk.Label(card, text="Drafted into a contact note (on that date in the session list).",
-                              style="Muted.TLabel").pack(anchor="w", pady=(px(2), 0))
-                    acts.add(ttk.Button(acts, text="Open", command=lambda s=sid: self.open_client(client["id"], select=s)))
-                acts.pack(fill="x", pady=(px(6), 0))
-            box.realize_all()
+            ttk.Label(v, text=f"{len(entries)} contact{'s' if len(entries) != 1 else ''}, newest first",
+                      style="Caption.TLabel").pack(anchor="w", pady=(px(4), px(2)))
+            lbox, clb = auto_scroll(v, lambda b: NiceList(b, "List.Treeview"))
+            lbox.pack(fill="x")
+            clb.configure(height=min(max(len(entries), 3), 8))
+            for e in entries:
+                clb.insert("end", e[2])
+            detail = ttk.Frame(v)
+            detail.pack(fill="both", expand=True, pady=(px(10), 0))
+
+            def show(i):
+                for w in detail.winfo_children():
+                    w.destroy()
+                kind, val = entries[i][3]
+                self._contact_focus = (kind, val.get("id") if kind == "log" else val)
+                if kind == "day":
+                    recs = dict(group_by_date(sessions)).get(val, [])
+                    self._render_day(detail, client, val, recs)
+                    return
+                x = val
+                ttk.Label(detail, text=f"{x.get('method', 'Contact')} with {self.comm_party(x).lower()}",
+                          style="Strong.TLabel").pack(anchor="w")
+                ttk.Label(detail, text=fmt_date(x.get("date", "")) + (f"  {x['time']}" if x.get("time") else ""),
+                          style="Muted.TLabel").pack(anchor="w")
+                if x.get("notes"):
+                    ttk.Label(detail, text="Note: " + x["notes"], wraplength=px(560), justify="left").pack(
+                        anchor="w", pady=(px(4), 0))
+                bar = Flow(detail, gap=px(8))
+                bar.pack(fill="x", pady=(px(6), 0))
+                bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(x.get("text", ""), "Contact")))
+                bar.add(ttk.Button(bar, text="Edit…", command=lambda: self.contact_log_dialog(client, x)))
+                bar.add(ttk.Button(bar, text="Remove", command=lambda: self.comm_remove(client, x)), gap=px(12))
+                fr, tb = scrolled_text(detail, readonly=True)
+                fr.pack(fill="both", expand=True, pady=(px(6), 0))
+                set_text(tb, x.get("text", ""))
+
+            clb.bind("<<ListboxSelect>>", lambda e: clb.curselection() and show(clb.curselection()[0]))
+            focus = getattr(self, "_contact_focus", None)
+            i0 = next((i for i, e in enumerate(entries) if focus and (
+                (focus[0] == "log" and e[3][0] == "log" and e[3][1].get("id") == focus[1]) or
+                (focus[0] == "day" and e[3] == ("day", focus[1])))), 0)
+            clb.selection_set(i0)
+            clb.see(i0)
+            show(i0)
+            v._contacts = {"list": clb, "entries": entries, "show": show}
+
+        CONTACT_METHODS = ["Phone call", "Voicemail left", "Text messages", "Email", "In person", "Video call",
+                           "Letter", "Other"]
+
+        def contact_log_dialog(self, client, existing=None):
+            """Log (or edit) one contact: when, with whom, how, and what was said or done."""
+            cid = client["id"]
+            ex = dict(existing or {})
+            win = new_window(root, f"{client.get('code', '')} — {'edit' if existing else 'log a'} contact", "680x600")
+            win.grab_set()
+            f = ttk.Frame(win, padding=(px(22), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="Edit contact" if existing else "Log a contact", style="Title.TLabel").pack(anchor="w")
+            grid = ttk.Frame(f)
+            grid.pack(fill="x", pady=(px(10), 0))
+            grid.columnconfigure(1, weight=1)
+            names = dict(CONTACT_WITH)
+            keys = {n: k for k, n in CONTACT_WITH}
+            day_var = tk.StringVar(value=ex.get("date") or date.today().isoformat())
+            time_var = tk.StringVar(value=ex.get("time") or datetime.now().strftime("%H:%M") if not existing else
+                                    ex.get("time", ""))
+            with_var = tk.StringVar(value=names.get(ex.get("with") or "patient", names["patient"]))
+            who_var = tk.StringVar(value=ex.get("who", ""))
+            how_var = tk.StringVar(value=ex.get("method") or "Phone call")
+            r = 0
+            for label, widget in (("Date", date_field(grid, day_var)),
+                                  ("Time (optional)", ttk.Entry(grid, textvariable=time_var, width=10)),
+                                  ("With", ttk.Combobox(grid, textvariable=with_var, values=[n for _, n in CONTACT_WITH],
+                                                        state="readonly", width=34)),
+                                  ("Their role, if someone else", ttk.Entry(grid, textvariable=who_var, width=30)),
+                                  ("How", ttk.Combobox(grid, textvariable=how_var, values=self.CONTACT_METHODS,
+                                                       width=24))):
+                ttk.Label(grid, text=label).grid(row=r, column=0, sticky="w", pady=px(3))
+                widget.grid(row=r, column=1, sticky="w", padx=(px(10), 0))
+                r += 1
+            ttk.Label(f, text="What happened (summary, or paste the messages)", style="Strong.TLabel").pack(
+                anchor="w", pady=(px(10), px(2)))
+            sfr, summ = scrolled_text(f, height=8)
+            sfr.pack(fill="both", expand=True)
+            set_text(summ, ex.get("text", ""))
+            msg = ttk.Label(f, text="", style="Bad.TLabel")
+            msg.pack(anchor="w", pady=(px(4), 0))
+
+            def save():
+                day = day_var.get().strip()
+                if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+                    return msg.config(text="Enter the date of the contact.")
+                t_ = time_var.get().strip()
+                if t_ and not re.fullmatch(r"\d{1,2}:\d\d(\s?[AaPp][Mm])?", t_):
+                    return msg.config(text="Time like 14:30 or 2:30 PM (or leave it empty).")
+                w_ = keys.get(with_var.get(), "patient")
+                text = get_text(summ).strip()
+                if looks_like_email_print(text):
+                    text = tidy_email_thread(text) or text
+                elif how_var.get() == "Text messages" or looks_like_message_export(text):
+                    other = "Patient" if w_ == "patient" else ((who_var.get().strip().capitalize()) or
+                                                                ("Contact" if w_ == "other" else "Parent"))
+                    text = tidy_message_thread(text, other=other) or text
+                entry = dict(ex, date=day, time=t_, method=how_var.get().strip() or "Other", text=text,
+                             notes=ex.get("notes", ""), who=who_var.get().strip()[:60] if w_ == "other" else "")
+                entry["with"] = w_
+                saved = self.comm_save(cid, entry)
+                win.destroy()
+                self._contact_focus = ("log", saved["id"])
+                self.set_status(f"{client.get('code', '')}: contact logged.")
+                if not self.wizard:
+                    self.refresh_client_page(cid, select="comms")
+            btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
+            ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
+            self._contact_win = {"win": win, "date": day_var, "time": time_var, "with": with_var, "how": how_var,
+                                 "text": summ, "save": save}
+            return win
 
         def edit_client(self, client):
             if self.client_dialog(client):

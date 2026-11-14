@@ -56,7 +56,7 @@ def script(app, root, V, h):
     page = app.page; lb = page._search["list"]
     app.comm_remove(V.load_client(cid), V.load_client(cid)["communications"][0]); h.pump(root, 0.6)
     same("Removing a logged message")
-    h.ok("…its tab leaves the list", not any("External communication" in r for r in rows()), rows())
+    h.ok("…the Contact log count updates (the tab stays)", "📞  Contact log" in rows(), rows())
 
     # from somewhere else (Home), it just opens the patient
     app.client_id = None; app.show_home(); h.pump(root, 0.8)

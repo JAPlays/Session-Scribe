@@ -34,6 +34,36 @@ def script(app, root, V, h):
     h.ok("ordinary text is left alone", ss.tidy_message_thread("Hello\nSee you Tuesday") == "Hello\nSee you Tuesday")
     h.ok("the format is recognized even if 'Text messages' isn't picked", ss.looks_like_message_export(PASTED)
          and not ss.looks_like_message_export("Dear Dr. X,\nThanks for the update."))
+    named = (
+        "Hi Robin! This is Sam from the clinic.\n\n"
+        "* Message from Robin School Counselor, Sure!, Monday, September 14 2026, 10:01 AM.\n"
+        "Sure!\n"
+        "* Robin School Counselor • Sep 14, 10:02 AM\n"
+        "Message from Robin School Counselor, When are you free?, Monday, September 14 2026, 10:02 AM.\n"
+        "R\n"
+        "When are you free?\n"
+        "* Sep 16, 11:46 AM\n"
+        "Message from you, Are you free at 3:30?, Wednesday, September 16 2026, 11:46 AM.\n"
+        "Are you free at 3:30?\n"
+        "* Robin School Counselor • Sep 16, 11:47 AM\n"
+        "Message from Robin School Counselor, Loved “Are you free at 3:30?”, Wednesday, September 16 2026, 11:47 AM.\n"
+        "R\n"
+        "Loved “Are you free at 3:30?”\n"
+        "* Message from you, see you then, Wednesday, September 16 2026, 11:50 AM.\n"
+        "see you then Robin School Counselor • Sep 16, 11:52 AM\n"
+        "Message from Robin School Counselor, Thanks!, Wednesday, September 16 2026, 11:52 AM.\n"
+        "R\n"
+        "Thanks!\n")
+    t2 = ss.tidy_message_thread(named, other="Contact").splitlines()
+    h.ok("named contacts, your own messages ('Message from you'), dated headers and initials",
+         t2[0].startswith("Hi Robin!") and "[2026-09-14 10:02 AM] Robin School Counselor: When are you free?" in t2
+         and "[2026-09-16 11:46 AM] Counselor: Are you free at 3:30?" in t2
+         and not any(l.strip() == "R" or "•" in l or l.startswith("Sep ") for l in t2), t2)
+    h.ok("…an iPhone reaction reads as a reaction, not a new message",
+         "[2026-09-16 11:47 AM] Robin School Counselor reacted (loved) to: “Are you free at 3:30?”" in t2, t2)
+    h.ok("…and a message glued to the next header comes apart cleanly",
+         "[2026-09-16 11:50 AM] Counselor: see you then" in t2
+         and "[2026-09-16 11:52 AM] Robin School Counselor: Thanks!" in t2 and sum("see you then" in l for l in t2) == 1, t2)
     h.ok("spelled-out phone numbers are scrubbed from anything sent to the AI",
          ss.scrub_contact_details("call 5 5 5 2 0 1 0 9 9 9 today") == "call [PHONE] today"
          and ss.scrub_contact_details("PHQ 1 2 3") == "PHQ 1 2 3")
@@ -42,8 +72,8 @@ def script(app, root, V, h):
     cid = V.save_client({"code": "TM1"})
     app.refresh_clients(); app.open_client(cid); h.pump(root, 1)
     lb = app.page._search["list"]
-    h.ok("no External communication entry in the list until something is logged",
-         not any("External communication" in lb.get(i) for i in range(lb.size())))
+    h.ok("the Contact log is in the list, empty to begin with",
+         "📞  Contact log" in [lb.get(i) for i in range(lb.size())])
     h.RESP[:] = [("", "Contact note text.")]
     app.external_comm(V.load_client(cid)); h.pump(root, 0.5)
     w = app.parent_win
@@ -59,8 +89,9 @@ def script(app, root, V, h):
     h.ok("…and no contact note is made", not any(d["meta"].get("source") == "messages" for _, d in V.sessions_for(cid)))
     lb = app.page._search["list"]
     rows = [lb.get(i) for i in range(lb.size())]
-    h.ok("the patient now has an External communication log, open on it", "✉  External communication  · 1" in rows
-         and "External communication" in h.texts(app.page) and h.button(app.page, "View (") is not None, rows)
+    h.ok("the Contact log shows it, open on it", "📞  Contact log  · 1" in rows
+         and "Contact log" in h.texts(app.page) and "Never mind 3 is fine" in "\n".join(
+             w.get("1.0", "end") for w in h.widgets(app.page, "Text")), rows)
     vw = app.comm_view(V.load_client(cid), log[0]); h.pump(root, 0.3)
     h.ok("View shows the whole thread", "Never mind 3 is fine" in h.texts(vw)); vw.destroy()
     ask = ss.build_ask_prompt(V.load_client(cid), V.sessions_for(cid), "What did they text about moving the time?",
