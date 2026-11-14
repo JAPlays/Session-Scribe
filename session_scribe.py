@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.8"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.9"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2993,6 +2993,36 @@ def ask_memory_text(client, hide=None):
     return "\n".join(f"- {hide(m.get('text', ''))}" + ("" if m.get("from") == "clinician" else
                                                         " (from an earlier AI answer — check against the record)")
                      for m in items)
+
+
+_ASK_Q_START = re.compile(
+    r"^(what|how|why|when|where|who|whom|whose|which|is|are|was|were|do|does|did|can|could|should|would|will|"
+    r"has|have|had|may|might|tell me|summari[sz]e|list|give|write|draft|compare|explain|describe|help|show|find|"
+    r"check|make|create|generate|prepare|outline|suggest|recommend|identify|analy[sz]e|review|look|go over|walk me|"
+    r"remind me|any)\b", re.I)
+_ASK_TELL_CUE = re.compile(r"\b(remember|keep in mind|note that|fyi|for context|for your information|goes by|"
+                           r"nickname|prefers to be called|likes to be called|wants to be called|pronouns)\b", re.I)
+
+
+def ask_is_statement(text):
+    """True when what was typed to Ask AI is something to remember ("He goes by Bobby", "Remember that…"),
+    not a question or a request — it's kept at once, without searching the record or asking the AI."""
+    t = re.sub(r"^\s*(please|pls|ok(ay)?|also|and)[,\s]+", "", (text or "").strip(), flags=re.I)
+    if not t or "?" in t or len(t) > 600:
+        return False
+    if _ASK_TELL_CUE.search(t) and not re.match(r"^(what|how|why|when|where|who|which|can|could|should|would|do|"
+                                                 r"does|did|is|are)\b", t, re.I):
+        return True
+    return not _ASK_Q_START.match(t)
+
+
+def ask_statement_text(text):
+    """The statement as it's remembered: without "Remember that", "FYI:" and the like."""
+    t = re.sub(r"^\s*(please|pls|ok(ay)?|also|and)[,\s]+", "", (text or "").strip(), flags=re.I)
+    t = re.sub(r"^(remember|note|keep in mind|fyi|for context|for your information)\b( that)?[\s:,\-–—]*", "", t,
+               flags=re.I)
+    t = re.sub(r"\s+", " ", t).strip()
+    return (t[:1].upper() + t[1:])[:400] if t else ""
 
 
 def clinician_memory_text(client, hide=None):
@@ -16710,8 +16740,8 @@ def run_gui():
                 q = get_text(box).strip()
                 if not q:
                     return "break"
-                if any(j["owner"] == ("ask", client["id"]) for j in self.waitlist) or \
-                        (self.busy and self.task_owner == ("ask", client["id"])):
+                if not ask_is_statement(q) and (any(j["owner"] == ("ask", client["id"]) for j in self.waitlist) or
+                                                (self.busy and self.task_owner == ("ask", client["id"]))):
                     messagebox.showinfo(APP_NAME, "One question at a time for this patient — this one can be asked "
                                                   "once the answer in progress is done.")
                     return "break"
@@ -16725,6 +16755,37 @@ def run_gui():
             v._ask = {"box": box, "send": send, "show": show_messages}       # for tests
 
         MEMORY_MAX = 40                    # items kept per patient (oldest go first)
+
+        def _ask_tell(self, client, chat_id, said, hooks=None):
+            """Something to remember, not a question: kept at once in the patient's memory (no record search, no
+            AI), and acknowledged in the conversation."""
+            cid, code = client["id"], client.get("code", "")
+            text = ask_statement_text(said)
+            now = datetime.now().isoformat(timespec="seconds")
+            cc = vault.load_client(cid)
+            mem = [m for m in cc.get("ai_memory") or [] if m.get("text", "").lower() != text.lower()]
+            mem.append({"id": uuid.uuid4().hex[:10], "text": text, "from": "clinician", "date": now})
+            cc["ai_memory"] = mem[-self.MEMORY_MAX:]
+            reply = (f"Got it — I'll remember: “{text}”\n(It's under 🧠 Remembers. Ask a question any time for an "
+                     "answer from the record.)")
+            cc.setdefault("chats", [])
+            ch = next((x for x in cc["chats"] if x["id"] == chat_id), None)
+            if ch is None:
+                ch = {"id": uuid.uuid4().hex, "title": re.sub(r"\s+", " ", said)[:70], "created": now, "messages": []}
+                cc["chats"].append(ch)
+            ch["messages"] += [{"role": "user", "text": said, "time": now},
+                               {"role": "ai", "text": reply, "time": now, "sources": ["your note"]}]
+            ch["updated"] = now
+            vault.save_client(cc)
+            self._sig = vault.signature()
+            self.__dict__.setdefault("_ask_chat", {})[cid] = ch["id"]
+            av = getattr(self, "_ask_view", None)
+            if av and av["client"] == cid and self.client_id == cid and not self.wizard:
+                self.open_client(cid, select="ask")
+            self.set_status(f"{code}: remembered — “{text[:60]}”.")
+            if (hooks or {}).get("done"):
+                hooks["done"](reply, ch["id"])
+            return "remembered"
 
         def ask_remember(self, cid, question, answer):
             """After an Ask AI answer: keep what's worth remembering about the patient for later conversations
@@ -16855,6 +16916,8 @@ def run_gui():
             done(answer, chat_id), failed(msg) — called alongside what the window shows."""
             hooks = hooks or {}
             code = client.get("code", "")
+            if ask_is_statement(question) and ask_statement_text(question):
+                return self._ask_tell(client, chat_id, question, hooks)
             c = vault.load_client(client["id"])
             sessions = vault.sessions_for(client["id"])
             chat = next((x for x in c.get("chats") or [] if x["id"] == chat_id), None)

@@ -29,7 +29,7 @@ def script(app, root, V, h):
 
     MEM["reply"] = {"add": [{"text": "Mother reported [Patient] started a new medication in early November.",
                              "from": "clinician"}], "remove": []}
-    sent = ask("Robin's mom told me he started a new medication last week — keep that in mind.")
+    sent = ask("Robin's mom told me he started a new medication last week — what should I watch for?")
     mem = V.load_client(cid).get("ai_memory") or []
     h.ok("after an answer, what's worth remembering is kept with the patient (marked as from you)",
          len(mem) == 1 and mem[0]["from"] == "clinician" and "new medication" in mem[0]["text"], mem)
@@ -49,6 +49,27 @@ def script(app, root, V, h):
     h.ok("an out-of-date item is replaced; one from an answer is marked so",
          len(mem) == 1 and mem[0]["from"] == "answer" and "watch sleep" in mem[0]["text"], mem)
 
+    # telling it something (not a question): kept at once, no record search, no AI
+    ss = h.ss
+    h.ok("statements are told apart from questions and requests",
+         ss.ask_is_statement("He goes by Bobby.") and ss.ask_is_statement("Remember that his mom works nights")
+         and ss.ask_is_statement("FYI: prefers afternoon sessions") and ss.ask_is_statement("His dog died last week.")
+         and not ss.ask_is_statement("How is sleep going") and not ss.ask_is_statement("Summarize the last 3 sessions")
+         and not ss.ask_is_statement("Does he have a nickname?")
+         and not ss.ask_is_statement("Give me an overview of his progress"))
+    n0, m0 = len(h.PROMPTS), len(h.MODELS)
+    t0 = __import__("time").time()
+    app._ask_send(V.load_client(cid), chat, "Remember that Robin goes by Bobby at school.")
+    h.pump(root, 0.5)
+    mem = V.load_client(cid)["ai_memory"]
+    msgs = V.load_client(cid)["chats"][0]["messages"]
+    h.ok("telling it something is remembered at once, as from you, without asking the AI",
+         len(h.MODELS) == m0 and mem[-1]["text"] == "Robin goes by Bobby at school." and mem[-1]["from"] == "clinician"
+         and __import__("time").time() - t0 < 3, mem[-1])
+    h.ok("…and the conversation says so", msgs[-2]["text"].startswith("Remember that") and
+         msgs[-1]["text"].startswith("Got it — I'll remember") and "Remembers (2)" in
+         str(app._ask_view["mem_btn"].cget("text")), msgs[-1]["text"])
+
     # the clinician's view
     app.ask_memory_dialog(V.load_client(cid)); h.pump(root, 0.4)
     mw = app._memory_win
@@ -56,7 +77,7 @@ def script(app, root, V, h):
     sd.askstring = lambda *a, **k: "Prefers sessions after school."
     mw["add"](); h.pump(root, 0.2)
     mem = V.load_client(cid)["ai_memory"]
-    h.ok("you can add something to remember", len(mem) == 2 and mem[-1]["from"] == "clinician")
+    h.ok("you can add something to remember", len(mem) == 3 and mem[-1]["from"] == "clinician")
     mw["tv"].selection_set(mem[0]["id"])
     sd.askstring = lambda *a, **k: "Medication started early November."
     mw["edit"](); h.pump(root, 0.2)
@@ -64,14 +85,14 @@ def script(app, root, V, h):
     h.ok("…edit one (it becomes yours)", mem[0]["text"] == "Medication started early November."
          and mem[0]["from"] == "clinician")
     mw["tv"].selection_set(mem[1]["id"]); mw["remove"](); h.pump(root, 0.2)
-    h.ok("…remove one", len(V.load_client(cid)["ai_memory"]) == 1)
+    h.ok("…remove one", len(V.load_client(cid)["ai_memory"]) == 2)
     mw["learn"].set(False); mw["save"](V.load_client(cid)["ai_memory"]); h.pump(root, 0.2)
     h.ok("…and turn learning off for this patient", V.load_client(cid).get("ai_memory_off") is True)
     mw["win"].destroy()
     MEM["reply"] = {"add": [{"text": "Should not be stored.", "from": "clinician"}], "remove": []}
     sent = ask("Anything else?", chat)
     h.ok("with learning off, nothing new is remembered", not any("LATEST EXCHANGE" in p for p in sent)
-         and len(V.load_client(cid)["ai_memory"]) == 1)
+         and len(V.load_client(cid)["ai_memory"]) == 2)
     h.ok("no errors", not errors, errors[-1:] if errors else "")
 
 
