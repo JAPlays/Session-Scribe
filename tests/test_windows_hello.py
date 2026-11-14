@@ -47,14 +47,22 @@ def script(app, root, V, h):
     h.ok("the key from Windows Hello unlocks the vault", V.key_ok(ss.hello_key(V)) and V.unlock_key(ss.hello_key(V)))
     sw.withdraw()
 
-    # lock screen
-    app.lock(); h.pump(root, 0.3)
+    # lock screen: nothing pops up while you're away; it asks as soon as you're back
+    fake["calls"].clear()
+    app.lock(); h.pump(root, 0.6)
+    h.ok("locking doesn't open the prompt while nobody's there", "sign" not in fake["calls"] and app.locked)
     fake["fail"] = "UserCanceled"
-    app._lock_hello(); h.pump(root, 0.8)
-    h.ok("a cancelled scan leaves it locked, with the reason", app.locked and "Cancelled" in h.texts(root))
+    app._lock_wake(); h.pump(root, 1.5)
+    h.ok("coming back opens it; Cancel stops after one try and points to the password",
+         app.locked and fake["calls"].count("sign") == 1 and "type your password" in h.texts(root), fake["calls"])
+    fake["fail"] = "DeviceBusy"
+    fake["calls"].clear()
+    app._lock_hello(); h.pump(root, 4)
+    h.ok("a failing scan is tried 3 times, then it's the password", app.locked and fake["calls"].count("sign") == 3
+         and "type your password" in h.texts(root), fake["calls"])
     fake["fail"] = None
     app._lock_hello(); h.pump(root, 0.8)
-    h.ok("a good scan unlocks the lock screen", not app.locked)
+    h.ok("the fingerprint button starts a fresh try and a good scan unlocks", not app.locked)
 
     # the assessment hand-back
     cid = V.save_client({"code": "WH1"})
@@ -64,11 +72,10 @@ def script(app, root, V, h):
     run["ask"]("1")
     for i in range(1, 6):
         run["choose"](str(i), 3, 0); h.pump(root, 0.1)
-    h.pump(root, 0.3); run["unlock"](); h.pump(root, 0.3)
     W = run["win"]
-    h.ok("the counselor screen offers the fingerprint", "Fingerprint" in h.texts(W))
-    run["state"]["hello_fn"](); h.pump(root, 1)
-    h.ok("…and it shows the results", not W.winfo_exists() and app._results_win["win"].winfo_exists())
+    h.pump(root, 0.3); run["unlock"](); h.pump(root, 1.2)
+    h.ok("the counselor screen asks for the fingerprint by itself and shows the results",
+         not W.winfo_exists() and app._results_win["win"].winfo_exists())
     app._results_win["win"].destroy()
 
     # fallback when signatures differ each time

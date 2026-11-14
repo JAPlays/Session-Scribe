@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.21"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.22"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -13268,23 +13268,58 @@ def run_gui():
         pw2.bind("<Return>", submit)
         pw1.focus_set()
         if not creating and hello_state(vault):
-            def by_finger():
-                msg.config(text="Waiting for Windows Hello…", style="Muted.TLabel")
-                hb.config(state="disabled")
+            def accept(key):
+                if vault.unlock_key(key):
+                    frame.destroy()
+                    on_ok()
+                    return True
+                return False
 
-                def done(key, err):
-                    if not frame.winfo_exists():
-                        return
-                    hb.config(state="normal")
-                    if key and vault.unlock_key(key):
-                        frame.destroy()
-                        on_ok()
-                    else:
-                        msg.config(text=err or "That didn't unlock the vault — use your password.", style="Bad.TLabel")
-                hello_async(done)
-            hb = hello_button(frame, by_finger)
+            def say(text, bad=False):
+                msg.config(text=text, style="Bad.TLabel" if bad else "Muted.TLabel")
+
+            def give_up(text):
+                say(text, True)
+                pw1.focus_set()
+            auto, again = hello_flow(lambda: frame.winfo_exists(), accept, say, give_up)
+            hb = hello_button(frame, again)
             hb.pack(fill="x", pady=(px(8), 0), ipady=px(3))
-            frame._hello = by_finger
+            frame._hello = again
+            frame.after(400, auto)                       # ask for the fingerprint straight away
+
+    HELLO_TRIES = 3
+
+    def hello_flow(alive, accept, say, give_up, tries=HELLO_TRIES):
+        """Windows Hello for an unlock screen: asks right away, tries again after a failed scan (up to `tries`
+        times, never after Cancel), then hands over to the password. Returns (start, start_again)."""
+        st = {"n": 0, "busy": False}
+
+        def attempt():
+            if st["busy"] or not alive():
+                return
+            st["busy"] = True
+            st["n"] += 1
+            say("Waiting for your fingerprint…" + (f" (try {st['n']} of {tries})" if st["n"] > 1 else ""))
+
+            def done(key, err):
+                st["busy"] = False
+                if not alive():
+                    return
+                if key and accept(key):
+                    return
+                cancelled = (err or "").startswith("Cancelled")
+                if not cancelled and st["n"] < tries:
+                    say((err or "That didn't work.") + " Trying again…", True)
+                    root.after(700, attempt)
+                    return
+                give_up(("Cancelled — " if cancelled else ((err or "Fingerprint didn't work.") + " "))
+                        + "type your password instead.")
+            hello_async(done)
+
+        def again():                                   # the fingerprint button: a fresh set of tries
+            st["n"] = 0
+            attempt()
+        return attempt, again
 
     def hello_button(parent, cmd):
         return ttk.Button(parent, text="👆  Use fingerprint (Windows Hello)", command=cmd)
@@ -16960,23 +16995,28 @@ def run_gui():
                 row.pack(anchor="w", pady=(px(12), 0))
                 big_btn(row, "Continue", attempt, accent=True).pack(side="left")
                 if hello_state(vault):
-                    def by_finger():
-                        err.config(text="Waiting for Windows Hello…", foreground=pal["muted"])
-                        st["hello"] = True
-                        _quiet(W.attributes, "-topmost", False)
+                    def accept(key):
+                        if not vault.key_ok(key):
+                            return False
+                        st["hello"] = False
+                        close()
+                        return True
 
-                        def done(key, why):
-                            st["hello"] = False
-                            if st["closed"] or not W.winfo_exists():
-                                return
-                            if key and vault.key_ok(key):
-                                close()
-                            else:
-                                _quiet(W.attributes, "-topmost", True)
-                                err.config(text=why or "That didn't work — use your password.", foreground=pal["bad"])
-                        hello_async(done)
-                    big_btn(row, "👆  Fingerprint", by_finger).pack(side="left", padx=(px(10), 0))
-                    st["hello_fn"] = by_finger
+                    def say(text, bad=False):
+                        st["hello"] = True                    # the prompt must be able to come in front
+                        _quiet(W.attributes, "-topmost", False)
+                        err.config(text=text, foreground=pal["bad"] if bad else pal["muted"])
+
+                    def give_up(text):
+                        st["hello"] = False
+                        _quiet(W.attributes, "-topmost", True)
+                        err.config(text=text, foreground=pal["bad"])
+                        _quiet(pw.focus_set)
+                    auto, again = hello_flow(lambda: not st["closed"] and W.winfo_exists() and pw.winfo_exists(),
+                                             accept, say, give_up)
+                    big_btn(row, "👆  Fingerprint", again).pack(side="left", padx=(px(10), 0))
+                    st["hello_fn"] = again
+                    W.after(300, auto)                        # ask for the fingerprint straight away
                 small_btn(row, "Back to the patient's screen", handback).pack(side="left", padx=(px(14), 0))
                 W.bind("<Return>", attempt)
                 pw.focus_set()
@@ -24766,26 +24806,39 @@ def run_gui():
             pw.bind("<Return>", attempt)
             pw.focus_set()
             if hello_state(vault):
-                def by_finger():
-                    err.config(text="Waiting for Windows Hello…", style="Muted.TLabel")
+                def accept(key):
+                    if not vault.key_ok(key):
+                        return False
+                    pw.delete(0, "end")
+                    f.destroy()
+                    self.locked = False
+                    self.last_activity = time.time()
+                    if self.setup_win is not None:
+                        self.setup_win["win"].deiconify()
+                    if q_was_open and self._alive(qwin["win"]):
+                        qwin["win"].deiconify()
+                    return True
 
-                    def done(key, why):
-                        if not f.winfo_exists():
-                            return
-                        if key and vault.key_ok(key):
-                            pw.delete(0, "end")
-                            f.destroy()
-                            self.locked = False
-                            self.last_activity = time.time()
-                            if self.setup_win is not None:
-                                self.setup_win["win"].deiconify()
-                            if q_was_open and self._alive(qwin["win"]):
-                                qwin["win"].deiconify()
-                        else:
-                            err.config(text=why or "That didn't unlock — use your password.", style="Bad.TLabel")
-                    hello_async(done)
-                hello_button(box, by_finger).pack(fill="x", pady=(px(8), 0), ipady=px(3))
-                self._lock_hello = by_finger
+                def say(text, bad=False):
+                    err.config(text=text, style="Bad.TLabel" if bad else "Muted.TLabel")
+
+                def give_up(text):
+                    say(text, True)
+                    pw.focus_set()
+                auto, again = hello_flow(lambda: f.winfo_exists(), accept, say, give_up)
+                hello_button(box, again).pack(fill="x", pady=(px(8), 0), ipady=px(3))
+                self._lock_hello = again
+                # it locked while you were away: the fingerprint prompt opens as soon as you're back
+                woke = {"done": False}
+
+                def on_return(_e=None):
+                    if not woke["done"] and f.winfo_exists():
+                        woke["done"] = True
+                        root.after(150, auto)
+                for seq in ("<Motion>", "<KeyPress>", "<ButtonPress>"):
+                    f.bind(seq, on_return, add="+")
+                    box.bind(seq, on_return, add="+")
+                self._lock_wake = on_return
 
         def idle_check(self):
             mins = int(cfg.get("autolock_minutes", 0) or 0)
