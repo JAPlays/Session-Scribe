@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.5"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.6"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2931,6 +2931,8 @@ Rules:
 - The record has notes (summaries) and transcript excerpts (what was actually said in the session). Use \
 the transcripts for what the patient or Counselor said, how they said it and details the notes leave out; \
 quote them briefly where it helps.
+- "What you've learned in earlier conversations" is context the clinician gave you before (and a few \
+earlier conclusions — check those against the record). Use it, but the written record wins if they differ.
 - It also has the patient's assessments and questionnaire scores, progress & risk (risk mentions, safety \
 plans, goals, homework, follow-ups, themes), the contact log (texts, emails, calls, contact notes and \
 summaries), imported documents and the registration form. Draw on all of them, not only the notes, and say \
@@ -2955,6 +2957,69 @@ tell give show please patient client session sessions note notes""".split())
 
 def _ask_words(q):
     return {w for w in re.findall(r"[a-z][a-z'-]{2,}", q.lower()) if w not in ASK_STOP}
+
+
+ASK_MEMORY_PROMPT = """You keep a short memory for a counseling clinician's conversations with an AI assistant \
+about ONE patient. Below is what's remembered so far (numbered) and the latest exchange. Decide what from the \
+latest exchange is worth remembering for later conversations about this patient:
+- context the CLINICIAN gave that may not be in the written record (background, how the patient responds, \
+what the clinician is watching for or planning, their preferences for how this patient's notes or answers \
+should be);
+- conclusions or hypotheses the clinician agreed with or asked to keep track of;
+- open questions to follow up.
+Do NOT remember: things already obvious from the record, small talk, the question itself, or anything the \
+assistant merely suggested that the clinician didn't take up. Never invent. Keep placeholders such as \
+[Patient] exactly as written. Each item at most 30 words, written as a plain statement.
+
+If a remembered item is now out of date or contradicted, list its number under "remove" (and add the \
+corrected version). Add at most 3 items; usually 0 or 1.
+
+Reply with JSON only, exactly like:
+{{"add": [{{"text": "...", "from": "clinician" or "answer"}}], "remove": [2]}}
+If there's nothing to change, reply {{"add": [], "remove": []}}.
+
+REMEMBERED SO FAR:
+{memory}
+
+LATEST EXCHANGE
+Clinician: {question}
+Assistant: {answer}"""
+
+
+def ask_memory_text(client, hide=None):
+    """What Ask AI has learned about the patient in earlier conversations, one line each (\"\" if nothing)."""
+    hide = hide or (lambda s: s or "")
+    items = client.get("ai_memory") or []
+    return "\n".join(f"- {hide(m.get('text', ''))}" + ("" if m.get("from") == "clinician" else
+                                                        " (from an earlier AI answer — check against the record)")
+                     for m in items)
+
+
+def ask_memory_update(cfg, client, question, answer, hide=None):
+    """(new items, ids to drop) from the latest Ask AI exchange — see ASK_MEMORY_PROMPT."""
+    hide = hide or client_hider(client)
+    mem = client.get("ai_memory") or []
+    listing = "\n".join(f"{i}. {hide(m.get('text', ''))}" for i, m in enumerate(mem, 1)) or "(nothing yet)"
+    reply = llm_chat(cfg, fill(ASK_MEMORY_PROMPT, {"memory": listing, "question": hide(question)[:3000],
+                                                   "answer": hide(answer)[:4000]}),
+                     expected=300, temperature=0.1)
+    data = llm_json(reply)
+    now = datetime.now().isoformat(timespec="seconds")
+    adds = []
+    for a in (data.get("add") or [])[:3]:
+        text = re.sub(r"\s+", " ", (a.get("text") if isinstance(a, dict) else str(a)) or "").strip()
+        if text and len(text) <= 400 and text.lower() not in {m.get("text", "").lower() for m in mem}:
+            adds.append({"id": uuid.uuid4().hex[:10], "text": text,
+                         "from": "clinician" if isinstance(a, dict) and a.get("from") == "clinician" else "answer",
+                         "date": now})
+    drop = []
+    for n in data.get("remove") or []:
+        try:
+            if 1 <= int(n) <= len(mem):
+                drop.append(mem[int(n) - 1].get("id"))
+        except (TypeError, ValueError):
+            pass
+    return adds, drop
 
 
 def ask_overview(client, sessions):
@@ -3078,6 +3143,9 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
     if client.get("background"):
         prof.append("Background: " + client["background"])
     add("PATIENT PROFILE", "\n".join(prof))
+    mem = ask_memory_text(client)
+    if mem and add("WHAT YOU'VE LEARNED IN EARLIER CONVERSATIONS ABOUT THIS PATIENT", mem, limit=4000):
+        sources.append("earlier conversations")
     meas = measures_text(client)
     if meas:
         add("QUESTIONNAIRE AND ASSESSMENT RESULTS (latest)", meas)
@@ -16414,6 +16482,8 @@ def run_gui():
             if chat:
                 head.add(ttk.Button(head, text="Delete…", command=lambda: self._ask_delete(client, chat)))
             head.add(ttk.Button(head, text="＋  New conversation", command=lambda: self._ask_open(client, None)))
+            mem_btn = head.add(ttk.Button(head, text=f"🧠  Remembers ({len(client.get('ai_memory') or [])})",
+                                          command=lambda: self.ask_memory_dialog(client)))
             cap = ttk.Label(v, text="Answers come from the local AI using this patient's whole record — notes, "
                                     "transcripts, treatment plans, case overview, assessments, progress & risk, the "
                                     "contact log, documents and registration form — plus the SSC manual. They're drafts — check the "
@@ -16468,7 +16538,7 @@ def run_gui():
                              + "\n", "a" if live[1] else ("a", "live"))
                 t.config(state="disabled")
                 t.see("end")
-            self._ask_view = {"client": client["id"], "show": show_messages, "text": t}
+            self._ask_view = {"client": client["id"], "show": show_messages, "text": t, "mem_btn": mem_btn}
 
             # the question box is reserved at the bottom first, so the conversation can't squeeze it out
             note = ttk.Label(v, text=("⌘↵" if IS_MAC else "Ctrl+Enter") + " to send", style="Caption.TLabel")
@@ -16499,6 +16569,119 @@ def run_gui():
             show_messages()
             box.focus_set()
             v._ask = {"box": box, "send": send, "show": show_messages}       # for tests
+
+        MEMORY_MAX = 40                    # items kept per patient (oldest go first)
+
+        def ask_remember(self, cid, question, answer):
+            """After an Ask AI answer: keep what's worth remembering about the patient for later conversations
+            (the fast model reads the exchange; names stay hidden as usual)."""
+            c = vault.load_client(cid)
+            code, job_cfg = c.get("code", ""), self.fast_cfg()
+
+            def job(p):
+                p("Remembering…", 10)
+                return ask_memory_update(job_cfg, c, question, answer)
+
+            def done(res):
+                adds, drop = res
+                if not adds and not drop:
+                    return
+                cc = vault.load_client(cid)
+                mem = [m for m in cc.get("ai_memory") or [] if m.get("id") not in drop] + adds
+                cc["ai_memory"] = mem[-self.MEMORY_MAX:]
+                vault.save_client(cc)
+                self._sig = vault.signature()
+                if adds:
+                    self.set_status(f"{code}: Ask AI will remember {len(adds)} more thing"
+                                    f"{'s' if len(adds) != 1 else ''} from this conversation (🧠 to see or change).")
+                av = getattr(self, "_ask_view", None)
+                if av and av["client"] == cid and self._alive(av.get("mem_btn")):
+                    av["mem_btn"].config(text=f"🧠  Remembers ({len(cc['ai_memory'])})")
+            self.run_bg(job, done, lambda m: None, label=f"remembering from the conversation about {code}",
+                        owner=("askmem", cid), patient=code)
+
+        def ask_memory_dialog(self, client):
+            """What Ask AI remembers about this patient: see, edit, remove, add, or turn it off."""
+            cid = client["id"]
+            win = new_window(root, f"{client.get('code', '')} — what Ask AI remembers", "720x560")
+            f = ttk.Frame(win, padding=(px(20), px(16)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text="What Ask AI remembers", style="Title.TLabel").pack(anchor="w")
+            ttk.Label(f, text="Learned from your conversations about this patient and used in every later question "
+                              "(the written record wins if they differ). “From an answer” items came from the AI — "
+                              "keep only what you agree with. Saved with the patient, encrypted.",
+                      style="Muted.TLabel", wraplength=px(660), justify="left").pack(anchor="w", fill="x",
+                                                                                     pady=(px(2), px(8)))
+            off_var = tk.BooleanVar(value=not client.get("ai_memory_off"))
+            btns = pin_bottom(ttk.Frame(f), pady=(px(10), 0))
+            box, tv = tree_box(f, columns=("text", "from", "date"), show="headings", height=10, selectmode="browse")
+            for c_, t_, w_ in (("text", "Remembered", 430), ("from", "From", 110), ("date", "Since", 90)):
+                tv.heading(c_, text=t_, anchor="w")
+                tv.column(c_, width=px(w_), anchor="w", stretch=(c_ == "text"))
+            box.pack(fill="both", expand=True)
+
+            def items():
+                return vault.load_client(cid).get("ai_memory") or []
+
+            def refresh():
+                tv.delete(*tv.get_children())
+                for m in items():
+                    tv.insert("", "end", iid=m["id"], values=(m.get("text", ""),
+                                                              "you" if m.get("from") == "clinician" else "an answer",
+                                                              fmt_date(m.get("date", "")[:10])))
+
+            def save(mem):
+                c = vault.load_client(cid)
+                c["ai_memory"] = mem
+                c["ai_memory_off"] = not off_var.get()
+                vault.save_client(c)
+                self._sig = vault.signature()
+                refresh()
+                av = getattr(self, "_ask_view", None)
+                if av and av["client"] == cid and self._alive(av.get("mem_btn")):
+                    av["mem_btn"].config(text=f"🧠  Remembers ({len(mem)})")
+
+            def sel():
+                s = tv.selection()
+                return next((m for m in items() if s and m["id"] == s[0]), None)
+
+            def add():
+                t_ = simpledialog.askstring(APP_NAME, "Something Ask AI should remember about this patient:",
+                                            parent=win)
+                if t_ and t_.strip():
+                    save(items() + [{"id": uuid.uuid4().hex[:10], "text": t_.strip()[:400], "from": "clinician",
+                                     "date": datetime.now().isoformat(timespec="seconds")}])
+
+            def edit():
+                m = sel()
+                if not m:
+                    return
+                t_ = simpledialog.askstring(APP_NAME, "Edit:", initialvalue=m.get("text", ""), parent=win)
+                if t_ is not None and t_.strip():
+                    save([dict(x, text=t_.strip()[:400], **({"from": "clinician"} if x["id"] == m["id"] else {}))
+                          if x["id"] == m["id"] else x for x in items()])
+
+            def remove():
+                m = sel()
+                if m:
+                    save([x for x in items() if x["id"] != m["id"]])
+
+            def forget():
+                if items() and messagebox.askyesno(APP_NAME, "Forget everything Ask AI remembers about this "
+                                                             "patient?", parent=win):
+                    save([])
+            ttk.Checkbutton(btns, text="Learn from conversations with this patient's AI", variable=off_var,
+                            command=lambda: save(items())).pack(side="left")
+            ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+            ttk.Button(btns, text="Forget all…", command=forget).pack(side="right", padx=(0, px(14)))
+            ttk.Button(btns, text="Remove", command=remove).pack(side="right", padx=(0, px(6)))
+            ttk.Button(btns, text="Edit…", command=edit).pack(side="right", padx=(0, px(6)))
+            ttk.Button(btns, text="＋ Add…", command=add).pack(side="right", padx=(0, px(6)))
+            tv.bind("<Double-1>", lambda e: edit())
+            refresh()
+            self._memory_win = {"win": win, "tv": tv, "add": add, "edit": edit, "remove": remove, "forget": forget,
+                                "learn": off_var, "save": save}
+            return win
 
         def _ask_open(self, client, chat_id):
             self.__dict__.setdefault("_ask_chat", {})[client["id"]] = chat_id
@@ -16577,6 +16760,8 @@ def run_gui():
                 self.set_status(f"{code}: answer saved to “{ch['title'][:40]}”.")
                 if hooks.get("done"):
                     hooks["done"](answer, ch["id"])
+                if not cc.get("ai_memory_off"):
+                    self.ask_remember(client["id"], question, answer)       # learn from it, in the background
 
             def failed(msg):
                 if hooks.get("failed"):
