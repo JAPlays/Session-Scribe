@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.3"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.4"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2930,6 +2930,10 @@ Rules:
 - The record has notes (summaries) and transcript excerpts (what was actually said in the session). Use \
 the transcripts for what the patient or Counselor said, how they said it and details the notes leave out; \
 quote them briefly where it helps.
+- It also has the patient's assessments and questionnaire scores, progress & risk (risk mentions, safety \
+plans, goals, homework, follow-ups, themes), the contact log (texts, emails, calls, contact notes and \
+summaries), imported documents and the registration form. Draw on all of them, not only the notes, and say \
+which one each point comes from.
 - If the record doesn't contain the answer, say so plainly and say what's missing. Never invent \
 history, quotes, diagnoses, dates or scores.
 - Use SSC's terms ("patient", "Counselor") and the SSC manual's vocabulary when describing interventions.
@@ -2950,6 +2954,91 @@ tell give show please patient client session sessions note notes""".split())
 
 def _ask_words(q):
     return {w for w in re.findall(r"[a-z][a-z'-]{2,}", q.lower()) if w not in ASK_STOP}
+
+
+def ask_overview(client, sessions):
+    """[(heading, text)] — a short account of every part of the patient's record beyond the notes, so Ask AI
+    always knows what's there: assessments, progress & risk, the contact log, imported documents, the
+    registration form and termination. (Full texts are added separately, as room allows.)"""
+    out = []
+    # assessments and questionnaire scores, oldest first
+    ab = assessment_export_blocks(client, lambda d_: True)
+    lines, cur = [], ""
+    for kind, text in ab:
+        if kind == "h2":
+            cur = text
+            lines.append(text)
+        elif kind == "p" and cur and not re.match(r"^\d+\. ", text):
+            lines.append("  " + text.replace("\n", "; "))
+    if lines:
+        out.append(("ASSESSMENTS AND QUESTIONNAIRES (all, oldest first)", "\n".join(lines)))
+    # progress & risk
+    pr = []
+    try:
+        rs = risk_summary(client, sessions)
+        for r in rs["rows"]:
+            pr.append(f"Risk {r['date']}: {r.get('type', '')} — {r.get('summary', '')}"
+                      + (f" (action: {r['action']})" if r.get("action") else ""))
+        if rs["last_screen"]:
+            pr.append(f"Last risk screening (denied): {rs['last_screen']['date']}")
+        for day, what in rs["plans"]:
+            pr.append(f"Safety plan {what}: {day}")
+        if rs["needs_plan"]:
+            pr.append("Recent risk documented but no safety plan mentioned or on file.")
+    except Exception:
+        pass
+    try:
+        gs = goals_summary(client, sessions)
+        for g in gs["goals"]:
+            pr.append(f"Goal “{g}”: last worked on {gs['last'].get(g) or 'not yet in a checked note'}")
+        for g, n, since in gs["stale"]:
+            pr.append(f"Goal not worked on in the last {n} sessions: “{g}”")
+    except Exception:
+        pass
+    for x in client.get("homework") or []:
+        pr.append(f"Homework ({x.get('status', '')}, {x.get('date', '')}): {x.get('title', '')}"
+                  + (f" — {x['notes']}" if x.get("notes") else ""))
+    for x in client.get("followups") or []:
+        pr.append(f"Follow-up ({'done' if x.get('done') else 'open'}, {x.get('date', '')}): {x.get('text', '')}")
+    try:
+        labels = role_labels(load_config())
+        th = session_themes(client, sessions, labels[0], patient_label=labels[1])
+        if th["themes"]:
+            pr.append("Themes the patient talks about most: " + ", ".join(t for t, _, _ in th["themes"][:6]))
+    except Exception:
+        pass
+    if pr:
+        out.append(("PROGRESS & RISK", "\n".join(pr)))
+    # the contact log: every contact, plus the period summaries
+    cl = []
+    for x in sorted(client.get("communications") or [], key=lambda x: (x.get("date", ""), x.get("time", ""))):
+        gist = re.sub(r"\s+", " ", scrub_contact_details(x.get("text", "")))[:180]
+        cl.append(f"{x.get('date', '')} {x.get('time', '')}".strip() + f" — {x.get('method', 'Contact')} with "
+                  f"{_export_party(x)}: {gist}" + (f" (note: {x['notes']})" if x.get("notes") else ""))
+    for day, records in group_by_date(sessions):
+        if is_contact_day(records):
+            cl.append(f"{day} — {day_title(records)} note (full text among the sessions)")
+    for s in client.get("contact_summaries") or []:
+        cl.append(f"Contact summary {s.get('start', '')} to {s.get('end', '')}:\n"
+                  + scrub_contact_details(s.get("text", ""))[:3000])
+    if cl:
+        out.append(("CONTACT LOG (oldest first)", "\n".join(cl)))
+    # imported documents, the registration form, termination
+    dl = []
+    for doc in client.get("documents") or []:
+        dl.append(f"{doc.get('date', '')} — {doc.get('type', 'Document')}"
+                  + (f" “{doc['title']}”" if doc.get("title") else "") + ": "
+                  + re.sub(r"\s+", " ", strip_word_xml(doc.get("text") or ""))[:240])
+    if dl:
+        out.append(("IMPORTED DOCUMENTS", "\n".join(dl)))
+    if client.get("registration_info"):
+        out.append(("REGISTRATION FORM (organized)",
+                    scrub_contact_details(registration_text(client["registration_info"]))[:3500]))
+    term = client.get("termination")
+    if term:
+        out.append(("TERMINATION", "; ".join(f"{k}: {v}" for k, v in term.items()
+                                             if isinstance(v, str) and v and k not in ("id", "file_id"))[:1500]))
+    return out
 
 
 def build_ask_prompt(client, sessions, question, history, reference, orientation, budget=24000):
@@ -3009,6 +3098,13 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
         index.append(f"{fmt_date(day)}: {day_title(records)} ({', '.join(lbl for lbl, *_ in day_docs(records))})")
     if index:
         add("SESSION INDEX (all dates on file)", "\n".join(index))
+    # the rest of the record, in brief: assessments, progress & risk, contact log, documents, registration
+    over_room = int(budget * 0.3)
+    for head_, text_ in ask_overview(client, sessions):
+        block_limit = max(800, min(len(text_), over_room))
+        if add(head_, text_, limit=block_limit):
+            over_room -= min(len(text_), block_limit) + len(head_) + 10
+            sources.append(head_.split(" (")[0].lower())
     appts = (client.get("appointments") or {}).get("items")
     if appts:
         add("THERANEST APPOINTMENT HISTORY", "\n".join(f"{a['date']}: {a['status']}"
@@ -3075,7 +3171,12 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
                             r"mention(ed|s)?|discuss(ed|es)?|spoke|conversation|exact)\b", question, re.I)
     trans = sorted([c for c in others if c["key"] == "transcript"],
                    key=lambda c: (c["rank"], c["recent"]), reverse=True)
-    extra = [c for c in others if c["key"] != "transcript" and c["rank"] > 1]
+    # message threads and imported documents: in full when they match the question, else the most recent
+    extra = sorted([c for c in others if c["key"] != "transcript"], key=lambda c: (c["rank"], c["recent"]),
+                   reverse=True)
+    about_extra = re.search(r"\b(texts?|texted|messages?|emails?|contact|called|call|parents?|mom|dad|mother|"
+                            r"father|guardian|school|teacher|documents?|reports?|records?|evaluation|testing|"
+                            r"assessment)\b", question, re.I)
 
     def take(pool, limit):
         nonlocal room
@@ -3092,9 +3193,15 @@ def build_ask_prompt(client, sessions, question, history, reference, orientation
     take(focused, room)
     # notes get at most half of what's left (a third when the question is about what was said), so the
     # transcripts — the sessions themselves — always get a share too
-    take(notes, room * (0.34 if about_words else 0.5))
-    take(extra, room * 0.4)
+    take(notes, room * (0.3 if about_words else 0.4))
+    if about_extra:                                   # the question is about contacts or documents
+        take(extra, room * 0.6)
+        take(trans, room * 0.6)
+    else:
+        take(trans, room * 0.5)
+        take(extra, room * 0.6)
     take(trans, room)
+    take(extra, room)
     take(notes, room)                                 # any room left: more notes
     for c in sorted(picked, key=lambda c: c["day"]):
         head = f"{fmt_date(c['day'])}" + (f" · Session {c['num']}" if c["num"] is not None else "") + f" · {c['label']}"
@@ -16284,8 +16391,9 @@ def run_gui():
             if chat:
                 head.add(ttk.Button(head, text="Delete…", command=lambda: self._ask_delete(client, chat)))
             head.add(ttk.Button(head, text="＋  New conversation", command=lambda: self._ask_open(client, None)))
-            cap = ttk.Label(v, text="Answers come from the local AI using this patient's notes, overviews, transcripts, "
-                                    "treatment plans and case overview, plus the SSC manual. They're drafts — check the "
+            cap = ttk.Label(v, text="Answers come from the local AI using this patient's whole record — notes, "
+                                    "transcripts, treatment plans, case overview, assessments, progress & risk, the "
+                                    "contact log, documents and registration form — plus the SSC manual. They're drafts — check the "
                                     "cited sessions before relying on them. Nothing leaves this computer.",
                             style="Caption.TLabel", wraplength=px(400), justify="left")
             cap.pack(anchor="w", fill="x", pady=(px(2), px(8)))
