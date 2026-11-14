@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.1"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.2"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -192,6 +192,7 @@ SHARED_KEYS = {"language", "min_speakers", "max_speakers", "max_chars", "previou
                "smooth_flicker", "delete_audio", "autolock_minutes", "role_labels", "date_format",
                "phone_page_url", "phone_client_id", "ai_names"}
 TEMPLATE_DIR = os.path.join(APP_DIR, "templates")     # updated by set_data_paths()
+MOBILE_ZOOMS = {"100": 1.0, "125": 1.25, "150": 1.5}  # Mobile mode: how much bigger everything is
 DEFAULT_CONFIG = {
     "lmstudio_url": "http://127.0.0.1:1234/v1",
     "model": "",
@@ -221,6 +222,8 @@ DEFAULT_CONFIG = {
     "session_sort": "desc",     # date list order: desc = newest first, asc = oldest first
     "contact_sort": "desc",     # the Contact log's order, the same way
     "doc_zoom": 0,              # document text size step (A−/A+)
+    "mobile_mode": False,       # remote desktop from a phone: fill the screen, narrow layout when upright
+    "mobile_zoom": "125",       # …and everything this much bigger (100 / 125 / 150 %)
     "export_format": "docx",    # last export format (docx / pdf)
     "setup_assistant_offered": False,   # first Setup visit: offered to install everything for this computer
     "setup_assistant_done": False,
@@ -12759,6 +12762,10 @@ def run_gui():
                 pass
     root.report_callback_exception = on_tk_error
     SCALE = max(1.0, root.winfo_fpixels("1i") / 96.0)      # 1.25 / 1.5 on high-DPI screens
+    # Mobile mode (remote desktop from a phone): everything a size up, so it reads and taps well on a phone
+    MOBILE = {"on": bool(cfg.get("mobile_mode")), "narrow": False}
+    MZOOM = (MOBILE_ZOOMS.get(str(cfg.get("mobile_zoom") or "125"), 1.25)) if MOBILE["on"] else 1.0
+    SCALE *= MZOOM
 
     def px(n):
         return int(round(n * SCALE))
@@ -12771,6 +12778,9 @@ def run_gui():
     ww, wh = min(px(1240), int(sw * 0.94)), min(px(840), int(sh * 0.88))
     root.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 3)}")
     root.minsize(min(px(800), ww), min(px(600), wh))
+    if MOBILE["on"]:
+        root.minsize(1, 1)                 # a phone held upright is narrower than the desktop minimum
+        _quiet(root.state, "zoomed")
     style = ttk.Style()
 
     # ---------------------------------------------------------------- fonts
@@ -12819,6 +12829,9 @@ def run_gui():
     _z = max(-3, min(6, int(cfg.get("doc_zoom", 0) or 0)))
     for _k, _base in (("doc", 11), ("doc_b", 11), ("doc_h", 13), ("doc_s", 9)):
         F[_k].configure(size=fs(_base + _z))
+    if MZOOM != 1.0:
+        for _f in F.values():
+            _f.configure(size=int(round(_f.cget("size") * MZOOM)))
 
     # --------------------------------------------------------------- colors
     PALETTES = {
@@ -13626,9 +13639,28 @@ def run_gui():
     def _autowrap(e):
         """Any label that wraps (wraplength set) re-wraps only when its container width genuinely changes,
         and never during scrolling."""
-        if time.monotonic() < _SCROLLING_UNTIL[0]:
-            return
         w = e.widget
+        if time.monotonic() < _SCROLLING_UNTIL[0]:
+            # not while scrolling — but look again once it settles (a page still laying itself out)
+            if not getattr(w, "_aw_retry", None) and hasattr(w, "after"):
+                class _Ev:
+                    pass
+
+                def again():
+                    w._aw_retry = None
+                    try:
+                        if w.winfo_exists():
+                            ev = _Ev()
+                            ev.widget, ev.width = w, w.winfo_width()
+                            _autowrap(ev)
+                    except tk.TclError:
+                        pass
+                wait = int((_SCROLLING_UNTIL[0] - time.monotonic()) * 1000) + 80
+                try:
+                    w._aw_retry = w.after(max(wait, 80), again)
+                except tk.TclError:
+                    pass
+            return
         if e.width <= px(60) or e.width == getattr(w, "_aw_last_w", None):
             return
         if not hasattr(w, "cget"):
@@ -13922,10 +13954,8 @@ def run_gui():
         """A− / A+ in any document view: resizes every document's text together (remembered)."""
         z = max(-3, min(6, int(cfg.get("doc_zoom", 0)) + step))
         cfg["doc_zoom"] = z
-        F["doc"].configure(size=fs(11 + z))
-        F["doc_b"].configure(size=fs(11 + z))
-        F["doc_h"].configure(size=fs(13 + z))
-        F["doc_s"].configure(size=fs(9 + z))
+        for k_, base_ in (("doc", 11), ("doc_b", 11), ("doc_h", 13), ("doc_s", 9)):
+            F[k_].configure(size=int(round(fs(base_ + z) * MZOOM)))
         try:
             save_config(cfg)
         except Exception:
@@ -14569,9 +14599,13 @@ def run_gui():
         def _build_shell(self):
             header = ttk.Frame(root, padding=(px(22), px(14), px(22), px(6)))
             header.pack(fill="x")
-            ttk.Label(header, text=APP_NAME, style="H2.TLabel").pack(side="left")
-            ttk.Label(header, text="🔒  Offline · stays on this computer", style="Caption.TLabel").pack(
-                side="left", padx=px(14))
+            # Mobile mode, upright phone: the patient list hides behind this button
+            self.m_list_btn = ttk.Button(header, text="☰  Patients", command=lambda: self.mobile_patients(None))
+            self.app_lbl = ttk.Label(header, text=APP_NAME, style="H2.TLabel")
+            self.app_lbl.pack(side="left")
+            self.offline_lbl = ttk.Label(header, text="🔒  Offline · stays on this computer", style="Caption.TLabel")
+            self.offline_lbl.pack(side="left", padx=px(14))
+            self.header = header
             hdr_btns = Flow(header, align="right", gap=px(8))
             hdr_btns.pack(side="right", fill="x", expand=True)
             self.queue_btn = hdr_btns.add(ttk.Button(hdr_btns, text="🎙  Queue",
@@ -14608,9 +14642,12 @@ def run_gui():
             side.pack(side="left", fill="y")
             side.pack_propagate(False)
             body.bind("<Configure>", lambda e: side.config(width=px(250) if e.width >= px(1060) else px(200))
-                      if e.widget is body else None, add="+")
-            ttk.Separator(body, orient="vertical").pack(side="left", fill="y")
-            ttk.Button(side, text="⌂  Home", command=lambda: self.leave(self.show_home)).pack(fill="x")
+                      if e.widget is body and not MOBILE["narrow"] else None, add="+")
+            side_sep = ttk.Separator(body, orient="vertical")
+            side_sep.pack(side="left", fill="y")
+            self.side, self.side_sep, self.body = side, side_sep, body
+            ttk.Button(side, text="⌂  Home", command=lambda: (self.mobile_patients(False),
+                                                              self.leave(self.show_home))).pack(fill="x")
             ttk.Label(side, text="PATIENTS", style="SideCaption.TLabel").pack(anchor="w", pady=(px(18), px(6)),
                                                                           padx=px(4))
             # bottom controls are placed first, so a short window shrinks the list, not the buttons
@@ -14626,6 +14663,121 @@ def run_gui():
             self.main = ttk.Frame(body)
             self.main.pack(side="left", fill="both", expand=True)
             self.refresh_strip()
+            self._m_job = None
+            self._m_screen = None
+            root.bind("<Configure>", lambda e: e.widget is root and self._mobile_soon(), add="+")
+            root.after(1500, self.mobile_watch)
+            self.mobile_layout()
+
+        # ----------------------------------------------------------- mobile mode (remote desktop on a phone)
+        def screen_size(self):
+            """The screen's size now. (A remote desktop app can change it mid-session — e.g. when the phone
+            turns — and Tk's own figure isn't always updated, so Windows is asked directly.)"""
+            if IS_WIN:
+                try:
+                    import ctypes
+                    gm = ctypes.windll.user32.GetSystemMetrics
+                    w_, h_ = gm(0), gm(1)
+                    if w_ > 0 and h_ > 0:
+                        return w_, h_
+                except Exception:
+                    pass
+            return root.winfo_screenwidth(), root.winfo_screenheight()
+
+        def mobile_watch(self):
+            """Mobile mode: keep the window filling the screen, whatever size the remote desktop makes it."""
+            try:
+                if MOBILE["on"]:
+                    s = self.screen_size()
+                    if s != self._m_screen:
+                        first = self._m_screen is None
+                        self._m_screen = s
+                        if not first or root.state() != "zoomed":
+                            _quiet(root.state, "normal")
+                            root.after(50, lambda: _quiet(root.state, "zoomed"))
+                        self._mobile_soon()
+            finally:
+                root.after(1500, self.mobile_watch)
+
+        def _mobile_soon(self):
+            if self._m_job is not None:
+                _quiet(root.after_cancel, self._m_job)
+            self._m_job = root.after(300, self.mobile_layout)
+
+        def mobile_layout(self, force=False):
+            """Narrow layout when Mobile mode is on and the window is upright or narrow: the patient list
+            behind ☰ Patients, a shorter header, a patient's list above the open document."""
+            self._m_job = None
+            w_, h_ = root.winfo_width(), root.winfo_height()
+            if w_ <= 1:
+                return
+            narrow = MOBILE["on"] and (w_ < px(900) or h_ > w_)
+            if narrow == MOBILE["narrow"] and not force:
+                return
+            MOBILE["narrow"] = narrow
+            if narrow:
+                self.side.pack_forget()
+                self.side_sep.pack_forget()
+                self.offline_lbl.pack_forget()
+                self.app_lbl.pack_forget()                 # (room for the buttons on one row)
+                self.m_list_btn.pack(side="left", padx=(0, px(10)))
+                self.header.config(padding=(px(10), px(8), px(10), px(4)))
+            else:
+                self.m_list_btn.pack_forget()
+                if not self.app_lbl.winfo_ismapped():
+                    self.app_lbl.pack(side="left", before=self.offline_lbl if self.offline_lbl.winfo_ismapped()
+                                      else None)
+                self.offline_lbl.pack(side="left", padx=px(14), after=self.app_lbl)
+                self.header.config(padding=(px(22), px(14), px(22), px(6)))
+                self.main.pack_forget()
+                self.side.config(width=px(250))
+                self.side.pack(side="left", fill="y")
+                self.side_sep.pack(side="left", fill="y")
+                self.main.pack(side="left", fill="both", expand=True)
+            if getattr(self, "page", None) is not None and self.wizard is None and \
+                    not getattr(self, "locked", False):
+                if self.client_id:                    # the patient page lays out differently: rebuild it
+                    self.open_client(self.client_id, select=getattr(self, "view_select", None))
+                else:
+                    self._home_page_key = None             # (not the cached Home: it was laid out for the old width)
+                    self.show_home()
+
+        def mobile_patients(self, show):
+            """Upright phone: show the patient list in place of the page (show=None toggles), or put the page
+            back."""
+            if not MOBILE["narrow"]:
+                return
+            showing = self.side.winfo_ismapped()
+            show = (not showing) if show is None else show
+            if show == showing:
+                return
+            if show:
+                self.main.pack_forget()
+                self.side.pack(side="left", fill="both", expand=True)
+                self.m_list_btn.config(text="✕  Close list")
+            else:
+                self.side.pack_forget()
+                self.main.pack(side="left", fill="both", expand=True)
+                self.m_list_btn.config(text="☰  Patients")
+
+        def set_mobile_mode(self, on, zoom=None):
+            """Settings: turn Mobile mode on/off (the layout changes now; a new size needs a restart)."""
+            size_was = (cfg.get("mobile_zoom") or "125") if cfg.get("mobile_mode") else "100"
+            cfg["mobile_mode"] = bool(on)
+            if zoom:
+                cfg["mobile_zoom"] = zoom
+            save_config(cfg)
+            MOBILE["on"] = bool(on)
+            if on:
+                root.minsize(1, 1)
+                self._m_screen = None
+                _quiet(root.state, "zoomed")
+            else:
+                sw_, sh_ = self.screen_size()
+                root.minsize(min(px(800), int(sw_ * 0.94)), min(px(600), int(sh_ * 0.88)))
+            self.mobile_layout(force=True)
+            size_now = (cfg.get("mobile_zoom") or "125") if on else "100"
+            return size_now != size_was                # True: restart to apply the new size
 
         def refresh_strip(self):
             for w in self.strip.winfo_children():
@@ -15322,7 +15474,8 @@ def run_gui():
                     return
                 if cached_f is not None and self._alive(cached_f):
                     cached_f.destroy()
-            self.page = ttk.Frame(self.main, padding=(px(28), px(22), px(28), px(18)))
+            self.page = ttk.Frame(self.main, padding=(px(12), px(10), px(12), px(10)) if MOBILE["narrow"]
+                                  else (px(28), px(22), px(28), px(18)))
             self.page.pack(fill="both", expand=True)
             self._page_is_home = bool(is_home)
             self._page_builder = builder
@@ -15501,6 +15654,7 @@ def run_gui():
             if not sel:
                 return
             cid = self.clients[sel[0]]["id"]
+            self.mobile_patients(False)                  # (upright phone: back to the page)
             if cid == self.client_id and self.wizard is None:
                 return
             self.leave(lambda: self.open_client(cid))
@@ -15781,24 +15935,33 @@ def run_gui():
             dup_days = {d_ for days in dups.values() for d_ in days}
 
             ttk.Separator(f).pack(fill="x", pady=(px(12), 0))
-            body = ttk.Panedwindow(f, orient="horizontal")
+            stacked = MOBILE["narrow"]            # upright phone: the list above the open document
+            body = ttk.Panedwindow(f, orient="vertical" if stacked else "horizontal")
             body.pack(fill="both", expand=True, pady=(px(12), 0))
             left_wrap = ttk.Frame(body, width=px(300))
-            ttk.Separator(left_wrap, orient="vertical").pack(side="right", fill="y", padx=(px(10), 0))
+            if stacked:
+                ttk.Separator(left_wrap).pack(side="bottom", fill="x", pady=(px(8), 0))
+            else:
+                ttk.Separator(left_wrap, orient="vertical").pack(side="right", fill="y", padx=(px(10), 0))
             left = ttk.Frame(left_wrap)
             left.pack(side="left", fill="both", expand=True)
-            right = ttk.Frame(body, padding=(px(6), 0, 0, 0))
+            right = ttk.Frame(body, padding=(0, px(6), 0, 0) if stacked else (px(6), 0, 0, 0))
             body.add(left_wrap, weight=0)
             body.add(right, weight=1)
             split = {"auto": True, "w": None}
+            f._stacked = stacked                  # (for tests)
 
             def fit_split(e):
                 # narrow window: give the open document more room; a sash the user dragged stays put
-                if not split["auto"] or e.width == split["w"] or e.width < px(200):
+                size = e.height if stacked else e.width
+                if not split["auto"] or size == split["w"] or size < px(200):
                     return
-                split["w"] = e.width
+                split["w"] = size
                 try:
-                    body.sashpos(0, px(300) if e.width >= px(820) else max(px(190), int(e.width * 0.36)))
+                    if stacked:
+                        body.sashpos(0, max(px(150), int(size * 0.3)))
+                    else:
+                        body.sashpos(0, px(300) if size >= px(820) else max(px(190), int(size * 0.36)))
                 except tk.TclError:
                     pass
             body.bind("<Configure>", fit_split, add="+")
@@ -22115,7 +22278,8 @@ def run_gui():
             def all_clear():
                 ttk.Label(box, text="Nothing needs your attention right now. Drafts to review, plan reviews, risk, score "
                                     "changes, follow-ups and homework show up here as they come in.",
-                          style="Muted.TLabel", wraplength=px(700), justify="left").pack(anchor="w", pady=(px(10), 0))
+                          style="Muted.TLabel", wraplength=px(700), justify="left").pack(anchor="w", fill="x",
+                                                                                         pady=(px(10), 0))
             if not total:
                 all_clear()
 
@@ -25088,64 +25252,41 @@ def run_gui():
                 self.sync_now(show_sync, redraw=redraw)
             sync_btn.config(command=do_sync)
 
-            # ---- phone: the iPhone page reads the vault from Drive; this computer answers what needs it
-            ph = ttk.LabelFrame(outer, text="Phone", padding=px(10))
-            ph.pack(fill="x", pady=(px(10), 0))
-            phone_var = tk.BooleanVar(value=bool(cfg.get("phone_relay")))
+            # ---- (the phone page is retired: the phone uses remote desktop and Mobile mode instead)
 
-            def save_phone():
-                cfg["phone_relay"] = phone_var.get()
-                save_config(cfg)
-                self._ph["last"], self._ph["isig"] = None, None       # publish right away
-                show_phone()
-            ttk.Checkbutton(ph, text="Phone access: let my phone ask questions and run the queue on this computer, "
-                                     "and keep the phone's patient list current", variable=phone_var,
-                            command=save_phone).pack(anchor="w")
-            ttk.Label(ph, text="The phone reads and edits notes straight from your Google Drive, encrypted, even when "
-                               "this computer is off. It sends questions and queue commands through the same folder, "
-                               "encrypted with your vault key. Nothing is stored on the phone.",
-                      style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(2), px(6)))
-            phrow = Flow(ph, gap=px(8))
-            phrow.pack(fill="x")
-            phrow.add(ttk.Button(phrow, text="Make the phone page…", command=lambda: self.phone_page_dialog(win)))
-            phone_info = ttk.Label(ph, text="", style="Muted.TLabel", wraplength=px(760), justify="left")
-            phone_info.pack(anchor="w", pady=(px(6), 0))
-            phone_devs = ttk.Frame(ph)
-            phone_devs.pack(fill="x", pady=(px(4), 0))
+            # ---- Mobile mode: using this computer from a phone through a remote desktop app
+            mm = ttk.LabelFrame(outer, text="Mobile mode (remote desktop from a phone)", padding=px(10))
+            mm.pack(fill="x", pady=(px(10), 0))
+            mm_var = tk.BooleanVar(value=bool(cfg.get("mobile_mode")))
+            MZ_NAMES = {"100": "Normal size", "125": "Larger (125%)", "150": "Largest (150%)"}
+            mz_var = tk.StringVar(value=MZ_NAMES.get(str(cfg.get("mobile_zoom") or "125"), MZ_NAMES["125"]))
+            mm_row = Flow(mm, gap=px(10))
+            mm_row.pack(fill="x")
+            mm_row.add(ttk.Checkbutton(mm_row, text="Mobile mode on this computer", variable=mm_var))
+            mm_row.add(ttk.Label(mm_row, text="Size"), gap=px(18))
+            mz_cb = mm_row.add(ttk.Combobox(mm_row, textvariable=mz_var, values=list(MZ_NAMES.values()),
+                                            state="readonly", width=16), gap=px(4))
+            ttk.Label(mm, text="Session Scribe fills the whole screen and stays that way when the remote desktop "
+                               "changes size (turning the phone). Held upright, the patient list moves behind "
+                               "“☰ Patients”, and a patient's list sits above the open document. For the full "
+                               "phone screen when it's upright, turn on “Resize desktop to fit” (or the like) in "
+                               "your remote desktop app, so this computer's screen takes the phone's shape.",
+                      style="Muted.TLabel", wraplength=px(760), justify="left").pack(anchor="w", pady=(px(6), 0))
+            mm_note = ttk.Label(mm, text="", style="Warn.TLabel", wraplength=px(760), justify="left")
+            mm_note.pack(anchor="w", pady=(px(4), 0))
 
-            def remove_phone(d):
-                if not messagebox.askyesno(APP_NAME, f"Turn off Face ID unlock for “{d['name']}”? That phone will need "
-                                                     "your vault password next time.", parent=win):
-                    return
-                try:
-                    os.remove(d["path"])
-                except OSError as e:
-                    return messagebox.showerror(APP_NAME, f"Couldn't remove it: {e}", parent=win)
-                phone_log(f"Face ID unlock removed for {d['name'][:40]}")
-                show_phone()
-
-            def show_phone():
-                if not phone_info.winfo_exists():
-                    return
-                url = cfg.get("phone_page_url") or ""
-                lines = [("Phone page: " + url) if url else "Phone page: not made yet — click “Make the phone page…”."]
-                if phone_var.get():
-                    lines.append("This computer answers the phone while Session Scribe is open (locked is fine).")
-                log = phone_log_tail(5)
-                if log:
-                    lines.append("Recent phone requests:\n" + "\n".join("   " + ln for ln in log))
-                phone_info.config(text="\n".join(lines))
-                for w_ in phone_devs.winfo_children():
-                    w_.destroy()
-                devs = phone_devices(cfg)
-                if devs:
-                    ttk.Label(phone_devs, text="Phones with Face ID + PIN unlock:", style="Strong.TLabel").pack(anchor="w")
-                for d in devs:
-                    r_ = ttk.Frame(phone_devs)
-                    r_.pack(fill="x", pady=(px(2), 0))
-                    ttk.Label(r_, text=f"• {d['name']}  ·  set up {fmt_date(d['created'][:10])}").pack(side="left")
-                    ttk.Button(r_, text="Remove", command=lambda d=d: remove_phone(d)).pack(side="right")
-            show_phone()
+            def mm_apply(*_):
+                zoom = next((k for k, v in MZ_NAMES.items() if v == mz_var.get()), "125")
+                if self.set_mobile_mode(mm_var.get(), zoom):
+                    mm_note.config(text="The new size applies after a restart.")
+                    if messagebox.askyesno(APP_NAME, "Restart Session Scribe now so the new size takes effect?",
+                                           parent=win):
+                        self.restart_app()
+                else:
+                    mm_note.config(text="")
+            mm_var.trace_add("write", mm_apply)
+            mz_cb.bind("<<ComboboxSelected>>", mm_apply)
+            self._mobile_ui = {"var": mm_var, "size": mz_var, "note": mm_note}      # (for tests)
 
             # ---- fingerprint unlock (Windows Hello), per computer
             if IS_WIN:
@@ -25994,7 +26135,7 @@ def run_gui():
             self._ph["q"].put(fn)
 
         def phone_on(self):
-            return bool(cfg.get("phone_relay")) and vault.fernet is not None and bool(cfg.get("data_dir"))
+            return False                  # the phone page is retired (remote desktop + Mobile mode instead)
 
         def phone_tick(self):
             try:
