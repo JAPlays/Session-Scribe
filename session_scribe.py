@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.22"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.23"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7559,6 +7559,115 @@ def tidy_email_thread(text):
     return "\n".join(out).strip()
 
 
+# ---- the contact log: one entry per date (texts/emails pasted together are split by their own dates)
+_STAMP_LINE_RE = re.compile(r"^\[(\d{4}-\d\d-\d\d)(?: (\d{1,2}:\d\d ?[AaPp][Mm]))?\]")
+
+
+def _clock(t):
+    """'8:34 AM' -> minutes after midnight (-1 when there's no time)."""
+    m = re.match(r"(\d{1,2}):(\d\d)\s*([AaPp])", t or "")
+    if not m:
+        return -1
+    h = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "p" else 0)
+    return h * 60 + int(m.group(2))
+
+
+def contact_blocks(text):
+    """(lines before the first dated message, subject, [(date, minutes, time text, block)]) — a block is a dated
+    message line ("[2026-10-19 8:34 AM] Patient: …") or a dated email with its body."""
+    pre, subject, blocks, cur = [], "", [], None
+    for l in (text or "").split("\n"):
+        if l.startswith("Subject: ") and not blocks and not subject:
+            subject = l[9:].strip()
+            continue
+        if _PHONE_RE.fullmatch(l.strip() or "x"):
+            continue                                # a lone phone number: the copy app's header, not a message
+        m = _STAMP_LINE_RE.match(l)
+        if m:
+            cur = [m.group(1), _clock(m.group(2)), (m.group(2) or "").upper().replace(" ", " "), [l]]
+            blocks.append(cur)
+        elif cur is None:
+            pre.append(l)
+        else:
+            cur[3].append(l)
+    out = []
+    for d, mins, t, ls in blocks:
+        while ls and not ls[-1].strip():
+            ls.pop()
+        out.append((d, mins, t, "\n".join(ls).strip()))
+    while pre and not pre[-1].strip():
+        pre.pop()
+    return [l for l in pre], subject, out
+
+
+def _contact_text(pre, subject, blocks):
+    blocks = sorted(blocks, key=lambda b: b[1])          # chronological (stable for equal times)
+    sep = "\n\n" if any("\n" in b[3] for b in blocks) else "\n"
+    parts = [("\n".join(pre)).strip(), f"Subject: {subject}" if subject else "", sep.join(b[3] for b in blocks)]
+    return "\n\n".join(p for p in parts if p)
+
+
+def merge_contacts(entries, new, now=None):
+    """Add a logged contact to the list, one entry per date: messages pasted together are split by their own
+    dates, and a date that already has an entry with the same person and way of contact gets them merged in,
+    in time order (repeats left out). Returns the entries it added or changed."""
+    now = now or datetime.now().isoformat(timespec="seconds")
+    pre, subject, blocks = contact_blocks(new.get("text", ""))
+    touched = []
+    if not blocks:                                       # a summary you typed: as it is
+        e = dict(new, id=new.get("id") or uuid.uuid4().hex[:12], added=new.get("added") or now, updated=now)
+        entries.append(e)
+        return [e]
+    by_date = {}
+    for b in blocks:
+        by_date.setdefault(b[0], []).append(b)
+    first = min(by_date)
+    same = lambda e: (e.get("method") == new.get("method") and e.get("with", "patient") == new.get("with", "patient")
+                      and (e.get("who") or "") == (new.get("who") or ""))
+    for d in sorted(by_date):
+        bl = by_date[d]
+        tgt = next((e for e in entries if e.get("date") == d and same(e)), None)
+        if tgt is not None:
+            p2, s2, b2 = contact_blocks(tgt.get("text", ""))
+            seen = {re.sub(r"\s+", " ", b[3]).strip().lower() for b in b2}
+            add = [b for b in bl if re.sub(r"\s+", " ", b[3]).strip().lower() not in seen]
+            merged = b2 + add
+            tgt["text"] = _contact_text(p2 or (pre if d == first else []), s2 or subject, merged)
+            tgt["time"] = sorted(merged, key=lambda b: b[1])[0][2] if merged else tgt.get("time", "")
+            tgt["updated"] = now
+            touched.append(tgt)
+        else:
+            e = dict(new, id=uuid.uuid4().hex[:12], date=d, text=_contact_text(pre if d == first else [], subject, bl),
+                     time=sorted(bl, key=lambda b: b[1])[0][2], notes=new.get("notes", "") if d == first else "",
+                     added=now, updated=now)
+            entries.append(e)
+            touched.append(e)
+    return touched
+
+
+def contacts_need_split(e):
+    """A saved contact whose messages span several dates (or another date), or with phone-number header lines."""
+    text = e.get("text") or ""
+    dated = re.search(r"(?m)^\[\d{4}-\d\d-\d\d", text) is not None
+    if dated and any(_PHONE_RE.fullmatch(l.strip()) for l in text.split("\n") if l.strip()):
+        return True
+    dates = {b[0] for b in contact_blocks(text)[2]}
+    return bool(dates) and dates != {e.get("date")}
+
+
+def resplit_contacts(entries):
+    """Re-file saved contacts that need it (see contacts_need_split). Returns True if anything changed."""
+    bad = [e for e in entries if contacts_need_split(e)]
+    if not bad:
+        return False
+    keep = [e for e in entries if e not in bad]
+    for e in sorted(bad, key=lambda x: x.get("added", "")):
+        merge_contacts(keep, {k: v for k, v in e.items() if k not in ("id", "date", "time", "added", "updated")},
+                       now=e.get("added"))
+    entries[:] = keep
+    return True
+
+
 def looks_like_message_export(text):
     return bool(re.search(r"(?m)^\W*Message from .+, (?:" + _WEEKDAYS + r"), ", _INVISIBLE_RE.sub("", text or "")))
 
@@ -14654,6 +14763,8 @@ def run_gui():
                 if self.repair_word_xml(client, sessions):  # imports read before the .docx fix
                     client = vault.load_client(cid)
                     sessions = vault.sessions_for(cid)
+                if resplit_contacts(client.get("communications") or []):   # threads logged before date-splitting
+                    _quiet(vault.save_client, client)
                 self._sig = vault.signature()              # what's on screen is current
             self.show(lambda f: self._client_page(f, client, sessions, select))
 
@@ -16022,8 +16133,8 @@ def run_gui():
                                                                ("Contact" if w_ == "other" else "Parent"))
                     text = tidy_message_thread(text, other=other) or text
                 # always: into the patient's External communication log, as they are (no AI)
-                self.comm_save(cid, {"date": day, "with": w_, "who": who_, "method": method, "text": text,
-                                     "notes": note_txt})
+                self.comm_add(cid, {"date": day, "with": w_, "who": who_, "method": method, "text": text,
+                                    "notes": note_txt})
                 if not draft_var.get():
                     win.destroy()
                     self.set_status(f"{code}: {method.lower()} added to the External communication log.")
@@ -17603,6 +17714,16 @@ def run_gui():
             self._sig = vault.signature()
             return entry
 
+        def comm_add(self, cid, entry):
+            """Log new texts/emails/contacts: one entry per date, merged into an entry already there for the same
+            date, person and way of contact. Returns the (first) entry it went into."""
+            c = vault.load_client(cid)
+            lst = c.setdefault("communications", [])
+            touched = merge_contacts(lst, entry)
+            vault.save_client(c)
+            self._sig = vault.signature()
+            return touched[0] if touched else None
+
         def comm_remove(self, client, entry):
             if not messagebox.askyesno(APP_NAME, f"Remove the {entry.get('method', 'messages').lower()} from "
                                                  f"{fmt_date(entry.get('date', ''))} from the log?"):
@@ -17781,7 +17902,7 @@ def run_gui():
                 entry = dict(ex, date=day, time=t_, method=how_var.get().strip() or "Other", text=text,
                              notes=ex.get("notes", ""), who=who_var.get().strip()[:60] if w_ == "other" else "")
                 entry["with"] = w_
-                saved = self.comm_save(cid, entry)
+                saved = self.comm_save(cid, entry) if existing else self.comm_add(cid, entry)
                 win.destroy()
                 self._contact_focus = ("log", saved["id"])
                 self.set_status(f"{client.get('code', '')}: contact logged.")

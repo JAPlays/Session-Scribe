@@ -93,6 +93,41 @@ def script(app, root, V, h):
     h.ok("…without signatures, the confidentiality notice, [Quoted text hidden] or the print header/link",
          "555-201-0999" not in t and "Psychotherapy Extern" not in t and "Confidentiality" not in t
          and "Quoted text" not in t and "mail.google" not in t and "9:09 PM" not in t, t)
+    # one entry per date; same-date messages merged in time order; lone phone-number lines dropped
+    cid3 = V.save_client({"code": "CL3"})
+    thread = ("Hi Sam, this is your counselor checking in.\n(555) 201-0999\n\n"
+              "[2026-10-19 8:34 AM] Patient: Yea\n"
+              "[2026-10-19 10:22 AM] Counselor: Would 5:45 work?\n(555) 201-0999\n\n"
+              "[2026-10-21 9:05 AM] Patient: Running late\n")
+    app.comm_add(cid3, {"date": "2026-11-13", "with": "patient", "who": "", "method": "Text messages",
+                        "text": thread, "notes": ""})
+    log = sorted(V.load_client(cid3)["communications"], key=lambda e: e["date"])
+    h.ok("texts spanning two dates become two dated entries (not today's date)",
+         [e["date"] for e in log] == ["2026-10-19", "2026-10-21"] and log[0]["time"] == "8:34 AM", log)
+    h.ok("…the first text before them stays with the first date, and the phone-number lines are gone",
+         log[0]["text"].startswith("Hi Sam") and "201-0999" not in log[0]["text"] + log[1]["text"], log[0]["text"])
+    more = "[2026-10-19 9:10 AM] Patient: I get a break at 2:45\n[2026-10-19 8:34 AM] Patient: Yea\n"
+    app.comm_add(cid3, {"date": "2026-11-13", "with": "patient", "who": "", "method": "Text messages", "text": more,
+                        "notes": ""})
+    log = sorted(V.load_client(cid3)["communications"], key=lambda e: e["date"])
+    lines = [l for l in log[0]["text"].splitlines() if l.startswith("[")]
+    h.ok("more messages from the same date are merged into that entry, in time order, without repeats",
+         len(log) == 2 and lines == ["[2026-10-19 8:34 AM] Patient: Yea", "[2026-10-19 9:10 AM] Patient: I get a break "
+                                     "at 2:45", "[2026-10-19 10:22 AM] Counselor: Would 5:45 work?"], lines)
+    mail = ss.tidy_email_thread(printed.replace("Wed, Nov 11, 2026 at 3:59 PM", "Thu, Nov 12, 2026 at 9:00 AM"))
+    app.comm_add(cid3, {"date": "2026-11-13", "with": "parent", "who": "", "method": "Email", "text": mail, "notes": ""})
+    em = sorted([e for e in V.load_client(cid3)["communications"] if e["method"] == "Email"], key=lambda e: e["date"])
+    h.ok("an email chain over two days becomes two dated entries, each keeping the subject",
+         [e["date"] for e in em] == ["2026-11-11", "2026-11-12"] and all(e["text"].startswith("Subject: Scheduling")
+                                                                         for e in em), em)
+    # an entry saved before splitting existed is re-filed when the patient is opened
+    c = V.load_client(cid3)
+    c["communications"] = [{"id": "old", "date": "2026-11-13", "with": "patient", "method": "Text messages",
+                            "text": thread, "notes": "", "added": "x"}]
+    V.save_client(c)
+    app.open_client(cid3, select="comms"); h.pump(root, 1)
+    h.ok("an older multi-date entry is split by date when the patient is opened",
+         sorted(e["date"] for e in V.load_client(cid3)["communications"]) == ["2026-10-19", "2026-10-21"])
     h.ok("dates with month names read again (find_date / parse_date)",
          ss.find_date("Seen on Nov 11, 2026") == "2026-11-11" and ss.parse_date("Nov 7, 2026") == "2026-11-07")
     h.ok("no errors", not errors, errors[-1:] if errors else "")
