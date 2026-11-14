@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.10"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.11"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -12368,10 +12368,25 @@ def _norm_word(w):
     return w
 
 
-def patient_speech(d, counselor_label, patient_label=None):
+_SPEAKER_LINE_RE = re.compile(r"^\s*(?:\[[^\]]{1,12}\]\s*)?([A-Za-z][\w ./'-]{0,30}?)\s*:\s+(\S.*)$")
+
+
+def _untimed_lines(transcript):
+    """A pasted transcript without timestamps ("Patient: …" per line) as speaker lines."""
+    out = []
+    for raw in (transcript or "").split("\n"):
+        m = _SPEAKER_LINE_RE.match(raw)
+        if m:
+            out.append({"speaker": m.group(1).strip(), "text": m.group(2).strip()})
+        elif out and raw.strip():
+            out[-1]["text"] += " " + raw.strip()            # a line that carries on the one before
+    return out if len(out) >= 2 else []
+
+
+def patient_speech(d, counselor_label, patient_label=None, note_ok=True):
     """What the patient said in a session — the patient's own transcript lines when the patient can be told
-    apart (see map_patient), otherwise everyone but the counselor — else the note."""
-    lines = timed_lines(d) or d.get("lines") or []
+    apart (see map_patient), otherwise everyone but the counselor — else (note_ok) the note."""
+    lines = timed_lines(d) or d.get("lines") or _untimed_lines(d.get("transcript"))
     roles = d.get("roles") or {}
     label = lambda l: roles.get(l.get("speaker"), l.get("speaker")) or ""
     names = list(dict.fromkeys(label(l) for l in lines))
@@ -12381,10 +12396,19 @@ def patient_speech(d, counselor_label, patient_label=None):
     else:
         said = [l.get("text", "") for l in lines if not _same_label(label(l), counselor_label)
                 and not any(w in label(l).lower() for w in _CLINICIAN_WORDS)]
-    return " ".join(said) if said else (d.get("note") or "")
+    return " ".join(said) if said else ((d.get("note") or "") if note_ok else "")
 
 
 _WORD_RE = re.compile(r"[A-Za-z][A-Za-z'-]+")
+# the language of notes and therapy, never listed as a word the patient uses
+DOC_WORDS = set("""session sessions therapy therapist therapists psychotherapy psychotherapist counselor counselors
+counseling counselling clinician clinicians clinical patient patients client clients person-centered
+person-centred cbt dbt act emdr intervention interventions modality reported reports reporting stated states
+discussed discuss explored explore processed processing provided utilized utilize presented presenting presents
+appeared appears demonstrated demonstrate engaged engagement rapport affect euthymic congruent oriented
+assessment assessed treatment objective objectives psychoeducation validated validation reflected
+reflection reframe reframing cognitive behavioral behavioural mindfulness strengths-based solution-focused
+psychodynamic humanistic supervisor supervision note notes""".split())
 _THEME_CACHE = collections.OrderedDict()          # (digest of the speech, names to leave out) -> counts
 
 
@@ -12399,13 +12423,13 @@ def _speech_counts(text, hide_names):
         return hit
     tokens = _WORD_RE.findall(text)
     tc, wc, surface = collections.Counter(), collections.Counter(), {}
-    for w, n in collections.Counter(t.lower().strip("'") for t in tokens).items():
+    for w, n in collections.Counter(re.sub(r"'s$", "", t.lower().strip("'")) for t in tokens).items():
         if w in hide_names:
             continue
         theme = _THEME_OF.get(w)
         if theme:
             tc[theme] += n
-        if len(w) < 4 or w in STOPWORDS or w.endswith("n't"):
+        if len(w) < 4 or w in STOPWORDS or w in DOC_WORDS or w.endswith("n't"):
             continue
         norm = _norm_word(w)
         wc[norm] += n
@@ -12435,9 +12459,12 @@ def session_themes(client, sessions, counselor_label, top_words=15, patient_labe
         text = patient_speech(d, counselor_label, patient_label)
         if not (text or "").strip():
             continue
-        n, tc, wc, surf = _speech_counts(text, hide_names)
+        n, tc, _wc, _surf = _speech_counts(text, hide_names)
         cols.append((d["meta"].get("session_date") or "", n))
         theme_counts.append(tc)
+        # the words the patient uses: only what they actually said (a transcript), never the note's wording
+        said = patient_speech(d, counselor_label, patient_label, note_ok=False)
+        _n, _tc, wc, surf = _speech_counts(said, hide_names) if said.strip() else (0, None, collections.Counter(), {})
         word_counts.append(wc)
         for norm, forms in surf.items():
             mine = surface.setdefault(norm, collections.Counter())
@@ -21983,8 +22010,9 @@ def run_gui():
             counselor, patient = self._counselor_patient()
             th = session_themes(client, sessions, counselor, patient_label=patient)
             ttk.Label(box, text="What the patient talks about, session by session", style="Strong.TLabel").pack(anchor="w")
-            ttk.Label(box, text="Counted on this computer from what the patient said in recorded sessions (or the note "
-                                "when there's no recording) — no AI. Darker = talked about more in that session. Names on "
+            ttk.Label(box, text="Counted on this computer — no AI. Themes come from what the patient said in "
+                                "sessions with a transcript (or the note when there's none); the words list only from "
+                                "what the patient actually said. Darker = talked about more in that session. Names on "
                                 "the hide list are left out.", style="Caption.TLabel", wraplength=px(720),
                       justify="left").pack(anchor="w", pady=(px(2), 0))
             if not th["columns"]:
