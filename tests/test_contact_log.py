@@ -148,6 +148,34 @@ def script(app, root, V, h):
          and mails[0]["text"].index("Teacher") < mails[0]["text"].index("Parent")
          and app.comm_party(mails[0]) == "several people" and texts[0]["time"] == "6:45 AM", (texts, mails))
 
+    # emails read as paragraphs, and the thread view is easy to follow
+    wrapped = ("Hi Sam,\nI hope you are doing well today! Just checking whether the schedule we sent a few\n"
+               "weeks ago is still right, and if not please let me know what needs to change. Thanks!\n"
+               "Monday Tuesday\nRoom 6 Room 5\n- bring the forms\n- sign page 2")
+    rf = ss.reflow_paragraphs(wrapped).splitlines()
+    h.ok("lines a print-out broke mid-sentence are joined; greetings, table rows and list items aren't",
+         rf[0] == "Hi Sam," and rf[1].startswith("I hope you") and rf[1].endswith("what needs to change. Thanks!")
+         and "Monday Tuesday" in rf and "Room 6 Room 5" in rf and "- sign page 2" in rf, rf)
+    tw = ss.tk.Toplevel(root) if hasattr(ss, "tk") else None
+    import tkinter as tk_
+    top = tk_.Toplevel(root)
+    txt = tk_.Text(top)
+    app.render_thread(txt, ss.tidy_email_thread(printed.replace("Can we move Thursday's session to 5pm?",
+                                                                  wrapped.split("\n", 1)[1])))
+    shown = txt.get("1.0", "end")
+    heads = [txt.get(a, b) for a, b in zip(txt.tag_ranges("who")[::2], txt.tag_ranges("who")[1::2])]
+    h.ok("the thread view: subject, then a bold 'who → whom' line per email with its date, paragraphs, a rule",
+         shown.startswith("Scheduling") and heads == ["Pat Parent → Counselor", "Counselor → Pat Parent"]
+         and "Nov 11, 2026" in shown or "2026-11-11" in shown, (heads, shown[:300]))
+    h.ok("…the wrapped email reads as one paragraph", "sent a few weeks ago" in shown and "─" in shown, shown)
+    top.destroy()
+    app.external_comm(V.load_client(cid3)); h.pump(root, 0.6)
+    lb_btn = next((b for b in h.widgets(app.parent_win["win"], "TButton") if "Load from files" in str(b.cget("text"))),
+                  None)
+    h.ok("'Load from files…' sits next to the heading and is visible", lb_btn is not None and lb_btn.winfo_ismapped()
+         and lb_btn.winfo_rooty() < app.parent_win["msgs"].winfo_rooty())
+    app.parent_win["win"].destroy()
+
     # dates are read from what's pasted or loaded
     app.external_comm(V.load_client(cid3)); h.pump(root, 0.4)
     w = app.parent_win

@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.25"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.26"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7487,6 +7487,36 @@ _MAIL_NOTICE_RE = re.compile(r"^\s*(confidentiality notice|this (e-?mail|message
                              r"attachments )?(is|are|may) (confidential|intended))", re.I)
 
 
+def reflow_paragraphs(text, wrap_at=60):
+    """Join lines a PDF or print-out broke mid-sentence back into paragraphs: a line that ran close to the page
+    width carries on into the next one. Short lines (greetings, sign-offs, table rows), list items and blank
+    lines stay as they are."""
+    out, cur, last_len = [], "", 0
+    for raw in (text or "").split("\n"):
+        l = raw.strip()
+        if not l:
+            if cur:
+                out.append(cur)
+                cur = ""
+            if out and out[-1] != "":
+                out.append("")
+            continue
+        listy = re.match(r"^([-*•·]|\d{1,2}[.)])\s", l) is not None
+        ends = re.search(r"[.!?:]\W{0,4}$", cur) is not None and l[:1].isupper()   # a sentence ended there
+        if cur and last_len >= wrap_at and not listy and not ends:
+            cur += ("" if cur.endswith("-") else " ") + l
+        else:
+            if cur:
+                out.append(cur)
+            cur = l
+        last_len = len(l)
+    if cur:
+        out.append(cur)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
 def looks_like_email_print(text):
     """An email thread printed or saved from Gmail/Outlook ("Name <address>   Wed, Nov 11, 2026 at 3:15 PM")."""
     return bool(re.search(r"(?m)^[^<\n]{1,80}<[^>\s]+@[^>\s]+>\s+(?:[A-Z][a-z]{2},\s+)?[A-Z][a-z]{2,8}\.?\s+\d{1,2},\s+"
@@ -7555,7 +7585,7 @@ def tidy_email_thread(text):
         to = msg["to"]
         if me and to and me in msg.get("to_raw", ""):
             to = "Counselor"
-        out.append(f"\n[{when}] {who}" + (f" → {to}" if to else "") + ":\n" + "\n".join(body).strip())
+        out.append(f"\n[{when}] {who}" + (f" → {to}" if to else "") + ":\n" + reflow_paragraphs("\n".join(body)).strip())
     return "\n".join(out).strip()
 
 
@@ -16036,12 +16066,14 @@ def run_gui():
                                         state="readonly", width=16), gap=px(4))
 
             msg_fr = ttk.Frame(f)
-            ttk.Label(msg_fr, text="Paste the messages (oldest first), or load them from files:",
-                      style="H2.TLabel").pack(anchor="w")
-            mfr, msgs = scrolled_text(msg_fr, height=12)
-            mfr.pack(fill="both", expand=True, pady=(px(4), px(4)))
+            m_head = Flow(msg_fr, gap=px(12))                # the file button sits up here, so it's never cut off
+            m_head.pack(fill="x")
+            m_head.add(ttk.Label(m_head, text="Paste the messages, or load them from files:", style="H2.TLabel"))
+            load_btn = m_head.add(ttk.Button(m_head, text="📂  Load from files…"))
             found_lbl = ttk.Label(msg_fr, text="", style="Caption.TLabel")
             found_lbl.pack(anchor="w")
+            mfr, msgs = scrolled_text(msg_fr, height=10)
+            mfr.pack(fill="both", expand=True, pady=(px(4), px(4)))
             found = {"dates": [], "job": None}
 
             def detect_dates(*_):
@@ -16083,7 +16115,7 @@ def run_gui():
                     if pth.lower().endswith(".eml") or looks_like_email_print(txt):
                         method_var.set("Email")
                 detect_dates()
-            ttk.Button(msg_fr, text="Load from files…", command=load_files).pack(anchor="w")
+            load_btn.config(command=load_files)
 
             call_fr = ttk.Frame(f)
             ttk.Label(call_fr, text="The phone-call recording:", style="H2.TLabel").pack(anchor="w")
@@ -16107,7 +16139,7 @@ def run_gui():
             draft_var = tk.BooleanVar(value=False)
             draft_cb = ttk.Checkbutton(f, text="Also draft a contact note with the AI (otherwise it's just logged)",
                                        variable=draft_var)
-            hint = ttk.Label(f, text=f"Texts and emails go into {code}'s External communication log as they are. If you "
+            hint = ttk.Label(f, text=f"Texts and emails go into {code}'s Contact log, one entry per date. If you "
                                      "also draft a contact note, names on the “names to hide” list are replaced and email "
                                      "addresses, phone numbers and links are removed before the AI sees anything.",
                              style="Muted.TLabel", wraplength=px(820), justify="left")
@@ -17814,7 +17846,7 @@ def run_gui():
             bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(entry.get("text", ""), "Messages")))
             fr, tb = scrolled_text(f, readonly=True)
             fr.pack(fill="both", expand=True, pady=(px(8), 0))
-            set_text(tb, entry.get("text", ""))
+            self.render_thread(tb, entry.get("text", ""))
             return win
 
         def contact_entries(self, client, sessions):
@@ -17859,7 +17891,7 @@ def run_gui():
                       style="Caption.TLabel").pack(anchor="w", pady=(px(4), px(2)))
             lbox, clb = auto_scroll(v, lambda b: NiceList(b, "List.Treeview"))
             lbox.pack(fill="x")
-            clb.configure(height=min(max(len(entries), 3), 8))
+            clb.configure(height=min(max(len(entries), 2), 4))      # (scrolls) — leaves the room for the thread
             for e in entries:
                 clb.insert("end", e[2])
             detail = ttk.Frame(v)
@@ -17875,21 +17907,23 @@ def run_gui():
                     self._render_day(detail, client, val, recs)
                     return
                 x = val
-                ttk.Label(detail, text=f"{x.get('method', 'Contact')} with {self.comm_party(x).lower()}",
-                          style="Strong.TLabel").pack(anchor="w")
-                ttk.Label(detail, text=fmt_date(x.get("date", "")) + (f"  {x['time']}" if x.get("time") else ""),
-                          style="Muted.TLabel").pack(anchor="w")
+                bar = Flow(detail, gap=px(8))                # title, date and actions share one line
+                bar.pack(fill="x")
+                bar.add(ttk.Label(bar, text=f"{x.get('method', 'Contact')} with {self.comm_party(x).lower()}",
+                                  style="Strong.TLabel"))
+                bar.add(ttk.Label(bar, text=fmt_date(x.get("date", "")) + (f"  {x['time']}" if x.get("time") else ""),
+                                  style="Muted.TLabel"), gap=px(4))
                 if x.get("notes"):
                     ttk.Label(detail, text="Note: " + x["notes"], wraplength=px(560), justify="left").pack(
                         anchor="w", pady=(px(4), 0))
-                bar = Flow(detail, gap=px(8))
-                bar.pack(fill="x", pady=(px(6), 0))
+                bar.add(ttk.Button(bar, text="⤢  Open", style="Accent.TButton",
+                                   command=lambda: self.comm_view(client, x)), gap=px(16))
                 bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(x.get("text", ""), "Contact")))
                 bar.add(ttk.Button(bar, text="Edit…", command=lambda: self.contact_log_dialog(client, x)))
                 bar.add(ttk.Button(bar, text="Remove", command=lambda: self.comm_remove(client, x)), gap=px(12))
                 fr, tb = scrolled_text(detail, readonly=True)
                 fr.pack(fill="both", expand=True, pady=(px(6), 0))
-                set_text(tb, x.get("text", ""))
+                self.render_thread(tb, x.get("text", ""))
 
             clb.bind("<<ListboxSelect>>", lambda e: clb.curselection() and show(clb.curselection()[0]))
             focus = getattr(self, "_contact_focus", None)
@@ -17900,6 +17934,51 @@ def run_gui():
             clb.see(i0)
             show(i0)
             v._contacts = {"list": clb, "entries": entries, "show": show}
+
+        def render_thread(self, t, text):
+            """Show a logged thread so it's easy to follow: the subject, then each email or text under a bold
+            "who → whom" line with its date and time, emails as paragraphs, a rule between emails. Text that isn't
+            a dated thread (a typed summary) is shown as it is."""
+            pre, subject, blocks = contact_blocks(text)
+            t.config(state="normal")
+            t.delete("1.0", "end")
+            if not blocks:
+                t.insert("1.0", text or "")
+                t.config(state="disabled")
+                return
+            t.tag_configure("subj", font=F["sub"], spacing3=px(8))
+            t.tag_configure("who", font=F["strong"], spacing1=px(10))
+            t.tag_configure("when", font=F["caption"], foreground=P("muted"))
+            t.tag_configure("body", lmargin1=px(14), lmargin2=px(14), spacing1=px(2), spacing3=px(2))
+            t.tag_configure("react", font=F["caption"], foreground=P("muted"), lmargin1=px(14), lmargin2=px(14))
+            t.tag_configure("rule", foreground=P("border"), spacing1=px(6), spacing3=px(2))
+            if subject:
+                t.insert("end", subject + "\n", "subj")
+            if pre:
+                t.insert("end", reflow_paragraphs("\n".join(pre)).strip() + "\n", "body")
+            head_re = re.compile(r"^\[(\d{4}-\d\d-\d\d)(?: ([^\]]+))?\]\s*(.*)$", re.S)
+            for i, (d, _mins, tm, block) in enumerate(sorted(blocks, key=lambda b: b[1])):
+                first, _, rest = block.partition("\n")
+                m = head_re.match(first)
+                who_line = m.group(3) if m else first
+                when = fmt_date(d) + (f"  ·  {tm}" if tm else "")
+                react = " reacted (" in who_line and ": “" not in who_line.split(" reacted (")[0]
+                if rest.strip() or who_line.endswith(":"):             # an email: header line, then its body
+                    if i:
+                        t.insert("end", "─" * 48 + "\n", "rule")
+                    t.insert("end", who_line.rstrip(":").strip(), "who")
+                    t.insert("end", "   " + when + "\n", "when")
+                    t.insert("end", reflow_paragraphs(rest).strip() + "\n", "body")
+                else:                                                    # a text: "Name: message"
+                    who, sep, msg_ = who_line.partition(": ")
+                    if react:
+                        t.insert("end", f"{tm}   " if tm else "", "when")
+                        t.insert("end", who_line + "\n", "react")
+                        continue
+                    t.insert("end", (who if sep else "") , "who")
+                    t.insert("end", "   " + (tm or when) + "\n", "when")
+                    t.insert("end", (msg_ if sep else who_line) + "\n", "body")
+            t.config(state="disabled")
 
         CONTACT_METHODS = ["Phone call", "Voicemail left", "Text messages", "Email", "In person", "Video call",
                            "Letter", "Other"]
