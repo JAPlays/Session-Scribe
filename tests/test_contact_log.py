@@ -128,6 +128,29 @@ def script(app, root, V, h):
     app.open_client(cid3, select="comms"); h.pump(root, 1)
     h.ok("an older multi-date entry is split by date when the patient is opened",
          sorted(e["date"] for e in V.load_client(cid3)["communications"]) == ["2026-10-19", "2026-10-21"])
+    # dates are read from what's pasted or loaded
+    app.external_comm(V.load_client(cid3)); h.pump(root, 0.4)
+    w = app.parent_win
+    w["date"].set("2026-01-01")
+    w["msgs"].insert("1.0", printed); w["detect"](); h.pump(root, 0.2)
+    h.ok("pasting an email chain fills in its date and switches to Email",
+         w["date"].get() == "2026-11-11" and w["method"].get() == "Email"
+         and "Date found" in str(w["found"].cget("text")), (w["date"].get(), w["found"].cget("text")))
+    w["msgs"].delete("1.0", "end"); w["msgs"].insert("1.0", thread); w["detect"](); h.pump(root, 0.2)
+    h.ok("texts over two days: the first date, and it says one entry per date",
+         w["date"].get() == "2026-10-19" and "2 days" in str(w["found"].cget("text")), w["found"].cget("text"))
+    w["win"].destroy()
+    h.ok(".eml-style 'Date:' headers are read too",
+         ss.detect_contact_dates("From: a@b.example\nDate: Wed, 11 Nov 2026 15:15:00 -0500\n\nHi") == ["2026-11-11"])
+    app.contact_log_dialog(V.load_client(cid3)); h.pump(root, 0.3)
+    cw = app._contact_win
+    cw["date"].set("2026-11-05")
+    cw["text"].insert("1.0", "Called mom; she'll bring the forms on Nov 20, 2026."); cw["detect"](); h.pump(root, 0.2)
+    h.ok("a typed summary keeps the date you chose", cw["date"].get() == "2026-11-05")
+    cw["text"].delete("1.0", "end"); cw["text"].insert("1.0", thread); cw["detect"](); h.pump(root, 0.2)
+    h.ok("…pasted texts set it (and the How) from the messages", cw["date"].get() == "2026-10-19"
+         and "2 days" in str(cw["found"].cget("text")), (cw["date"].get(), cw["how"].get()))
+    cw["win"].destroy()
     h.ok("dates with month names read again (find_date / parse_date)",
          ss.find_date("Seen on Nov 11, 2026") == "2026-11-11" and ss.parse_date("Nov 7, 2026") == "2026-11-07")
     h.ok("no errors", not errors, errors[-1:] if errors else "")

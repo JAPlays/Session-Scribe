@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.23"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.24"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7643,6 +7643,28 @@ def merge_contacts(entries, new, now=None):
             entries.append(e)
             touched.append(e)
     return touched
+
+
+def detect_contact_dates(text):
+    """The dates in pasted or loaded texts/emails (sorted, YYYY-MM-DD), read the same way they'll be saved; a
+    date written anywhere in the text when the messages carry none; [] when there's none at all."""
+    t = text or ""
+    if looks_like_email_print(t):
+        t = tidy_email_thread(t)
+    elif looks_like_message_export(t):
+        t = tidy_message_thread(t)
+    dates = sorted({b[0] for b in contact_blocks(t)[2]})
+    if dates:
+        return dates
+    m = re.search(r"(?mi)^\s*(?:date|sent):\s*(.+)$", text or "")      # an .eml / Outlook "Date:" header
+    found = ""
+    if m:
+        try:
+            from email.utils import parsedate_to_datetime
+            found = parsedate_to_datetime(m.group(1).strip()).date().isoformat()
+        except (TypeError, ValueError, IndexError):
+            found = find_date(m.group(1))
+    return [found or find_date(text or "")] if (found or find_date(text or "")) else []
 
 
 def contacts_need_split(e):
@@ -16015,6 +16037,33 @@ def run_gui():
                       style="H2.TLabel").pack(anchor="w")
             mfr, msgs = scrolled_text(msg_fr, height=12)
             mfr.pack(fill="both", expand=True, pady=(px(4), px(4)))
+            found_lbl = ttk.Label(msg_fr, text="", style="Caption.TLabel")
+            found_lbl.pack(anchor="w")
+            found = {"dates": [], "job": None}
+
+            def detect_dates(*_):
+                """Read the dates from what's pasted/loaded: they fill the Date box (one log entry per date)."""
+                found["job"] = None
+                txt = get_text(msgs)
+                ds = detect_contact_dates(txt) if txt.strip() else []
+                found["dates"] = ds
+                if ds:
+                    date_var.set(ds[0])
+                    found_lbl.config(text=("Date found in the messages: " + fmt_date(ds[0])) if len(ds) == 1 else
+                                     f"Dates found in the messages: {fmt_date(ds[0])} → {fmt_date(ds[-1])} "
+                                     f"({len(ds)} days — one log entry per date)")
+                else:
+                    found_lbl.config(text="No dates found in the messages — the Date above is used." if txt.strip()
+                                     else "")
+                if txt.strip() and looks_like_email_print(txt):
+                    method_var.set("Email")
+
+            def soon(*_):
+                if found["job"]:
+                    _quiet(win.after_cancel, found["job"])
+                found["job"] = win.after(400, detect_dates)
+            for seq in ("<KeyRelease>", "<<Paste>>", "<ButtonRelease-2>"):
+                msgs.bind(seq, soon, add="+")
 
             def load_files():
                 paths = filedialog.askopenfilenames(parent=win, title="Messages to add", filetypes=[
@@ -16030,6 +16079,7 @@ def run_gui():
                     set_text(msgs, (cur + "\n\n" if cur else "") + txt.strip())
                     if pth.lower().endswith(".eml") or looks_like_email_print(txt):
                         method_var.set("Email")
+                detect_dates()
             ttk.Button(msg_fr, text="Load from files…", command=load_files).pack(anchor="w")
 
             call_fr = ttk.Frame(f)
@@ -16111,6 +16161,9 @@ def run_gui():
                     self.queue_start()
 
             def go_messages():
+                if found["job"]:
+                    _quiet(win.after_cancel, found["job"])
+                detect_dates()                           # (in case they were pasted from a menu)
                 text, day = get_text(msgs).strip(), date_var.get().strip()
                 if not text:
                     return status.config(text="Paste the messages (or load them from files) first.")
@@ -16183,7 +16236,8 @@ def run_gui():
             go.config(command=lambda: go_messages() if mode_var.get() == "messages" else go_call())
             self.parent_win = {"win": win, "with": with_var, "who": who_var, "mode": mode_var, "date": date_var,
                                "method": method_var, "msgs": msgs, "draft": draft_var,
-                               "obs": obs, "audio": audio_var, "go": go, "load": load_files, "status": status}
+                               "obs": obs, "audio": audio_var, "go": go, "load": load_files, "status": status,
+                               "detect": detect_dates, "found": found_lbl}
 
         parent_comm = external_comm                     # (its earlier name)
 
@@ -17881,10 +17935,42 @@ def run_gui():
             sfr, summ = scrolled_text(f, height=8)
             sfr.pack(fill="both", expand=True)
             set_text(summ, ex.get("text", ""))
+            found_lbl = ttk.Label(f, text="", style="Caption.TLabel")
+            found_lbl.pack(anchor="w")
             msg = ttk.Label(f, text="", style="Bad.TLabel")
             msg.pack(anchor="w", pady=(px(4), 0))
+            job = {"id": None}
+
+            def detect_dates(*_):
+                """Pasted texts/emails carry their own dates: they set the Date (one log entry per date)."""
+                job["id"] = None
+                txt = get_text(summ)
+                if not txt.strip() or existing:
+                    return found_lbl.config(text="")
+                ds = [d for d in detect_contact_dates(txt) if d]
+                if looks_like_email_print(txt):
+                    how_var.set("Email")
+                elif looks_like_message_export(txt):
+                    how_var.set("Text messages")
+                if not ds or not (looks_like_email_print(txt) or looks_like_message_export(txt)
+                                  or re.search(r"(?m)^\[\d{4}-\d\d-\d\d", txt)):
+                    return found_lbl.config(text="")          # a typed summary: the Date you chose stays
+                day_var.set(ds[0])
+                found_lbl.config(text=("Date found in the messages: " + fmt_date(ds[0])) if len(ds) == 1 else
+                                 f"Dates found: {fmt_date(ds[0])} → {fmt_date(ds[-1])} ({len(ds)} days — one log "
+                                 "entry per date)")
+
+            def soon(*_):
+                if job["id"]:
+                    _quiet(win.after_cancel, job["id"])
+                job["id"] = win.after(400, detect_dates)
+            for seq in ("<KeyRelease>", "<<Paste>>", "<ButtonRelease-2>"):
+                summ.bind(seq, soon, add="+")
 
             def save():
+                if job["id"]:
+                    _quiet(win.after_cancel, job["id"])
+                    detect_dates()
                 day = day_var.get().strip()
                 if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
                     return msg.config(text="Enter the date of the contact.")
@@ -17912,7 +17998,7 @@ def run_gui():
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
             ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
             self._contact_win = {"win": win, "date": day_var, "time": time_var, "with": with_var, "how": how_var,
-                                 "text": summ, "save": save}
+                                 "text": summ, "save": save, "detect": detect_dates, "found": found_lbl}
             return win
 
         def edit_client(self, client):
