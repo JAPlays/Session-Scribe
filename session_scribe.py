@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.12"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.13"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -6819,7 +6819,8 @@ def set_eta(secs):
 # a key derived from the vault key, named by keyed hashes (no file names or patient details), removed as
 # soon as the session is saved, and after CKPT_KEEP_SECS regardless.
 CHUNK_SECS = 10 * 60
-SESSION_EXTRA_KEYS = ("review", "risk_check", "goals_check", "ai_draft", "revisions")   # kept when a session is re-saved
+SESSION_EXTRA_KEYS = ("review", "risk_check", "goals_check", "ai_draft", "revisions",
+                      "images")                                      # kept when a session is re-saved
 QUEUE_FILE = os.path.join(LOCAL_DIR, "queue.enc")   # this computer's recording queue, kept between runs (encrypted)
 CKPT_DIR = os.path.join(LOCAL_DIR, "checkpoints")
 CKPT_KEEP_SECS = 3 * 24 * 3600
@@ -8268,6 +8269,55 @@ def resplit_contacts(entries):
 
 def looks_like_message_export(text):
     return bool(re.search(r"(?m)^\W*Message from .+, (?:" + _WEEKDAYS + r"), ", _INVISIBLE_RE.sub("", text or "")))
+
+
+IMAGE_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "gif": "image/gif", "bmp": "image/bmp",
+               "tif": "image/tiff", "tiff": "image/tiff", "webp": "image/webp", "heic": "image/heic"}
+
+
+def extract_images(data, ext, limit=40):
+    """The pictures inside an imported file — a Word document's, a PDF's, an email's (inline or attached) —
+    as [{"name", "mime", "data"}], each once, so they can be kept with what was imported. [] if none."""
+    out, seen = [], set()
+
+    def add(name, data_):
+        kind = (os.path.splitext(name or "")[1].lstrip(".") or "").lower()
+        if kind not in IMAGE_TYPES or not data_ or len(data_) < 300 or len(data_) > 15 * 1024 * 1024:
+            return
+        h = hashlib.sha256(data_).hexdigest()
+        if h not in seen and len(out) < limit:
+            seen.add(h)
+            out.append({"name": os.path.basename(name), "mime": IMAGE_TYPES[kind], "data": data_})
+    ext = (ext or "").lower()
+    try:
+        import io
+        if ext == ".docx":
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(data)) as z:
+                for n in sorted(z.namelist()):
+                    if n.startswith("word/media/"):
+                        add(n, z.read(n))
+        elif ext == ".pdf":
+            from pypdf import PdfReader
+            for pi, page in enumerate(PdfReader(io.BytesIO(data)).pages, 1):
+                try:
+                    for img in page.images:
+                        add(f"page{pi}_{img.name}", img.data)
+                except Exception:
+                    continue
+        elif ext == ".eml":
+            import email
+            from email import policy
+            msg = email.message_from_bytes(data, policy=policy.default)
+            for k, part in enumerate(msg.walk(), 1):
+                if part.get_content_maintype() == "image":
+                    name = part.get_filename() or f"image{k}.{part.get_content_subtype()}"
+                    if not os.path.splitext(name)[1]:
+                        name += "." + part.get_content_subtype()
+                    add(name, part.get_payload(decode=True))
+    except Exception:
+        return out
+    return out
 
 
 def read_messages_file(path):
@@ -17376,6 +17426,11 @@ def run_gui():
             head = Flow(v, gap=px(16))
             head.pack(fill="x")
             head.add(ttk.Label(head, text=f"{day_title(records)} — {fmt_date(day)}", style="H2.TLabel"))
+            day_imgs = [im for _, rd in records for im in rd.get("images") or []]
+            if day_imgs:
+                head.add(ttk.Button(head, text=f"🖼  Images ({len(day_imgs)})",
+                                    command=lambda: self.image_gallery(f"{day_title(records)} — {fmt_date(day)}",
+                                                                       day_imgs)))
             for rsid, rd in records:
                 if rd["meta"].get("needs_review"):
                     ban = ttk.Frame(v, style="Card.TFrame", padding=(px(12), px(8)))
@@ -17834,7 +17889,7 @@ def run_gui():
             found_lbl.pack(anchor="w")
             mfr, msgs = scrolled_text(msg_fr, height=10)
             mfr.pack(fill="both", expand=True, pady=(px(4), px(4)))
-            found = {"dates": [], "job": None}
+            found = {"dates": [], "job": None, "images": []}      # images: [(date or "", [images])] from loaded files
 
             def detect_dates(*_):
                 """Read the dates from what's pasted/loaded: they fill the Date box (one log entry per date)."""
@@ -17870,6 +17925,18 @@ def run_gui():
                         messagebox.showerror(APP_NAME, f"Couldn't read {os.path.basename(pth)}: {friendly_error(e)}",
                                              parent=win)
                         continue
+                    try:                                    # its pictures (inline or attached): kept with the log
+                        with open(pth, "rb") as fh:
+                            imgs = extract_images(fh.read(), os.path.splitext(pth)[1])
+                    except OSError:
+                        imgs = []
+                    if imgs:
+                        when = ""
+                        if pth.lower().endswith(".eml"):
+                            dm = re.search(r"(?m)^Date: (.+)$", txt)
+                            dt = _eml_date(dm.group(1)) if dm else None
+                            when = dt.date().isoformat() if dt else ""
+                        found["images"].append((when, imgs))
                     cur = get_text(msgs).strip()
                     set_text(msgs, (cur + "\n\n" if cur else "") + txt.strip())
                     if pth.lower().endswith(".eml") or looks_like_email_print(txt):
@@ -17986,6 +18053,17 @@ def run_gui():
                 # always: into the patient's External communication log, as they are (no AI)
                 self.comm_add(cid, {"date": day, "with": w_, "who": who_, "method": method, "text": text,
                                     "notes": note_txt})
+                if found["images"]:                      # the files' pictures go with that date's entry
+                    c_ = vault.load_client(cid)
+                    log_ = c_.get("communications") or []
+                    for when, imgs in found["images"]:
+                        tgt = next((x for x in log_ if x.get("date") == (when or day) and x.get("method") == method),
+                                   None) or next((x for x in log_ if x.get("date") == (when or day)), None)
+                        if tgt is not None:
+                            tgt.setdefault("images", []).extend(self.save_images(imgs))
+                    vault.save_client(c_)
+                    self._sig = vault.signature()
+                    found["images"] = []
                 if not draft_var.get():
                     win.destroy()
                     self.set_status(f"{code}: {method.lower()} added to the External communication log.")
@@ -18261,6 +18339,80 @@ def run_gui():
             except Exception as ex:
                 return messagebox.showerror(APP_NAME, f"Couldn't open it: {friendly_error(ex)}", parent=parent)
             self.set_status(f"Opened a temporary copy of {e.get('name', 'the file')} — wiped when Session Scribe closes.")
+
+        def save_images(self, images):
+            """Keep pictures from an imported file in the vault, encrypted like everything else. Returns the
+            references ([{"id", "name", "mime"}]) to store with the document, note or message."""
+            refs = []
+            for im in images or []:
+                try:
+                    refs.append({"id": vault.save_file(im["data"]), "name": im["name"], "mime": im["mime"]})
+                except Exception:
+                    continue
+            return refs
+
+        def images_from_file(self, path):
+            """The pictures in a file being imported (Word, PDF, email), saved encrypted: references."""
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return []
+            return self.save_images(extract_images(data, os.path.splitext(path)[1]))
+
+        def delete_images(self, refs):
+            for r in refs or []:
+                _quiet(vault.delete_file, r.get("id"))
+
+        def image_gallery(self, title, refs, parent=None):
+            """The pictures kept with an imported document, note or email, one under another. Shown from memory
+            (decrypted here, never written out); a picture this computer can't draw opens as a temporary copy."""
+            win = new_window(parent or root, f"{title} — images", "860x760")
+            f = ttk.Frame(win, padding=(px(16), px(12)))
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=f"Images · {title}", style="H2.TLabel").pack(anchor="w")
+            ttk.Label(f, text=f"{len(refs)} picture{'s' if len(refs) != 1 else ''} kept from the imported file "
+                              "(encrypted in the vault).", style="Muted.TLabel").pack(anchor="w", pady=(0, px(6)))
+            sc, box = scrollable(f)
+            sc.pack(fill="both", expand=True)
+            win._imgs = []
+            max_w = px(760)
+            try:
+                from PIL import Image, ImageTk            # JPEG and the rest (PNG and GIF work without it)
+            except Exception:
+                Image = ImageTk = None
+            for r in refs:
+                card = ttk.Frame(box, style="Card.TFrame", padding=(px(10), px(8)))
+                card.pack(fill="x", pady=(0, px(8)), padx=(0, px(8)))
+                row = Flow(card, gap=px(8))
+                row.pack(fill="x")
+                row.add(ttk.Label(row, text=r.get("name", "image"), style="Strong.TLabel"))
+                row.add(ttk.Button(row, text="Open", command=lambda r=r: self.vault_file_open(r, win)), gap=px(14))
+                photo = None
+                try:
+                    data = vault.load_file(r["id"])
+                    if Image is not None:
+                        import io
+                        im = Image.open(io.BytesIO(data))
+                        im.thumbnail((max_w, max_w * 2))
+                        photo = ImageTk.PhotoImage(im, master=win)
+                    elif r.get("mime") in ("image/png", "image/gif"):
+                        photo = tk.PhotoImage(master=win, data=base64.b64encode(data).decode("ascii"))
+                        k = max(1, -(-photo.width() // max_w))
+                        if k > 1:
+                            photo = photo.subsample(k, k)
+                except Exception:
+                    photo = None
+                if photo is not None:
+                    win._imgs.append(photo)
+                    tk.Label(card, image=photo, borderwidth=0, background=THEME["P"]["surface"]).pack(
+                        anchor="w", pady=(px(6), 0))
+                else:
+                    ttk.Label(card, text="This kind of picture can't be shown here — use Open.",
+                              style="Muted.TLabel").pack(anchor="w", pady=(px(4), 0))
+            box.realize_all()
+            win._gallery = {"refs": refs, "shown": len(win._imgs)}
+            return win
 
         def _file_entry(self, client, fid):
             return next((x for x in client.get("files") or [] if x.get("id") == fid), None) if fid else None
@@ -19567,7 +19719,7 @@ def run_gui():
                 c.setdefault("documents", []).append({
                     "id": uuid.uuid4().hex[:12], "type": var.get(), "date": d["meta"].get("session_date", ""),
                     "title": "", "text": strip_word_xml(text).strip(), "file_id": "", "added": now,
-                    "moved_from": "imported note"})
+                    "moved_from": "imported note", **({"images": d["images"]} if d.get("images") else {})})
                 vault.save_client(c)
                 vault.delete_session(sid)
                 self._sig = vault.signature()
@@ -19595,6 +19747,9 @@ def run_gui():
             bar = Flow(f, gap=px(8))
             bar.pack(fill="x", pady=(px(8), 0))
             bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(doc.get("text", ""), doc.get("type", ""))))
+            if doc.get("images"):
+                bar.add(ttk.Button(bar, text=f"🖼  Images ({len(doc['images'])})",
+                                   command=lambda: self.image_gallery(doc.get("type", "Document"), doc["images"], win)))
             fe = self._file_entry(vault.load_client(client["id"]), doc.get("file_id"))
             if fe:
                 bar.add(ttk.Button(bar, text="Open original", command=lambda: self.vault_file_open(fe, win)))
@@ -19635,6 +19790,7 @@ def run_gui():
                 return
             if doc.get("file_id"):
                 _quiet(self.patient_file_remove, client["id"], doc["file_id"])
+            self.delete_images(doc.get("images"))
             c = vault.load_client(client["id"])
             c["documents"] = [d for d in c.get("documents") or [] if d.get("id") != doc.get("id")]
             vault.save_client(c)
@@ -19668,6 +19824,10 @@ def run_gui():
                 acts = Flow(card, gap=px(6))
                 acts.add(ttk.Button(acts, text="View", style="Accent.TButton",
                                     command=lambda d=doc: self.doc_view(client, d)))
+                if doc.get("images"):
+                    acts.add(ttk.Button(acts, text=f"🖼  Images ({len(doc['images'])})",
+                                        command=lambda d=doc: self.image_gallery(d.get("type", "Document"),
+                                                                                 d["images"])))
                 fe = self._file_entry(client, doc.get("file_id"))
                 if fe:
                     acts.add(ttk.Button(acts, text="Open original", command=lambda e=fe: self.vault_file_open(e)))
@@ -19710,6 +19870,7 @@ def run_gui():
                 return
             c = vault.load_client(client["id"])
             c["communications"] = [x for x in c.get("communications") or [] if x.get("id") != entry.get("id")]
+            self.delete_images(entry.get("images"))
             vault.save_client(c)
             self._sig = vault.signature()
             self.refresh_client_page(client["id"], select="comms")
@@ -19991,6 +20152,10 @@ def run_gui():
                         anchor="w", pady=(px(4), 0))
                 bar.add(ttk.Button(bar, text="⤢  Open", style="Accent.TButton",
                                    command=lambda: self.comm_view(client, x)), gap=px(16))
+                if x.get("images"):
+                    bar.add(ttk.Button(bar, text=f"🖼  Images ({len(x['images'])})",
+                                       command=lambda: self.image_gallery(
+                                           f"{x.get('method', 'Messages')} {fmt_date(x.get('date', ''))}", x["images"])))
                 bar.add(ttk.Button(bar, text="Copy", command=lambda: self.copy(x.get("text", ""), "Contact")))
                 bar.add(ttk.Button(bar, text="Edit…", command=lambda: self.contact_log_dialog(client, x)))
                 bar.add(ttk.Button(bar, text="Remove", command=lambda: self.comm_remove(client, x)), gap=px(12))
@@ -20567,11 +20732,13 @@ def run_gui():
                                                         note=it["kind"][4:])["id"]
                         except Exception:
                             fid = ""
+                    imgs = self.images_from_file(it["path"]) if it.get("path") else []
                     c = vault.load_client(client["id"])
                     c.setdefault("documents", []).append({
                         "id": uuid.uuid4().hex[:12], "type": it["kind"][4:], "date": it["date"],
                         "title": it.get("source") if it.get("source") != "pasted" else "",
-                        "text": it["text"], "file_id": fid, "added": now})
+                        "text": it["text"], "file_id": fid, "added": now,
+                        **({"images": imgs} if imgs else {})})
                     vault.save_client(c)
                 joined = sum(1 for it in notes_in if it["date"] in existing_days)
                 if plans_in:          # treatment plans join the patient's plan history, in date order
@@ -20586,7 +20753,9 @@ def run_gui():
                         pl["version"] = i
                     vault.save_client(c)
                 for it in notes_in:
+                    imgs = self.images_from_file(it["path"]) if it.get("path") else []    # one note from one file
                     vault.save_session({
+                        **({"images": imgs} if imgs else {}),
                         "meta": {"client_id": client["id"], "client_code": client.get("code", ""),
                                  "session_date": it["date"], "session_number": it["number"],
                                  "kind": it["kind"].partition(":")[0], "source": "imported", "created": now,
