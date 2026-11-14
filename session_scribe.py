@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.7"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.8"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -6666,7 +6666,7 @@ def timing_llm(model=None):
     return d
 
 
-def record_llm(model, prompt_chars, prefill_secs, out_chars, gen_secs):
+def record_llm(model, prompt_chars, prefill_secs, out_chars, gen_secs, think_chars=None):
     with _TIMING_LOCK:
         t = _timing_load()
         llm = t.setdefault("llm", {})
@@ -6675,7 +6675,12 @@ def record_llm(model, prompt_chars, prefill_secs, out_chars, gen_secs):
         if gen_secs > 1.0 and out_chars > 200:
             cur["gen"] = round(_blend(cur.get("gen"), out_chars / gen_secs, n), 2)
         if prefill_secs > 0.5 and prompt_chars > 2000:
-            cur["prefill"] = round(_blend(cur.get("prefill"), prompt_chars / prefill_secs, n), 1)
+            rate = prompt_chars / prefill_secs
+            # a start far slower than usual is LM Studio loading the model, not its reading speed: not learned
+            if not (n >= 3 and cur.get("prefill") and rate < cur["prefill"] * 0.3):
+                cur["prefill"] = round(_blend(cur.get("prefill"), rate, n), 1)
+        if think_chars is not None:                   # how much a reasoning model "thinks" before answering
+            cur["think"] = round(_blend(cur.get("think"), float(think_chars), n), 1)
         cur["n"] = n + 1
         llm["last_model"] = model
         _timing_save(t)
@@ -6718,11 +6723,12 @@ WRITE_STEPS = {"progress": (("Writing the progress note", 1000), ("Writing the s
                "parent": (("Writing the contact note", 1200), ("Writing the conversation summary", 2500))}
 
 
-def estimate_write_secs(kind, transcript_chars, context_chars=8000):
-    r = timing_llm()
+def estimate_write_secs(kind, transcript_chars, context_chars=8000, model=None):
+    r = timing_llm(model)                    # notes are written by the main model
     total = 0.0
     for label, dflt in WRITE_STEPS.get(kind, WRITE_STEPS["progress"]):
-        total += (transcript_chars + context_chars) / r["prefill"] + expected_out(label, dflt) / r["gen"]
+        total += (transcript_chars + context_chars) / r["prefill"] + \
+            (expected_out(label, dflt) + r.get("think", 0.0)) / r["gen"]
     return total
 
 
@@ -9305,9 +9311,10 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     eta_out = on_eta or set_eta
     # Learned speed of this model on this computer: how long reading the prompt and writing the answer take.
     rates = timing_llm(model)
+    think_exp = float(rates.get("think", 0.0))            # a reasoning model "thinks" this much first (learned)
     prompt_chars = len(prompt) + len(system or SYSTEM_PROMPT)
     pre_est = prompt_chars / max(rates["prefill"], 1.0)
-    gen_est = max(expected, 1) / max(rates["gen"], 0.1)
+    gen_est = (max(expected, 1) + think_exp) / max(rates["gen"], 0.1)
     share = pre_est / (pre_est + gen_est)
     clock = {"sent": None, "first": None, "chars": 0, "stop": False}
 
@@ -9383,13 +9390,20 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
                 if clock["first"] is None and (delta.get("content") or thinking):
                     clock["first"] = now
                 clock["chars"] = len(text) + thinking
-                # thinking counts a little, so the bar still moves for reasoning models
-                g = min(0.97, (visible + 0.15 * (thinking + len(text) - visible)) / max(expected, 1))
+                # thinking counts in full when this model is known to think (else only a little), so the bar
+                # moves steadily through a reasoning model's thinking and its answer
+                thought = thinking + len(text) - visible
+                if think_exp > 0:
+                    g = min(0.97, (visible + thought) / max(expected + think_exp, 1))
+                    todo = max(expected + max(think_exp - thought, 0) - visible, 0.03 * expected)
+                else:
+                    g = min(0.97, (visible + 0.15 * thought) / max(expected, 1))
+                    todo = max(expected * 1.0 - visible, 0.03 * expected)
                 if clock["first"] is not None and now - clock["first"] > 1.5:
                     rate = clock["chars"] / (now - clock["first"])          # this answer's own pace
                 else:
                     rate = rates["gen"]
-                left = max(expected * 1.0 - visible, 0.03 * expected) / max(rate, 0.1)
+                left = todo / max(rate, 0.1)
                 report(share + (1 - share) * g, left)
     except (Cancelled, RuntimeError, NetworkBlocked):
         raise
@@ -9413,8 +9427,9 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
         _quiet(conn.close)
     report(1.0, 0.0)
     if clock["sent"] and clock["first"] and not _SleepWatch.slept_since(clock["sent"]):   # learn its speed
+        thought = thinking + len(text) - len(re.sub(r"<think>.*?(</think>|$)", "", text, flags=re.S))
         _quiet(record_llm, model, prompt_chars, clock["first"] - clock["sent"], clock["chars"],
-               time.time() - clock["first"])
+               time.time() - clock["first"], thought)
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
     text = re.sub(r"^\s*```[a-z]*\n|\n```\s*$", "", text.strip())
     if finish == "length":
@@ -9431,17 +9446,24 @@ class _Steps:
 
     def __init__(self, progress, plan, prompt_hint=8000):
         # plan: [(label, expected_chars)] or [(label, expected_chars, prompt_chars)]
-        self.progress, self.rates = progress, timing_llm()
+        self.progress, self.rates, self.model = progress, timing_llm(), None
         self.labels = [p[0] for p in plan]
         self.out = [expected_out(p[0], p[1]) for p in plan]
-        self.secs = [self._secs(p[2] if len(p) > 2 else prompt_hint, o) for p, o in zip(plan, self.out)]
+        self.hints = [p[2] if len(p) > 2 else prompt_hint for p in plan]
+        self.secs = [self._secs(h, o) for h, o in zip(self.hints, self.out)]
         self.pct = 0.0
 
     def _secs(self, prompt_chars, out_chars):
-        return prompt_chars / max(self.rates["prefill"], 1.0) + out_chars / max(self.rates["gen"], 0.1)
+        return prompt_chars / max(self.rates["prefill"], 1.0) + \
+            (out_chars + self.rates.get("think", 0.0)) / max(self.rates["gen"], 0.1)
 
     def run(self, i, cfg, prompt):
         label = self.labels[i]
+        model = (cfg.get("model") or "").strip() or None
+        if model and model != self.model:                # the model that will actually do it (main or fast)
+            self.model, self.rates = model, timing_llm(model)
+            for j in range(i + 1, len(self.secs)):
+                self.secs[j] = self._secs(self.hints[j], self.out[j])
         self.secs[i] = self._secs(len(prompt), self.out[i])          # the real prompt is known now
         lo = self.pct
         hi = lo + (100.0 - lo) * self.secs[i] / (sum(self.secs[i:]) or 1.0)
@@ -24600,7 +24622,8 @@ def run_gui():
             total = estimate_tx_secs(cfg.get("whisper_model") or "large-v3-turbo",
                                      speakers_on(self.settings.get("hf_token")), secs)
             if it.get("write", self._q()["write"]):
-                total += estimate_write_secs(it.get("kind", "progress"), secs / 60 * CHARS_PER_AUDIO_MIN)
+                total += estimate_write_secs(it.get("kind", "progress"), secs / 60 * CHARS_PER_AUDIO_MIN,
+                                             model=(cfg.get("model") or "").strip() or None)
             return total
 
         def queue_running_left(self, it):
@@ -24612,7 +24635,8 @@ def run_gui():
             left = max(0.0, live[0] - (time.time() - live[1]))
             if it["status"] == "transcribing" and it.get("write", self._q()["write"]):
                 secs = it.get("audio_secs") or typical_audio_secs()
-                left += estimate_write_secs(it.get("kind", "progress"), secs / 60 * CHARS_PER_AUDIO_MIN)
+                left += estimate_write_secs(it.get("kind", "progress"), secs / 60 * CHARS_PER_AUDIO_MIN,
+                                            model=(cfg.get("model") or "").strip() or None)
             return left
 
         def queue_total_left(self):
