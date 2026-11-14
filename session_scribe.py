@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.13"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.14"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -6806,6 +6806,25 @@ def audio_seconds(path):
     return int(h) * 3600 + int(mi) * 60 + float(sec)
 
 
+_LLM_PHASE = {"text": ""}           # (one AI request runs at a time; its helper threads update it too)
+
+
+def set_llm_phase(text):
+    """What the AI is doing in the current step, in LM Studio's own terms ("reading 85%", "thinking",
+    "writing") — shown next to the step's name, so it matches what LM Studio shows."""
+    _LLM_PHASE["text"] = text or ""
+
+
+def llm_phase():
+    return _LLM_PHASE["text"]
+
+
+def with_phase(label):
+    """A progress line: the step's name plus what LM Studio is doing in it."""
+    ph = llm_phase()
+    return f"{label.rstrip('…').rstrip()}… {ph}" if ph else label
+
+
 def set_eta(secs):
     """Time left for the running task (seconds, or None). The task's progress updates carry it to the bar."""
     _TASK.eta = None if secs is None else max(0.0, float(secs))
@@ -9416,6 +9435,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
                              {"role": "user", "content": prompt}]}
     assert_local_url(url)
     text, thinking, finish = "", 0, None
+    set_llm_phase("")
     report_f = on_progress or (lambda f: None)
     eta_out = on_eta or set_eta
     # Learned speed of this model on this computer: how long reading the prompt and writing the answer take.
@@ -9446,6 +9466,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
                     or clock["load_at"] is not None:
                 continue
             el = time.time() - clock["sent"]
+            set_llm_phase("reading")                         # (LM Studio hasn't said how far yet)
             # eases toward the end of reading instead of stopping there when it takes longer than usual
             frac = el / max(pre_est, 0.1)
             frac = frac * 0.9 if frac < 1 else 0.9 + 0.09 * (1 - 1 / (1 + frac - 1))
@@ -9463,6 +9484,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
         now = time.time()
         if clock["first"] is None and (add_text or add_think):
             clock["first"] = now
+        set_llm_phase("writing" if visible else "thinking")
         clock["chars"] = len(text) + thinking
         # thinking counts in full when this model is known to think (else only a little); an answer that runs
         # longer than usual stretches the target, so the bar keeps creeping instead of stopping short
@@ -9486,6 +9508,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
             clock["load_at"] = now
         elif kind == "model_load.progress":
             p = float(ev.get("progress") or 0.0)
+            set_llm_phase(f"loading the model {round(100 * p)}%")
             clock["load_at"] = clock["load_at"] or now
             el = now - clock["load_at"]
             left = el / p * (1 - p) if p > 0.03 else 60.0
@@ -9495,6 +9518,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
             clock["sent"] = now                              # (the reading starts now)
         elif kind == "prompt_processing.progress":
             p = float(ev.get("progress") or 0.0)
+            set_llm_phase(f"reading {round(100 * p)}%")          # LM Studio's own "processing prompt" number
             if clock["pp"] is None:
                 clock["pp_at"] = now
             clock["pp"] = p
@@ -9503,6 +9527,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
             report(span(share * p), left + gen_est)
         elif kind == "prompt_processing.end":
             clock["pp"] = 1.0
+            set_llm_phase("reading 100%")
             report(span(share), gen_est)
         elif kind == "reasoning.delta":
             on_written("", ev.get("content") or "")
@@ -9526,6 +9551,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
             time.sleep(1.0)
             while loading["on"]:
                 el = time.time() - t_load
+                set_llm_phase("loading the model")
                 frac = el / load_est if el < load_est else 1 - 0.1 * load_est / el
                 _quiet(report, 0.15 * min(frac, 0.99), max(load_est - el, 5.0) + pre_est + gen_est)
                 time.sleep(0.5)
@@ -9636,6 +9662,7 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
         clock["stop"] = True
         forget()
         _quiet(conn.close)
+    set_llm_phase("")
     report(1.0, 0.0)
     if clock["sent"] and clock["first"] and not _SleepWatch.slept_since(clock["sent"]):   # learn its speed
         thought = thinking + len(text) - len(re.sub(r"<think>.*?(</think>|$)", "", text, flags=re.S))
@@ -9687,8 +9714,9 @@ class _Steps:
             self.pct = hi
             return memo[key]
         set_eta(self.secs[i] + later)
-        self.progress(f"{label}…", lo)
-        out = llm_chat(cfg, prompt, lambda f: self.progress(f"{label}…", lo + (hi - lo) * f),
+        shown = f"{label} (step {i + 1} of {len(self.labels)})" if len(self.labels) > 1 else label
+        self.progress(f"{shown}…", lo)
+        out = llm_chat(cfg, prompt, lambda f: self.progress(with_phase(f"{shown}…"), lo + (hi - lo) * f),
                        expected=self.out[i], on_eta=lambda e: set_eta((e or 0) + later))
         record_out(label, len(out))
         if memo is not None:
@@ -17156,7 +17184,7 @@ def run_gui():
                 self.msgs.put(("call", lambda txt=txt: view_ok() and self._ask_view["show"]((question, txt))))
 
             def job(progress):
-                answer = llm_chat(job_cfg, prompt, lambda f: progress("Answering…", 100 * f), expected=1400,
+                answer = llm_chat(job_cfg, prompt, lambda f: progress(with_phase("Answering…"), 100 * f), expected=1400,
                                   system=system, on_text=on_text, temperature=0.3)
                 if not re.sub(r"\[VERIFY:[^\]]*\]", "", answer or "").strip():
                     raise RuntimeError("The AI sent back an empty answer. This usually means the question and this "

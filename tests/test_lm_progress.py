@@ -70,6 +70,18 @@ def script(app, root, V, h):
          and len(set(round(f, 3) for f in fr)) >= 8, mid)
     h.ok("…and the thinking and answer keep it moving", len([f for f in fr if f > max(mid or [0])]) >= 5)
 
+    # a note: the step's label carries LM Studio's own number (the bar is the whole task)
+    labels = []
+    st = ss._Steps(lambda text, pct: labels.append((text, pct)), [("Writing the progress note", 400, 20000),
+                                                                 ("Writing the session overview", 400, 20000)])
+    st.run(0, cfg, "x" * 20000)
+    texts = [t for t, _ in labels]
+    h.ok("the step's label shows LM Studio's reading percentage, then that it's writing",
+         any("Writing the progress note (step 1 of 2)… reading 50%" == t for t in texts)
+         and any(t.endswith("… writing") for t in texts), texts[:12])
+    h.ok("…while the bar covers the whole task (this first step ends partway)",
+         max(p for _, p in labels) < 80, max(p for _, p in labels))
+
     # the model has to be loaded first: the bar shows it, not 0%
     MODE["loaded"] = False
     ss._LM_LOADED.update(key=None, at=0)
