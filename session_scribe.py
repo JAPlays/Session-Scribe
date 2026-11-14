@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.19"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.20"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14519,6 +14519,18 @@ def run_gui():
                 self._sig = vault.signature()              # what's on screen is current
             self.show(lambda f: self._client_page(f, client, sessions, select))
 
+        def refresh_client_page(self, cid, select=None):
+            """Show a change on the patient page that's open by redrawing just its list and open tab; any other
+            time (another page is showing) open the patient as usual."""
+            f = self.page
+            if (f is not None and self._alive(f) and getattr(f, "_client_id", None) == cid and self.client_id == cid
+                    and not self.wizard and getattr(f, "_refresh", None)):
+                self._sig = vault.signature()
+                f._refresh(select)
+                return True
+            self.open_client(cid, select=select)
+            return False
+
         def _client_page(self, f, client, sessions, select):
             top = ttk.Frame(f)
             top.pack(fill="x")
@@ -14808,6 +14820,50 @@ def run_gui():
             f._search = {"var": q_var, "run": do_search, "list": lb, "items": items, "state": state}
             fill_list()
 
+            def pick(select):
+                latest = days[-1][0] if days else None          # open on the most recent session
+                idx = next((i for i, it in enumerate(items) if it == ("day", latest)), min(1, len(items) - 1))
+                if select == "plan":
+                    idx = 1
+                elif select == "ask" or (isinstance(select, str) and select.startswith("ask:")):
+                    idx = 2
+                elif select == "insights" or (isinstance(select, str) and select.startswith("insights:")):
+                    if isinstance(select, str) and select.startswith("insights:"):
+                        self._insight_tab = select[9:]
+                    idx = 3
+                elif select in ("assess", "term", "comms", "docs"):
+                    idx = next((i for i, it in enumerate(items) if it[0] == select), idx)
+                elif select == "case" or (select is None and client.get("case_overview")):
+                    idx = 0
+                elif select:
+                    want = select[4:] if str(select).startswith("day:") else \
+                        next((d["meta"].get("session_date") for sid, d in sessions if sid == select), None)
+                    idx = next((i for i, it in enumerate(items) if it[1] == want), idx)
+                return idx
+
+            def refresh_in_place(select=None):
+                """After a change on one tab (an assessment, document or message removed…): reload this patient
+                and redraw only the list on the left and the open tab — not the whole page."""
+                nonlocal client, sessions, days, dups, dup_days
+                client = vault.load_client(client["id"])
+                sessions = vault.sessions_for(client["id"])
+                days = group_by_date(sessions)
+                dups = duplicate_numbers(sessions)
+                dup_days = {d_ for ds in dups.values() for d_ in ds}
+                if state["query"]:
+                    state["results"] = search_patient(client, sessions, state["query"])
+                top_ = lb.yview()[0]
+                fill_list()
+                if not items:
+                    return
+                i_ = min(pick(select), len(items) - 1)
+                lb.yview_moveto(top_)                       # the list stays where it was
+                lb.selection_set(i_)
+                lb.see(i_)
+                render(i_)
+            f._refresh = refresh_in_place
+            f._client_id = client["id"]
+
             if not sessions and any(it[0] == select for it in items if select in ("assess", "term", "comms", "docs")):
                 idx = next(i for i, it in enumerate(items) if it[0] == select)
                 lb.selection_set(idx)
@@ -14822,24 +14878,7 @@ def run_gui():
                                        "to bring in notes you've already written.", wraplength=px(560), justify="left",
                           style="Muted.TLabel").pack(anchor="w")
                 return
-            latest = days[-1][0] if days else None          # open on the most recent session
-            idx = next((i for i, it in enumerate(items) if it == ("day", latest)), min(1, len(items) - 1))
-            if select == "plan":
-                idx = 1
-            elif select == "ask" or (isinstance(select, str) and select.startswith("ask:")):
-                idx = 2
-            elif select == "insights" or (isinstance(select, str) and select.startswith("insights:")):
-                if isinstance(select, str) and select.startswith("insights:"):
-                    self._insight_tab = select[9:]
-                idx = 3
-            elif select in ("assess", "term", "comms", "docs"):
-                idx = next((i for i, it in enumerate(items) if it[0] == select), idx)
-            elif select == "case" or (select is None and client.get("case_overview")):
-                idx = 0
-            elif select:
-                want = select[4:] if str(select).startswith("day:") else \
-                    next((d["meta"].get("session_date") for sid, d in sessions if sid == select), None)
-                idx = next((i for i, it in enumerate(items) if it[1] == want), idx)
+            idx = pick(select)
             lb.selection_set(idx)
             lb.see(idx)
             render(idx)
@@ -15842,7 +15881,7 @@ def run_gui():
                     win.destroy()
                     self.set_status(f"{code}: {method.lower()} added to the External communication log.")
                     if self.client_id == cid and not self.wizard:
-                        self.open_client(cid, select="comms")
+                        self.refresh_client_page(cid, select="comms")
                     return
                 values.update(contact_method=method, contact_with=w_, contact_who=who_, source_kind=(
                     f"the text messages between the Counselor and {party}, copied by the clinician (oldest first)"
@@ -15874,7 +15913,7 @@ def run_gui():
                     messagebox.showerror(APP_NAME, f"Couldn't write the contact note: {msg}\n\nThe messages are "
                                                    "saved in the External communication log.")
                     if self.client_id == cid and not self.wizard:
-                        self.open_client(cid, select="comms")
+                        self.refresh_client_page(cid, select="comms")
                 r = self.run_bg(lambda p: generate_documents(job_cfg, values, transcript, context, p, kind="parent",
                                                              reference=reference),
                                 done, failed, label=f"writing the contact note for {code}", patient=code,
@@ -16218,7 +16257,7 @@ def run_gui():
             if a.get("file_id"):
                 _quiet(self.patient_file_remove, client["id"], a["file_id"])
             self.assessment_delete(client["id"], a.get("id"))     # (and its PHQ-9/GAD-7 score, if it made one)
-            self.open_client(client["id"], select="assess")
+            self.refresh_client_page(client["id"], select="assess")
 
         def assessment_dialog(self, client, existing=None):
             cid = client["id"]
@@ -16296,7 +16335,7 @@ def run_gui():
                 win.destroy()
                 self.set_status(f"{client.get('code', '')}: {name} saved.")
                 if self.client_id == cid and not self.wizard:
-                    self.open_client(cid, select="assess")
+                    self.refresh_client_page(cid, select="assess")
             btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
             ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
@@ -16847,10 +16886,10 @@ def run_gui():
                     self.assessment_delete(cid, e["id"])
                     self.set_status(f"{code}: partial {inst['name']} discarded.")
                     if self.client_id == cid and not self.wizard:
-                        self.open_client(cid, select="assess")
+                        self.refresh_client_page(cid, select="assess")
                     return
                 if self.client_id == cid and not self.wizard:
-                    self.open_client(cid, select="assess")
+                    self.refresh_client_page(cid, select="assess")
                 self.assessment_results(vault.load_client(cid), e)
 
             W.bind("<Escape>", lambda e: "break")
@@ -17221,7 +17260,7 @@ def run_gui():
                 win.destroy()
                 self.set_status(f"{client.get('code', '')}: brief suicide safety assessment saved ({short}).")
                 if self.client_id == cid and not self.wizard:
-                    self.open_client(cid, select="assess")
+                    self.refresh_client_page(cid, select="assess")
             btns = pin_bottom(ttk.Frame(win, padding=(px(22), 0, px(22), px(14))), pady=(px(6), 0))
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
             ttk.Button(btns, text="Save", style="Accent.TButton", command=save).pack(side="right", padx=px(8))
@@ -17340,7 +17379,7 @@ def run_gui():
                         d["type"] = var.get()
                 vault.save_client(c)
                 win.destroy()
-                self.open_client(client["id"], select="docs")
+                self.refresh_client_page(client["id"], select="docs")
             btns = pin_bottom(ttk.Frame(f), pady=(px(12), 0))
             ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
             ttk.Button(btns, text="Save", style="Accent.TButton", command=ok).pack(side="right", padx=px(8))
@@ -17357,7 +17396,7 @@ def run_gui():
             c["documents"] = [d for d in c.get("documents") or [] if d.get("id") != doc.get("id")]
             vault.save_client(c)
             self._sig = vault.signature()
-            self.open_client(client["id"], select="docs")
+            self.refresh_client_page(client["id"], select="docs")
 
         def _render_docs(self, v, client, sessions):
             client = vault.load_client(client["id"])
@@ -17420,7 +17459,7 @@ def run_gui():
             c["communications"] = [x for x in c.get("communications") or [] if x.get("id") != entry.get("id")]
             vault.save_client(c)
             self._sig = vault.signature()
-            self.open_client(client["id"], select="comms")
+            self.refresh_client_page(client["id"], select="comms")
 
         @staticmethod
         def comm_party(entry):
@@ -18808,7 +18847,7 @@ def run_gui():
             vault.save_client(c)
             self._sig = vault.signature()
             self._insight_tab = "scores"
-            self.open_client(client["id"], select=select)
+            self.refresh_client_page(client["id"], select=select)
 
         def measures_add(self, client, entries, select="insights"):
             c = vault.load_client(client["id"])
@@ -18817,7 +18856,7 @@ def run_gui():
             self._sig = vault.signature()
             self._insight_tab = "scores"
             if self.client_id == client["id"] and not self.wizard:
-                self.open_client(client["id"], select=select)
+                self.refresh_client_page(client["id"], select=select)
 
         def measure_dialog(self, client, select="insights", kind="PHQ-9"):
             win = new_window(root, f"{client.get('code', '')} — add a score", "720x720")
