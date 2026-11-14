@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.11"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.12"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -6716,6 +6716,19 @@ def record_llm(model, prompt_chars, prefill_secs, out_chars, gen_secs, think_cha
         _timing_save(t)
 
 
+def record_llm_load(model, secs):
+    """How long LM Studio takes to load this model here (for the bar while it loads)."""
+    if not secs or secs < 2:
+        return
+    with _TIMING_LOCK:
+        t = _timing_load()
+        cur = t.setdefault("llm", {}).setdefault(model or "?", {})
+        n = cur.get("loads", 0)
+        cur["load"] = round(_blend(cur.get("load"), secs, n), 1)
+        cur["loads"] = n + 1
+        _timing_save(t)
+
+
 def _out_key(label):
     return re.sub(r"\d+", "#", label or "")
 
@@ -9244,17 +9257,20 @@ def ensure_model_loaded(cfg, model):
     entry = next((m for m in models if model in (m.get("key"), *(m.get("variants") or []))), None)
     if entry is None:
         return                                   # not a model LM Studio knows by that name: let it report that
+    loaded = False
     if not entry.get("loaded_instances"):
         try:
             _http_json(root + "/api/v1/models/load",
                        {"model": entry.get("key") or model, "context_length": int(cfg.get("lm_context") or 16384),
                         "parallel": max(1, int(cfg.get("lm_parallel") or 1)), "flash_attention": True},
                        timeout=900)
+            loaded = True
         except RuntimeError as e:
             if "Couldn't reach" in str(e):
                 raise
             pass                                 # fall back to LM Studio's own on-demand loading
     _LM_LOADED.update(key=key, at=time.time())
+    return loaded
 
 
 def ai_prompt_chars(cfg, answer_tokens=2000):
@@ -9272,6 +9288,11 @@ def ai_chunk_chars(cfg):
 
 
 LLM_RETRY_WAITS = (5, 15, 30)      # seconds before trying LM Studio again after a dropped connection
+_LM_NATIVE = {}                    # LM Studio address -> whether its own /api/v1/chat is there (None: not tried)
+
+
+class _UseOpenAI(Exception):
+    """This LM Studio has no /api/v1/chat: ask again through the OpenAI-style API."""
 
 
 def llm_chat(cfg, prompt, on_progress=None, expected=1500, system=None, on_text=None, temperature=0.2,
@@ -9328,14 +9349,22 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
         model = cfg.get("model") or (list_models(cfg) or [None])[0]
         if not model:
             raise RuntimeError("LM Studio is running but no model is loaded.")
-        if cfg.get("model"):
-            ensure_model_loaded(cfg, model)
         base = cfg["lmstudio_url"]
-    url = base.rstrip("/") + "/chat/completions"
+    # LM Studio's own chat API reports how far it has got reading the prompt (and loading the model), so the
+    # progress bar can follow it; the OpenAI-style one says nothing until the first word. Older LM Studio
+    # versions (no /api/v1/chat) and the built-in engine use the OpenAI-style one.
+    lm_root = base.rstrip("/")[:-3] if base.rstrip("/").endswith("/v1") else base.rstrip("/")
+    native = not builtin and _LM_NATIVE.get(lm_root) is not False
+    if native:
+        url = lm_root + "/api/v1/chat"
+        body = {"model": model, "input": prompt, "system_prompt": system or SYSTEM_PROMPT,
+                "temperature": temperature, "stream": True, "store": False}
+    else:
+        url = base.rstrip("/") + "/chat/completions"
+        body = {"model": model, "temperature": temperature, "stream": True,
+                "messages": [{"role": "system", "content": system or SYSTEM_PROMPT},
+                             {"role": "user", "content": prompt}]}
     assert_local_url(url)
-    body = {"model": model, "temperature": temperature, "stream": True,
-            "messages": [{"role": "system", "content": system or SYSTEM_PROMPT},
-                         {"role": "user", "content": prompt}]}
     text, thinking, finish = "", 0, None
     report_f = on_progress or (lambda f: None)
     eta_out = on_eta or set_eta
@@ -9346,19 +9375,118 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
     pre_est = prompt_chars / max(rates["prefill"], 1.0)
     gen_est = (max(expected, 1) + think_exp) / max(rates["gen"], 0.1)
     share = pre_est / (pre_est + gen_est)
-    clock = {"sent": None, "first": None, "chars": 0, "stop": False}
+    # off: the part of the bar a model load took (when LM Studio had to load it first); pp: LM Studio's own
+    # prompt-reading progress (0..1, None until it reports)
+    clock = {"sent": None, "first": None, "chars": 0, "stop": False, "off": 0.0, "pp": None, "pp_at": None,
+             "load_at": None, "last": 0.0}
 
     def report(f, eta):
+        f = max(f, clock["last"])                       # never backwards
+        clock["last"] = f
         eta_out(eta)
         report_f(f)
 
-    def reading_prompt():                  # nothing streams back while LM Studio reads: fill by time
+    def span(f):                                        # 0..1 of reading+writing -> the bar, after any load
+        return clock["off"] + (1.0 - clock["off"]) * f
+
+    def reading_prompt():                  # until LM Studio says how far it has read: fill by time
         while not clock["stop"]:
             time.sleep(0.5)
-            if clock["stop"] or clock["first"] is not None or clock["sent"] is None:
+            if clock["stop"] or clock["first"] is not None or clock["sent"] is None or clock["pp"] is not None \
+                    or clock["load_at"] is not None:
                 continue
             el = time.time() - clock["sent"]
-            _quiet(report, share * min(0.95, el / max(pre_est, 0.1)), max(pre_est - el, 0.0) + gen_est)
+            # eases toward the end of reading instead of stopping there when it takes longer than usual
+            frac = el / max(pre_est, 0.1)
+            frac = frac * 0.9 if frac < 1 else 0.9 + 0.09 * (1 - 1 / (1 + frac - 1))
+            _quiet(report, span(share * frac), max(pre_est - el, 0.0) + gen_est)
+
+    def on_written(add_text, add_think):
+        """A piece of the answer (or of the thinking) came in: move the bar and the time left."""
+        nonlocal text, thinking
+        text += add_text or ""
+        thinking += len(add_think or "")
+        shown = re.sub(r"<think>.*?(</think>|$)", "", text, flags=re.S)
+        visible = len(shown)
+        if on_text is not None and add_text:
+            on_text(shown)
+        now = time.time()
+        if clock["first"] is None and (add_text or add_think):
+            clock["first"] = now
+        clock["chars"] = len(text) + thinking
+        # thinking counts in full when this model is known to think (else only a little); an answer that runs
+        # longer than usual stretches the target, so the bar keeps creeping instead of stopping short
+        thought = thinking + len(text) - visible
+        if think_exp > 0:
+            done_, total = visible + thought, max(expected + think_exp, (visible + thought) * 1.08, 1)
+        else:
+            done_, total = visible + 0.15 * thought, max(expected, visible * 1.08, 1)
+        g = min(0.99, done_ / total)
+        if clock["first"] is not None and now - clock["first"] > 1.5:
+            rate = clock["chars"] / (now - clock["first"])          # this answer's own pace
+        else:
+            rate = rates["gen"]
+        report(span(share + (1 - share) * g), max(total - done_, 0.03 * expected) / max(rate, 0.1))
+
+    def on_event(ev):
+        """One of LM Studio's own progress events (its /api/v1/chat stream)."""
+        kind = ev.get("type") or ""
+        now = time.time()
+        if kind == "model_load.start":
+            clock["load_at"] = now
+        elif kind == "model_load.progress":
+            p = float(ev.get("progress") or 0.0)
+            clock["load_at"] = clock["load_at"] or now
+            el = now - clock["load_at"]
+            left = el / p * (1 - p) if p > 0.03 else 60.0
+            report(0.15 * p, left + pre_est + gen_est)
+        elif kind == "model_load.end":
+            clock["off"], clock["load_at"] = 0.15, None
+            clock["sent"] = now                              # (the reading starts now)
+        elif kind == "prompt_processing.progress":
+            p = float(ev.get("progress") or 0.0)
+            if clock["pp"] is None:
+                clock["pp_at"] = now
+            clock["pp"] = p
+            el = now - (clock["pp_at"] or now)
+            left = el / p * (1 - p) if p > 0.05 else pre_est * (1 - p)
+            report(span(share * p), left + gen_est)
+        elif kind == "prompt_processing.end":
+            clock["pp"] = 1.0
+            report(span(share), gen_est)
+        elif kind == "reasoning.delta":
+            on_written("", ev.get("content") or "")
+        elif kind == "message.delta":
+            on_written(ev.get("content") or "", "")
+        elif kind == "error":
+            msg = (ev.get("error") or {}).get("message") or str(ev.get("error"))
+            if re.search(r"context|too (long|many tokens)|exceed", msg, re.I):
+                raise RuntimeError(f"That was more text than the AI model can read at once ({who}: {msg[:160]}). "
+                                   "Lower “Condense transcripts over” in Settings, or load the model with a "
+                                   "longer context.")
+            raise RuntimeError(f"{who} returned an error: {msg[:300]}")
+    if not builtin and cfg.get("model"):
+        # LM Studio may need to load this model first (e.g. switching between the main and the fast one): show
+        # that on the bar by its usual load time on this computer, instead of sitting at 0%
+        load_est = float(rates.get("load", 60.0))
+        t_load = time.time()
+        loading = {"on": True}
+
+        def load_ticker():
+            time.sleep(1.0)
+            while loading["on"]:
+                el = time.time() - t_load
+                frac = el / load_est if el < load_est else 1 - 0.1 * load_est / el
+                _quiet(report, 0.15 * min(frac, 0.99), max(load_est - el, 5.0) + pre_est + gen_est)
+                time.sleep(0.5)
+        threading.Thread(target=load_ticker, daemon=True).start()
+        try:
+            did_load = ensure_model_loaded(cfg, model)
+        finally:
+            loading["on"] = False
+        if did_load:
+            clock["off"] = 0.15
+            _quiet(record_llm_load, model, time.time() - t_load)
     u = urllib.parse.urlparse(url)
     conn_cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
     conn = conn_cls(u.hostname, u.port, timeout=1800)
@@ -9381,6 +9509,10 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
         clock["sent"] = time.time()
         threading.Thread(target=reading_prompt, daemon=True).start()
         r = conn.getresponse()
+        if native and r.status in (404, 405):
+            r.read()
+            _LM_NATIVE[lm_root] = False                     # an older LM Studio: the OpenAI-style API from now on
+            raise _UseOpenAI()
         if r.status >= 400:
             detail = r.read().decode("utf-8", errors="replace")[:300]
             if re.search(r"context|too (long|many tokens)|exceed", detail, re.I):
@@ -9388,10 +9520,19 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
                                    "Lower “Condense transcripts over” in Settings, or load the model with a "
                                    "longer context.")
             raise RuntimeError(f"{who} returned an error ({r.status}): {detail}")
+        if native:
+            _LM_NATIVE[lm_root] = True
         if "event-stream" not in (r.getheader("Content-Type") or ""):
             data = json.loads(r.read().decode("utf-8"))      # server ignored streaming
-            choice = data["choices"][0]
-            text, finish = choice["message"]["content"] or "", choice.get("finish_reason")
+            if "choices" in data:
+                choice = data["choices"][0]
+                text, finish = choice["message"]["content"] or "", choice.get("finish_reason")
+            else:                                           # LM Studio's own format
+                for item in data.get("output") or []:
+                    if item.get("type") == "message":
+                        text += item.get("content") or ""
+                    elif item.get("type") == "reasoning":
+                        thinking += len(item.get("content") or "")
         else:
             while True:
                 raw = r.readline()
@@ -9405,36 +9546,26 @@ def _llm_chat_once(cfg, prompt, on_progress=None, expected=1500, system=None, on
                 if payload == "[DONE]":
                     break
                 try:
-                    chunk = json.loads(payload)["choices"][0]
-                except (ValueError, KeyError, IndexError):
+                    obj = json.loads(payload)
+                except ValueError:
+                    continue
+                if native and isinstance(obj, dict) and "type" in obj and "choices" not in obj:
+                    on_event(obj)
+                    if obj.get("type") == "chat.end":
+                        break
+                    continue
+                try:
+                    chunk = obj["choices"][0]
+                except (KeyError, IndexError, TypeError):
                     continue
                 delta = chunk.get("delta") or {}
-                text += delta.get("content") or ""
-                thinking += len(delta.get("reasoning_content") or delta.get("reasoning") or "")
                 finish = chunk.get("finish_reason") or finish
-                shown = re.sub(r"<think>.*?(</think>|$)", "", text, flags=re.S)
-                visible = len(shown)
-                if on_text is not None and delta.get("content"):
-                    on_text(shown)
-                now = time.time()
-                if clock["first"] is None and (delta.get("content") or thinking):
-                    clock["first"] = now
-                clock["chars"] = len(text) + thinking
-                # thinking counts in full when this model is known to think (else only a little), so the bar
-                # moves steadily through a reasoning model's thinking and its answer
-                thought = thinking + len(text) - visible
-                if think_exp > 0:
-                    g = min(0.97, (visible + thought) / max(expected + think_exp, 1))
-                    todo = max(expected + max(think_exp - thought, 0) - visible, 0.03 * expected)
-                else:
-                    g = min(0.97, (visible + 0.15 * thought) / max(expected, 1))
-                    todo = max(expected * 1.0 - visible, 0.03 * expected)
-                if clock["first"] is not None and now - clock["first"] > 1.5:
-                    rate = clock["chars"] / (now - clock["first"])          # this answer's own pace
-                else:
-                    rate = rates["gen"]
-                left = todo / max(rate, 0.1)
-                report(share + (1 - share) * g, left)
+                on_written(delta.get("content") or "", delta.get("reasoning_content") or delta.get("reasoning") or "")
+    except _UseOpenAI:
+        clock["stop"] = True
+        forget()
+        _quiet(conn.close)
+        return _llm_chat_once(cfg, prompt, on_progress, expected, system, on_text, temperature, on_eta)
     except (Cancelled, RuntimeError, NetworkBlocked):
         raise
     except Exception as e:

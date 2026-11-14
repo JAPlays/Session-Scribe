@@ -60,6 +60,9 @@ class H:
                     self.send_response(400); self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
                     return
+                if "messages" not in req:                         # LM Studio's own /api/v1/chat format
+                    req["messages"] = [{"role": "system", "content": req.get("system_prompt") or ""},
+                                       {"role": "user", "content": req.get("input") or ""}]
                 prompt = "\n".join(m["content"] for m in req["messages"])
                 cls.PROMPTS.append(prompt)
                 user = req["messages"][-1]["content"]
