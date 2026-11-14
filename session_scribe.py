@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.13.26"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.13.27"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7517,6 +7517,142 @@ def reflow_paragraphs(text, wrap_at=60):
     return "\n".join(out)
 
 
+def _clean_mail_body(lines, who=""):
+    """An email's own words: without the confidentiality notice, print junk, the sender's signature and blank
+    edges."""
+    body = []
+    for l in lines:
+        if _MAIL_NOTICE_RE.match(l):
+            break                                     # the confidentiality notice runs to the end
+        if _MAIL_JUNK_RE.match(l):
+            continue
+        body.append(l.strip())
+    # the signature: from the sender's own name on a line of its own, near the end
+    name = (who or "").lower()
+    for i in range(len(body) - 1, max(-1, len(body) - 14), -1):
+        if body[i].strip().lower() in (name, name.split()[0] if name else "", "-- ", "--"):
+            body = body[:i]
+            break
+    while body and not body[-1].strip():
+        body.pop()
+    while body and not body[0].strip():
+        body.pop(0)
+    return body
+
+
+def _cut_quoted(lines):
+    """An email body without the earlier emails quoted under it ("On … wrote:", "-----Original Message-----",
+    Outlook's "From: … Sent: …") and without "> " quoted lines or "Sent from my iPhone"."""
+    out = []
+    for i, l in enumerate(lines):
+        s = l.strip()
+        if s.startswith(">"):
+            continue
+        if re.match(r"^On\s.{4,}", s) and re.search(r"wrote:\s*$", " ".join(x.strip() for x in lines[i:i + 3])):
+            break
+        if re.match(r"^-{2,}\s*Original Message\s*-{2,}", s, re.I) or re.match(r"^(Sent from my |Get Outlook for )",
+                                                                                 s, re.I):
+            break
+        if (re.match(r"^From:\s", s) or re.fullmatch(r"_{8,}", s)) and \
+                any(re.match(r"^\s*(Sent|Date|From):\s", x) for x in lines[i + 1:i + 4]):
+            break
+        out.append(l)
+    return out
+
+
+_EML_HEAD_RE = re.compile(r"^(From|To|Cc|Date|Subject): ?(.*)$")
+
+
+def _eml_date(v):
+    from email.utils import parsedate_to_datetime
+    try:
+        dt = parsedate_to_datetime((v or "").strip())
+    except (TypeError, ValueError, IndexError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()                          # this computer's time, so every email lines up
+    return dt.replace(tzinfo=None)
+
+
+def eml_messages(text):
+    """The emails in text loaded from .eml files (each one a "From:/To:/Date:/Subject:" header block, a blank line
+    and its body): [{"dt", "from", "to", "subject", "body"}], oldest first. A header block counts only when its
+    Date is a real email date, so a quoted email inside a body stays part of that body."""
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    heads = []                                        # (start, end of header, header dict)
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("From:") and (i == 0 or not lines[i - 1].strip()):
+            j, head = i, {}
+            while j < len(lines) and _EML_HEAD_RE.match(lines[j]):
+                k, v = _EML_HEAD_RE.match(lines[j]).groups()
+                head.setdefault(k, v.strip())
+                j += 1
+            dt = _eml_date(head.get("Date"))
+            if dt is not None and (j == len(lines) or not lines[j].strip()):
+                heads.append((i, j, head, dt))
+                i = j
+                continue
+        i += 1
+    msgs = []
+    for n, (s, e, head, dt) in enumerate(heads):
+        end = heads[n + 1][0] if n + 1 < len(heads) else len(lines)
+        msgs.append({"dt": dt, "from": head.get("From", ""), "to": ", ".join(x for x in (head.get("To"), head.get("Cc"))
+                                                                              if x),
+                     "subject": head.get("Subject", ""), "body": lines[e:end]})
+    msgs.sort(key=lambda m: m["dt"])
+    return msgs
+
+
+def looks_like_eml_dump(text):
+    return bool(eml_messages(text)) if re.search(r"(?m)^Date: ", text or "") else False
+
+
+def eml_thread(text, me_name=None):
+    """Emails loaded from .eml files as one dated block each, oldest first: "[2026-11-11 3:15 PM] Sender →
+    Recipient:", the subject, then the message without quoted earlier emails, signature or notices. With two or
+    more emails, the address on every one of them is the Counselor's own. Text without such emails: unchanged."""
+    from email.utils import getaddresses
+    msgs = eml_messages(text)
+    if not msgs:
+        return text or ""
+    for m in msgs:
+        m["f"] = [(n.strip().strip('"'), a.lower()) for n, a in getaddresses([m["from"]]) if a]
+        m["t"] = [(n.strip().strip('"'), a.lower()) for n, a in getaddresses([m["to"]]) if a]
+    me = ""
+    if me_name is None:
+        try:
+            me_name = load_config().get("therapist_name", "")
+        except Exception:
+            me_name = ""
+    key = lambda s: re.sub(r"[^a-z]", "", (s or "").lower())
+    if key(me_name):                                  # your name as Settings has it (the note's therapist)
+        me = next((a for m in msgs for n, a in m["f"] + m["t"] if key(n) == key(me_name)), "")
+    if not me and len(msgs) >= 2:
+        # the address on every email; with two such (a back-and-forth), the one receiving more — files saved
+        # from your own mailbox are mostly emails to you
+        common = set.intersection(*[{a for _, a in m["f"] + m["t"]} for m in msgs])
+        if common:
+            me = max(sorted(common), key=lambda a: sum(a == x for m in msgs for _, x in m["t"]))
+
+    def name(p):
+        n, a = p
+        return "Counselor" if me and a == me else (n or a)
+    out = []
+    for m in msgs:
+        who = name(m["f"][0]) if m["f"] else (m["from"].strip() or "Unknown sender")
+        tos = [name(p) for p in m["t"]]
+        to = ", ".join(tos[:3]) + (f" +{len(tos) - 3}" if len(tos) > 3 else "")
+        tm = m["dt"].strftime("%I:%M %p").lstrip("0")
+        sig = m["f"][0][0] if m["f"] else ""         # their real name signs the email, not "Counselor"
+        body = reflow_paragraphs("\n".join(_clean_mail_body(_cut_quoted(m["body"]), sig))).strip()
+        out.append(f"[{m['dt'].date().isoformat()} {tm}] {who}" + (f" → {to}" if to else "") + ":\n" +
+                   (f"Subject: {m['subject']}\n" if m["subject"].strip() else "") + body)
+    return "\n\n".join(out)
+
+
 def looks_like_email_print(text):
     """An email thread printed or saved from Gmail/Outlook ("Name <address>   Wed, Nov 11, 2026 at 3:15 PM")."""
     return bool(re.search(r"(?m)^[^<\n]{1,80}<[^>\s]+@[^>\s]+>\s+(?:[A-Z][a-z]{2},\s+)?[A-Z][a-z]{2,8}\.?\s+\d{1,2},\s+"
@@ -7560,23 +7696,7 @@ def tidy_email_thread(text):
                     and not _MAIL_JUNK_RE.match(l)), "")
     out = [f"Subject: {subject}"] if subject else []
     for msg in msgs:
-        body = []
-        for l in msg["body"]:
-            if _MAIL_NOTICE_RE.match(l):
-                break                                     # the confidentiality notice runs to the end
-            if _MAIL_JUNK_RE.match(l):
-                continue
-            body.append(l.strip())
-        # the signature: from the sender's own name on a line of its own, near the end
-        name = msg["who"].lower()
-        for i in range(len(body) - 1, max(-1, len(body) - 14), -1):
-            if body[i].strip().lower() in (name, name.split()[0] if name else "", "-- ", "--"):
-                body = body[:i]
-                break
-        while body and not body[-1].strip():
-            body.pop()
-        while body and not body[0].strip():
-            body.pop(0)
+        body = _clean_mail_body(msg["body"], msg["who"])
         h = msg["head"]
         mon = _MONTHS.get(h.group("mon").lower()[:3])
         when = (f"{int(h.group('year')):04d}-{mon:02d}-{int(h.group('day')):02d} " if mon else "") + \
@@ -7642,6 +7762,8 @@ def merge_contacts(entries, new, now=None):
     dates, and a date that already has an entry with the same person and way of contact gets them merged in,
     in time order (repeats left out). Returns the entries it added or changed."""
     now = now or datetime.now().isoformat(timespec="seconds")
+    if looks_like_eml_dump(new.get("text", "")):         # emails loaded from .eml files: one dated block each
+        new = dict(new, text=eml_thread(new["text"]))
     pre, subject, blocks = contact_blocks(new.get("text", ""))
     touched = []
     if not blocks:                                       # a summary you typed: as it is
@@ -7682,7 +7804,9 @@ def detect_contact_dates(text):
     """The dates in pasted or loaded texts/emails (sorted, YYYY-MM-DD), read the same way they'll be saved; a
     date written anywhere in the text when the messages carry none; [] when there's none at all."""
     t = text or ""
-    if looks_like_email_print(t):
+    if looks_like_eml_dump(t):
+        t = eml_thread(t)
+    elif looks_like_email_print(t):
         t = tidy_email_thread(t)
     elif looks_like_message_export(t):
         t = tidy_message_thread(t)
@@ -7703,6 +7827,8 @@ def detect_contact_dates(text):
 def contacts_need_split(e):
     """A saved contact whose messages span several dates (or another date), or with phone-number header lines."""
     text = e.get("text") or ""
+    if looks_like_eml_dump(text):
+        return True                                      # .eml files saved as one block before they were split
     dated = re.search(r"(?m)^\[\d{4}-\d\d-\d\d", text) is not None
     if dated and any(_PHONE_RE.fullmatch(l.strip()) for l in text.split("\n") if l.strip()):
         return True
@@ -7735,10 +7861,19 @@ def read_messages_file(path):
         with open(path, "rb") as f:
             msg = email.message_from_binary_file(f, policy=policy.default)
         body = msg.get_body(preferencelist=("plain", "html"))
-        text = body.get_content() if body else ""
+        try:
+            text = body.get_content() if body else ""
+        except (LookupError, ValueError):
+            text = (body.get_payload(decode=True) or b"").decode("utf-8", "replace") if body else ""
         if body is not None and body.get_content_type() == "text/html":
-            text = re.sub(r"<[^>]+>", " ", text)
-        head = "\n".join(f"{h}: {msg[h]}" for h in ("From", "To", "Date", "Subject") if msg[h])
+            import html as _html
+            text = re.sub(r"(?is)<(style|script|head)\b.*?</\1>", "", text)
+            text = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|li|h\d|blockquote)>", "\n", text)
+            text = _html.unescape(re.sub(r"<[^>]+>", "", text))
+            text = re.sub(r"[ \t\xa0]+", " ", text)
+            text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+        head = "\n".join(f"{h}: {' '.join(str(msg[h]).split())}" for h in ("From", "To", "Cc", "Date", "Subject")
+                         if msg[h])
         return (head + "\n\n" + text.strip()).strip()
     return extract_text(path)
 
@@ -16090,7 +16225,7 @@ def run_gui():
                 else:
                     found_lbl.config(text="No dates found in the messages — the Date above is used." if txt.strip()
                                      else "")
-                if txt.strip() and looks_like_email_print(txt):
+                if txt.strip() and (looks_like_email_print(txt) or looks_like_eml_dump(txt)):
                     method_var.set("Email")
 
             def soon(*_):
@@ -16213,7 +16348,10 @@ def run_gui():
                 w_, who_ = contact_choice()
                 remember_choice()
                 party = contact_party(w_, who_)
-                if looks_like_email_print(text):
+                if looks_like_eml_dump(text):
+                    text = eml_thread(text)                    # .eml files: one dated block per email, oldest first
+                    method = "Email"
+                elif looks_like_email_print(text):
                     text = tidy_email_thread(text) or text     # one dated block per email, no signatures/notices
                 elif method == "Text messages" or looks_like_message_export(text):
                     # one line per message, without the copy app's repeats and the sender's phone number
@@ -17956,16 +18094,26 @@ def run_gui():
                 t.insert("end", subject + "\n", "subj")
             if pre:
                 t.insert("end", reflow_paragraphs("\n".join(pre)).strip() + "\n", "body")
+            t.tag_configure("esubj", font=F["strong"], foreground=P("muted"), spacing1=px(10))
             head_re = re.compile(r"^\[(\d{4}-\d\d-\d\d)(?: ([^\]]+))?\]\s*(.*)$", re.S)
+            subj_key = lambda s: re.sub(r"^((re|fwd?|aw|sv)\s*:\s*)+", "", (s or "").strip(), flags=re.I).lower()
+            last_subj = subj_key(subject)
             for i, (d, _mins, tm, block) in enumerate(sorted(blocks, key=lambda b: b[1])):
                 first, _, rest = block.partition("\n")
+                esubj = ""
+                if rest.startswith("Subject: "):                        # an email's own subject (from .eml files)
+                    s_line, _, rest = rest.partition("\n")
+                    esubj = s_line[9:].strip()
                 m = head_re.match(first)
                 who_line = m.group(3) if m else first
                 when = fmt_date(d) + (f"  ·  {tm}" if tm else "")
                 react = " reacted (" in who_line and ": “" not in who_line.split(" reacted (")[0]
-                if rest.strip() or who_line.endswith(":"):             # an email: header line, then its body
+                if rest.strip() or who_line.endswith(":") or esubj:   # an email: header line, then its body
                     if i:
                         t.insert("end", "─" * 48 + "\n", "rule")
+                    if esubj and subj_key(esubj) != last_subj:         # shown when the conversation changes
+                        t.insert("end", esubj + "\n", "esubj")
+                        last_subj = subj_key(esubj)
                     t.insert("end", who_line.rstrip(":").strip(), "who")
                     t.insert("end", "   " + when + "\n", "when")
                     t.insert("end", reflow_paragraphs(rest).strip() + "\n", "body")

@@ -88,6 +88,19 @@ class H:
             es[1].event_generate("<Return>")
             for _ in range(40):
                 root.update(); time.sleep(0.05)
+            if not hasattr(root, "_app"):      # the key press didn't reach the window (e.g. it isn't in front)
+                def buttons(w, out):
+                    for c in w.winfo_children():
+                        if c.winfo_class() == "TButton":
+                            out.append(c)
+                        buttons(c, out)
+                    return out
+                for b in buttons(root, []):
+                    if str(b.cget("text")) in ("Create vault", "Unlock"):
+                        b.invoke()
+                        break
+                for _ in range(40):
+                    root.update(); time.sleep(0.05)
             app = root._app
             app.lm_status = ["mock-model"]
             import gc
