@@ -32,7 +32,7 @@ import platform
 import sys
 
 APP_NAME = "Session Scribe"
-APP_BUILD = "2026.11.14.6"   # raised with every new version; computers sharing a data folder update to the newest
+APP_BUILD = "2026.11.14.7"   # raised with every new version; computers sharing a data folder update to the newest
 IS_WIN = os.name == "nt"
 IS_MAC = sys.platform == "darwin"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -2993,6 +2993,14 @@ def ask_memory_text(client, hide=None):
     return "\n".join(f"- {hide(m.get('text', ''))}" + ("" if m.get("from") == "clinician" else
                                                         " (from an earlier AI answer — check against the record)")
                      for m in items)
+
+
+def clinician_memory_text(client, hide=None):
+    """Only what the clinician told Ask AI (not conclusions from AI answers) — background for notes and the case
+    overview. "" if nothing."""
+    hide = hide or (lambda s: s or "")
+    items = [m for m in client.get("ai_memory") or [] if m.get("from") == "clinician"]
+    return "\n".join(f"- {hide(m.get('text', ''))}" for m in items)[:3000]
 
 
 def ask_memory_update(cfg, client, question, answer, hide=None):
@@ -9732,6 +9740,11 @@ def build_context(client, prior_sessions, n_prev, hide, same_day=None):
     if meas:
         parent_txt += "\nOUTCOME MEASURES (latest scores; mention them in the note only where relevant):\n" + meas + "\n"
         used = used + ["PHQ-9/GAD-7 scores"]
+    mine = clinician_memory_text(client, hide)
+    if mine:
+        parent_txt += ("\nBACKGROUND THE CLINICIAN GAVE IN EARLIER CONVERSATIONS (for understanding only — never write "
+                       "it into this note as something said or done in this session):\n" + mine + "\n")
+        used = used + ["what you told Ask AI"]
     return fill(CONTEXT_HEADER, {"background": hide(client.get("background", "").strip()) or "(not provided)",
                                  "plan": plan_txt,
                                  "intake": intake_txt, "case": case_txt, "previous": prev + parent_txt}), \
@@ -11924,11 +11937,33 @@ LETTER_TYPES = {
     "school": ("School or provider letter", ["dates", "count", "goals", "progress", "recommendations"]),
     "referral": ("Referral", ["reason", "goals", "progress", "diagnosis", "scores", "recommendations"]),
     "coordination": ("Coordination email", ["goals", "progress", "recommendations"]),
+    "summary": ("Summary of treatment", ["intake", "count", "schedule", "diagnosis", "presentation", "goals",
+                                         "progress", "ending"]),
 }
 LETTER_PARTS = {"dates": "Dates of sessions attended", "count": "Number of sessions", "reason": "Reason for referral",
                 "diagnosis": "Diagnosis (from the treatment plan)", "goals": "Treatment goals",
                 "progress": "Summary of progress", "scores": "PHQ-9 / GAD-7 scores",
-                "recommendations": "Recommendations"}
+                "recommendations": "Recommendations", "intake": "Intake date",
+                "schedule": "How often and how long sessions were", "presentation": "Presenting problem and symptoms",
+                "ending": "Missed sessions and how treatment ended (or stands)"}
+
+# The agency's treatment-summary letter, as a structure for the AI to follow ([Patient] is filled in after)
+SUMMARY_FORMAT = """Follow this structure exactly (it is the agency's template for a summary of treatment):
+1. Today's date ({today}) on its own line.
+2. The salutation on its own line: "To Whom It May Concern," — or, if a recipient is given above, "Dear …,".
+3. The opening paragraph, in these words: "I write to you today to summarize the clinical course and treatment \
+for [Patient], a patient {status} under my care as a psychotherapist. As psychotherapists, we do not release our \
+progress notes; thus, the following letter provides an accurate summary of [Patient]'s treatment to date."
+4. A paragraph on the treatment: when the intake assessment was completed; how many individual psychotherapy \
+sessions followed, how often and how long (write numbers like "five (5)" and "forty-five (45) minutes"; \
+virtual or in person only if stated, else [VERIFY: virtual or in person]); the diagnosis with its codes exactly \
+as given; and how the symptoms presented, in general, non-sensitive terms.
+5. A paragraph on the therapeutic goals and the course of treatment: what was worked on and progress made, and \
+how treatment ended or where it stands now.
+6. "Please feel free to contact me with any questions or concerns." — and, only if the signature below \
+includes a phone number or email, point the reader to it.
+7. "Sincerely," and then the signature block.
+Plain text, a blank line between paragraphs, no headings or bullet points."""
 
 LETTER_PROMPT = """Write a {kind_name} from a counselor at an outpatient mental health agency.
 Recipient: {to}
@@ -11972,7 +12007,97 @@ def letter_facts(client, sessions, parts):
                        "quote it or include sensitive personal details):\n" + src)
     if "scores" in parts and measures_text(client):
         out.append("Questionnaire scores:\n" + measures_text(client))
+    therapy = sorted((d for _, d in sessions if d.get("meta", {}).get("session_date")
+                      and d["meta"].get("kind") != "parent"), key=session_sort_key)
+    intakes = [d for d in therapy if d["meta"].get("kind") == "intake"]
+    if "intake" in parts and therapy:
+        first = intakes[0] if intakes else therapy[0]
+        out.append(("Intake assessment completed: " if intakes else "First session: ")
+                   + fmt_date(first["meta"]["session_date"]))
+        if intakes:
+            after = len({d["meta"]["session_date"] for d in therapy
+                         if d["meta"]["session_date"] > first["meta"]["session_date"]})
+            out.append(f"Psychotherapy sessions after the intake: {after}")
+    if "schedule" in parts and therapy:
+        ds = sorted({date.fromisoformat(d["meta"]["session_date"]) for d in therapy})
+        gaps = sorted((b - a).days for a, b in zip(ds, ds[1:]))
+        if gaps:
+            g = gaps[len(gaps) // 2]
+            out.append("How often: " + ("weekly" if 5 <= g <= 9 else "every two weeks" if 12 <= g <= 16 else
+                                        "monthly" if 26 <= g <= 35 else f"about every {g} days"))
+        mins = sorted(int(d["meta"]["duration"] // 60) for d in therapy if (d["meta"].get("duration") or 0) > 600)
+        if mins:
+            out.append(f"Session length: about {mins[len(mins) // 2]} minutes (from the recordings)")
+    if "presentation" in parts:
+        src = (intakes[0].get("note") or "")[:3500] if intakes else ""
+        src = src or ((client.get("case_overview") or {}).get("text", "") or "")[:3500]
+        if src:
+            out.append("Material on the presenting problem and symptoms (summarize in general, non-sensitive "
+                       "terms; do not quote):\n" + src)
+    if "ending" in parts:
+        appts = (client.get("appointments") or {}).get("items") or []
+        missed = [a for a in appts if re.search(r"no.?show|cancel|missed", a.get("status", ""), re.I)]
+        if missed:
+            out.append("Missed or cancelled appointments: " + "; ".join(f"{fmt_date(a['date'])} ({a['status']})"
+                                                                        for a in missed[-6:]))
+        term = client.get("termination")
+        if term:
+            out.append("Treatment ended: " + "; ".join(f"{k.replace('_', ' ')}: {v}" for k, v in term.items()
+                                                       if isinstance(v, str) and v and k not in ("id", "file_id")))
+        elif therapy:
+            out.append(f"Treatment is ongoing (most recent session {fmt_date(therapy[-1]['meta']['session_date'])}).")
     return "\n\n".join(out)
+
+
+def letterhead_path():
+    """The clinician's own Word letter (letterhead, fonts, signature lines) that letters can be saved on."""
+    return os.path.join(TEMPLATE_DIR, "letterhead.docx")
+
+
+def write_docx_letterhead(template, path, text):
+    """The letter in a copy of the clinician's Word template: its header (letterhead), footer, page setup and
+    font kept; its body replaced by this text, one paragraph per line (tabs kept)."""
+    import zipfile
+    with zipfile.ZipFile(template) as zin:
+        doc = zin.read("word/document.xml").decode("utf-8")
+        m = re.search(r"<w:body>(.*)</w:body>", doc, re.S)
+        if not m:
+            raise ValueError("That Word file doesn't look like a letter template.")
+        body = m.group(1)
+        sects = re.findall(r"<w:sectPr[\s>].*?</w:sectPr>", body, re.S)
+        sect_xml = sects[-1] if sects else ""
+        paras = re.findall(r"<w:p[ >].*?</w:p>", body, re.S)
+        first = next((p for p in paras if re.search(r"<w:t[ >]", p)), "")
+        ppr = re.search(r"<w:pPr>.*?</w:pPr>", first, re.S)
+        rpr = re.search(r"<w:rPr>.*?</w:rPr>", first, re.S)
+        ppr = re.sub(r"<w:sectPr[\s>].*?</w:sectPr>", "", ppr.group(0), flags=re.S) if ppr else ""
+        rpr = rpr.group(0) if rpr else ""
+        out = []
+        lines = (text or "").split("\n")
+        for n, line in enumerate(lines):
+            if not line.strip():
+                # the template's paragraphs already have space after them: a blank line between paragraphs
+                # adds nothing — except room to sign after "Sincerely,"
+                prev = next((x for x in reversed(lines[:n]) if x.strip()), "")
+                if re.match(r"^\s*(sincerely|respectfully|best regards|regards|warmly)\b.*,\s*$", prev, re.I) and \
+                        (n == 0 or lines[n - 1].strip()):
+                    out += [f"<w:p>{ppr}</w:p>"] * 2
+                continue
+            runs, col = [], 0
+            for i, piece in enumerate(line.split("\t")):
+                if i:
+                    # signature columns: tab across to about 3.5 inches (default stops every half inch)
+                    k = max(1, int((3.5 - col * 0.075) / 0.5 + 0.99)) if i == 1 else 1
+                    runs += [f"<w:r>{rpr}<w:tab/></w:r>"] * k
+                if piece:
+                    runs.append(f'<w:r>{rpr}<w:t xml:space="preserve">{_xml(piece)}</w:t></w:r>')
+                col += len(piece)
+            out.append(f"<w:p>{ppr}{''.join(runs)}</w:p>")
+        new_doc = doc[:m.start(1)] + "".join(out) + sect_xml + doc[m.end(1):]
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                zout.writestr(item, new_doc.encode("utf-8") if item.filename == "word/document.xml"
+                              else zin.read(item.filename))
 
 
 def generate_letter(cfg, client, sessions, kind, to, purpose, parts, signature, fill_names, progress):
@@ -11981,6 +12106,9 @@ def generate_letter(cfg, client, sessions, kind, to, purpose, parts, signature, 
     fmt = ("Write it as an email: a subject line first (\"Subject: ...\"), then the message."
            if kind == "coordination" else "Format it as a letter with today's date (" + fmt_date(date.today().isoformat())
            + "), the recipient, \"Re: [Patient]\", the body and the signature.")
+    if kind == "summary":
+        fmt = fill(SUMMARY_FORMAT, {"today": date.today().strftime("%B %d, %Y").replace(" 0", " "),
+                                    "status": "previously" if client.get("termination") else "currently"})
     facts = hide(letter_facts(client, sessions, parts))
     if "reason" in parts and purpose.strip():
         facts = "Reason for referral: " + hide(purpose.strip()) + "\n\n" + facts
@@ -12561,9 +12689,13 @@ def generate_case_overview(cfg, client, sessions, orientation, progress):
     else:
         source, kind = text, "all session documentation, in order"
     dates = [d.get("meta", {}).get("session_date", "") for d in sessions if d.get("meta", {}).get("session_date")]
+    mine = clinician_memory_text(client, hide)
+    background = hide(client.get("background", "")).strip() or "(not provided)"
+    if mine:
+        background += "\nThe clinician has also told the assistant (background, not session content):\n" + mine
     return strip_case_title(steps.run(len(groups), cfg, fill(read_template("case_overview.txt"), {
         "client_code": client.get("code", ""), "orientation": orientation or "not specified",
-        "background": hide(client.get("background", "")).strip() or "(not provided)",
+        "background": background,
         "goals": hide(client.get("goals", "")).strip() or "(not provided)",
         "session_count": len(days),
         "date_range": f"{min(dates)} to {max(dates)}" if dates else "",
@@ -20517,7 +20649,25 @@ def run_gui():
             self.set_status(f"Exported to {os.path.basename(path)} (not encrypted).")
             return path
 
-        def doc_window(self, title, text, subtitle="", filename="document", on_save=None, footer="Confidential"):
+        def save_on_letterhead(self, parent, text, filename):
+            """The letter in a copy of your Word letter template (Letterhead in the letter window)."""
+            path = filedialog.asksaveasfilename(parent=parent, defaultextension=".docx", initialfile=filename + ".docx",
+                                                filetypes=[("Word document", "*.docx")])
+            if not path:
+                return None
+            if is_cloud_path(path) and not messagebox.askyesno(
+                    APP_NAME, "That location is a cloud-synced folder, so this UNENCRYPTED letter would be uploaded "
+                              "as readable text.\n\nSave it there anyway?", parent=parent):
+                return None
+            try:
+                write_docx_letterhead(letterhead_path(), path, text)
+            except Exception as e:
+                return messagebox.showerror(APP_NAME, f"Couldn't save it: {friendly_error(e)}", parent=parent)
+            self.set_status(f"Saved on your letterhead: {os.path.basename(path)} (not encrypted).")
+            return path
+
+        def doc_window(self, title, text, subtitle="", filename="document", on_save=None, footer="Confidential",
+                       letterhead=False):
             """A document to read, edit, copy or export. on_save(text) keeps edits (encrypted)."""
             win = new_window(root, title, "920x780")
             f = ttk.Frame(win, padding=(px(24), px(18)))
@@ -20533,6 +20683,9 @@ def run_gui():
             status = ttk.Label(btns, text="", style="Muted.TLabel")
             status.pack(side="left")
             ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+            if letterhead and os.path.isfile(letterhead_path()):
+                ttk.Button(btns, text="Save on letterhead…", command=lambda: self.save_on_letterhead(
+                    win, get_text(t), filename)).pack(side="right")
             ttk.Button(btns, text="Export…", command=lambda: self.export_text(win, title, get_text(t), filename,
                                                                               footer)).pack(side="right", padx=px(8))
             ttk.Button(btns, text="Copy", command=lambda: self.copy(get_text(t), title)).pack(side="right")
@@ -20677,7 +20830,8 @@ def run_gui():
                      "letter": f"{rp.get('code', '')}_{re.sub(r'[^A-Za-z]+', '_', rp.get('title', 'letter')).lower()}"}.get(
                 kind, re.sub(r"[^\w-]+", "_", title)[:60])
             return self.doc_window(title, rp.get("text", ""), subtitle=sub, filename=fname, on_save=save,
-                                   footer=f"{rp.get('code', '')} · Confidential" if rp.get("code") else "Confidential")
+                                   footer=f"{rp.get('code', '')} · Confidential" if rp.get("code") else "Confidential",
+                                   letterhead=kind == "letter")
 
         # ======================================================== PROGRESS & RISK (patient-level insights)
         def insight_flags(self, client, sessions):
@@ -21423,7 +21577,7 @@ def run_gui():
             client = vault.load_client(client["id"])
             sessions = vault.sessions_for(client["id"])
             code = client.get("code", "")
-            win = new_window(root, f"{code} — letter or document", "820x820")
+            win = new_window(root, f"{code} — letter or document", "840x900")
             f = ttk.Frame(win, padding=(px(24), px(18)))
             f.pack(fill="both", expand=True)
             ttk.Label(f, text="Letter or document", style="Title.TLabel").pack(anchor="w")
@@ -21466,6 +21620,33 @@ def run_gui():
             sfr, stxt = scrolled_text(f, height=3)
             sfr.pack(fill="x")
             set_text(stxt, self.settings.get("letter_signature") or "")
+            lrow = Flow(f, gap=px(8))
+            lrow.pack(fill="x", pady=(px(8), 0))
+            lrow.add(ttk.Label(lrow, text="Letterhead", style="Strong.TLabel"))
+            lh_lbl = lrow.add(ttk.Label(lrow, text="", style="Muted.TLabel"))
+
+            def show_lh():
+                lh_lbl.config(text="your Word template — letters can be saved on it" if os.path.isfile(letterhead_path())
+                              else "none — letters export as plain Word or PDF")
+
+            def pick_lh():
+                pth = filedialog.askopenfilename(parent=win, title="Your letter template (Word)",
+                                                 filetypes=[("Word document", "*.docx")])
+                if not pth:
+                    return
+                try:
+                    import zipfile
+                    zipfile.ZipFile(pth).read("word/document.xml")
+                    os.makedirs(os.path.dirname(letterhead_path()), exist_ok=True)
+                    shutil.copyfile(pth, letterhead_path())
+                except Exception as e:
+                    return messagebox.showerror(APP_NAME, f"Couldn't use that file: {friendly_error(e)}", parent=win)
+                show_lh()
+            lrow.add(ttk.Button(lrow, text="Choose Word template…", command=pick_lh), gap=px(14))
+            show_lh()
+            ttk.Label(f, text="Your agency's letter as a .docx (logo, header, footer, font). Only its look is used — "
+                              "the text is replaced by the letter you write here.", style="Caption.TLabel",
+                      wraplength=px(760), justify="left").pack(anchor="w", fill="x")
             names_var = tk.BooleanVar(value=True)
             ttk.Checkbutton(f, text="Fill in the patient's name after writing (done on this computer)",
                             variable=names_var).pack(anchor="w", pady=(px(8), 0))
@@ -21526,7 +21707,7 @@ def run_gui():
                     msg.config(text="Writing… it opens when it's ready.", style="Muted.TLabel")
             go.config(command=run)
             win._test = {"kind": kind_var, "to": to_var, "purpose": ptxt, "parts": part_vars, "sig": stxt,
-                         "names": names_var, "consent": consent_var, "go": run, "msg": msg}
+                         "names": names_var, "consent": consent_var, "go": run, "msg": msg, "pick_lh": pick_lh}
             return win
 
         # ======================================================== LEARNING FROM YOUR EDITS
